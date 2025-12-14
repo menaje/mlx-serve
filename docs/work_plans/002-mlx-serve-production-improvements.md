@@ -146,12 +146,26 @@ mlx-serve service install   # macOS: launchd, Linux: systemd
 mlx-serve service start
 mlx-serve service stop
 mlx-serve service status
+
+# 로그인 시 자동 시작 설정
+mlx-serve service enable    # 로그인 시 자동 시작 활성화
+mlx-serve service disable   # 로그인 시 자동 시작 비활성화
 ```
 
-#### 2.5.4 구현 방식
+#### 2.5.4 설정 파일 지원
+```yaml
+# ~/.mlx-serve/config.yaml
+service:
+  auto_start: true          # 로그인 시 자동 시작 (기본값: false)
+  restart_on_failure: true  # 크래시 시 자동 재시작
+  restart_delay: 5          # 재시작 대기 시간 (초)
+```
+
+#### 2.5.5 구현 방식
 - `platform.system()`으로 OS 감지
-- macOS → 기존 LaunchdManager 사용
-- Linux → 새로운 SystemdManager 구현
+- macOS → 기존 LaunchdManager 사용 (RunAtLoad 옵션)
+- Linux → 새로운 SystemdManager 구현 (WantedBy 옵션)
+- `enable/disable` 명령으로 auto_start 토글
 
 ---
 
@@ -246,5 +260,6 @@ class Settings(BaseSettings):
 - [ ] 리랭커 API에서 `return_text` 옵션 동작
 - [ ] 프리로드 옵션으로 서버 시작 시 모델 로드
 - [ ] Linux에서 `mlx-serve service install/start/stop` 동작
+- [ ] `mlx-serve service enable/disable`로 자동 시작 설정 가능
 - [ ] 모든 테스트 통과
 - [ ] README.md 업데이트
