@@ -244,6 +244,77 @@ def server_status(
 
 
 @app.command()
+def config(
+    show: bool = typer.Option(
+        False,
+        "--show",
+        "-s",
+        help="Show current configuration",
+    ),
+    example: bool = typer.Option(
+        False,
+        "--example",
+        "-e",
+        help="Print example config file",
+    ),
+    path: bool = typer.Option(
+        False,
+        "--path",
+        "-p",
+        help="Show config file path",
+    ),
+) -> None:
+    """Manage mlx-serve configuration."""
+    from mlx_serve.core.config_loader import DEFAULT_CONFIG_PATH, get_example_config
+
+    if example:
+        console.print(get_example_config())
+        return
+
+    if path:
+        console.print(f"Config file: {DEFAULT_CONFIG_PATH}")
+        console.print(f"Exists: {DEFAULT_CONFIG_PATH.exists()}")
+        return
+
+    if show or not any([example, path]):
+        # Show current configuration
+        table = Table(title="Current Configuration")
+        table.add_column("Setting", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_column("Source", style="dim")
+
+        # Determine source for each setting
+        from mlx_serve.core.config_loader import get_config_values
+        import os
+
+        yaml_config = get_config_values()
+
+        for field_name, field_info in settings.model_fields.items():
+            value = getattr(settings, field_name)
+
+            # Determine source
+            env_var = f"MLX_SERVE_{field_name.upper()}"
+            if env_var in os.environ:
+                source = "env"
+            elif field_name in yaml_config:
+                source = "yaml"
+            else:
+                source = "default"
+
+            # Format value
+            if isinstance(value, list):
+                value_str = ", ".join(str(v) for v in value) if value else "(empty)"
+            elif isinstance(value, Path):
+                value_str = str(value)
+            else:
+                value_str = str(value)
+
+            table.add_row(field_name, value_str, source)
+
+        console.print(table)
+
+
+@app.command()
 def pull(
     model: str = typer.Argument(
         ...,
