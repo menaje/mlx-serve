@@ -6,13 +6,21 @@ MLX-based embedding and reranking server with OpenAI-compatible API for Apple Si
 
 - **OpenAI-compatible API** for embeddings (`/v1/embeddings`)
 - **Jina-compatible API** for reranking (`/v1/rerank`)
+- **Token counting API** (`/v1/tokenize`)
 - **Ollama-compatible API** for model management (`/api/pull`, `/api/tags`, etc.)
 - **Native Metal acceleration** on Apple Silicon
+- **YAML configuration file** support (`~/.mlx-serve/config.yaml`)
+- **Batch processing** for improved throughput
+- **Prometheus metrics** (`/metrics` endpoint)
+- **Model quantization** (4-bit, 8-bit)
+- **Auto-download** models on first request
+- **Model aliases** for common models
 - **CLI** for server and model management
 - **System service integration** - launchd (macOS) and systemd (Linux)
 - **Model caching** with LRU eviction and TTL-based expiration
 - **Server lifecycle control** - start, stop, status commands
 - **Model preloading** for faster startup
+- **Homebrew** installation support
 
 ## Requirements
 
@@ -20,6 +28,15 @@ MLX-based embedding and reranking server with OpenAI-compatible API for Apple Si
 - Python 3.10+
 
 ## Installation
+
+### Using Homebrew (macOS)
+
+```bash
+brew tap menaje/mlx-serve
+brew install mlx-serve
+```
+
+### Using pip
 
 ```bash
 pip install mlx-serve
@@ -96,6 +113,15 @@ mlx-serve stop --all
 mlx-serve pull <model> --type <embedding|reranker>
 mlx-serve list
 mlx-serve remove <model>
+mlx-serve quantize <model> --bits 4  # Quantize for reduced memory
+```
+
+### Configuration
+
+```bash
+mlx-serve config                # Show current configuration
+mlx-serve config --example      # Print example config file
+mlx-serve config --path         # Show config file location
 ```
 
 ### Service Management (macOS launchd / Linux systemd)
@@ -170,6 +196,31 @@ Rerank documents by relevance to a query.
 }
 ```
 
+### POST /v1/tokenize
+
+Count tokens for text input.
+
+**Request:**
+```json
+{
+  "model": "Qwen3-Embedding-0.6B",
+  "input": ["text1", "text2"],
+  "return_tokens": false
+}
+```
+
+**Response:**
+```json
+{
+  "object": "list",
+  "data": [
+    {"index": 0, "tokens": 5},
+    {"index": 1, "tokens": 3}
+  ],
+  "model": "Qwen3-Embedding-0.6B"
+}
+```
+
 ### GET /v1/models
 
 List available models (OpenAI format).
@@ -192,7 +243,42 @@ Get detailed information about a model.
 
 ## Configuration
 
-Environment variables:
+### YAML Configuration File
+
+Create `~/.mlx-serve/config.yaml`:
+
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+models:
+  directory: ~/.mlx-serve/models
+  preload:
+    - Qwen3-Embedding-0.6B
+  auto_download: true
+
+cache:
+  max_embedding_models: 3
+  max_reranker_models: 2
+  ttl_seconds: 1800
+
+batch:
+  max_batch_size: 32
+  max_wait_ms: 50
+
+metrics:
+  enabled: true
+  port: 9090
+
+logging:
+  level: INFO
+  format: json
+```
+
+Generate example config: `mlx-serve config --example > ~/.mlx-serve/config.yaml`
+
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -200,10 +286,16 @@ Environment variables:
 | `MLX_SERVE_PORT` | `8000` | Server port |
 | `MLX_SERVE_MODELS_DIR` | `~/.mlx-serve/models` | Model storage path |
 | `MLX_SERVE_LOG_LEVEL` | `INFO` | Log level |
-| `MLX_SERVE_CACHE_MAX_EMBEDDING_MODELS` | `3` | Max embedding models in cache (LRU) |
-| `MLX_SERVE_CACHE_MAX_RERANKER_MODELS` | `2` | Max reranker models in cache (LRU) |
-| `MLX_SERVE_CACHE_TTL_SECONDS` | `1800` | Model cache TTL in seconds (30 min) |
+| `MLX_SERVE_LOG_FORMAT` | `text` | Log format (text/json) |
+| `MLX_SERVE_CACHE_MAX_EMBEDDING_MODELS` | `3` | Max embedding models in cache |
+| `MLX_SERVE_CACHE_MAX_RERANKER_MODELS` | `2` | Max reranker models in cache |
+| `MLX_SERVE_CACHE_TTL_SECONDS` | `1800` | Model cache TTL in seconds |
 | `MLX_SERVE_PRELOAD_MODELS` | `` | Comma-separated model names to preload |
+| `MLX_SERVE_BATCH_MAX_SIZE` | `32` | Max batch size for continuous batching |
+| `MLX_SERVE_BATCH_MAX_WAIT_MS` | `50` | Max wait time for batch collection |
+| `MLX_SERVE_METRICS_ENABLED` | `false` | Enable Prometheus metrics |
+| `MLX_SERVE_METRICS_PORT` | `9090` | Prometheus metrics port |
+| `MLX_SERVE_AUTO_DOWNLOAD` | `false` | Auto-download missing models |
 
 ### Model Cache
 

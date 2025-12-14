@@ -5,11 +5,11 @@ import signal
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from mlx_serve import __version__
-from mlx_serve.routers import embeddings_router, models_router, rerank_router
+from mlx_serve.routers import embeddings_router, models_router, rerank_router, tokenize_router
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,7 @@ def create_app() -> FastAPI:
     app.include_router(embeddings_router)
     app.include_router(rerank_router)
     app.include_router(models_router)
+    app.include_router(tokenize_router)
 
     # Middleware to track active requests
     @app.middleware("http")
@@ -108,6 +109,25 @@ def create_app() -> FastAPI:
     async def health_check() -> dict:
         """Health check endpoint."""
         return {"status": "healthy", "version": __version__, "shutting_down": _shutting_down}
+
+    # Add metrics endpoint if enabled
+    from mlx_serve.config import settings
+
+    if settings.metrics_enabled:
+        from mlx_serve.core.metrics import MetricsMiddleware, get_metrics
+
+        # Add metrics middleware
+        app.add_middleware(MetricsMiddleware)
+
+        @app.get("/metrics")
+        async def metrics() -> Response:
+            """Prometheus metrics endpoint."""
+            return Response(
+                content=get_metrics(),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+
+        logger.info("Prometheus metrics enabled at /metrics")
 
     return app
 

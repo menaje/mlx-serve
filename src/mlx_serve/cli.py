@@ -244,6 +244,77 @@ def server_status(
 
 
 @app.command()
+def config(
+    show: bool = typer.Option(
+        False,
+        "--show",
+        "-s",
+        help="Show current configuration",
+    ),
+    example: bool = typer.Option(
+        False,
+        "--example",
+        "-e",
+        help="Print example config file",
+    ),
+    path: bool = typer.Option(
+        False,
+        "--path",
+        "-p",
+        help="Show config file path",
+    ),
+) -> None:
+    """Manage mlx-serve configuration."""
+    from mlx_serve.core.config_loader import DEFAULT_CONFIG_PATH, get_example_config
+
+    if example:
+        console.print(get_example_config())
+        return
+
+    if path:
+        console.print(f"Config file: {DEFAULT_CONFIG_PATH}")
+        console.print(f"Exists: {DEFAULT_CONFIG_PATH.exists()}")
+        return
+
+    if show or not any([example, path]):
+        # Show current configuration
+        table = Table(title="Current Configuration")
+        table.add_column("Setting", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_column("Source", style="dim")
+
+        # Determine source for each setting
+        from mlx_serve.core.config_loader import get_config_values
+        import os
+
+        yaml_config = get_config_values()
+
+        for field_name, field_info in settings.model_fields.items():
+            value = getattr(settings, field_name)
+
+            # Determine source
+            env_var = f"MLX_SERVE_{field_name.upper()}"
+            if env_var in os.environ:
+                source = "env"
+            elif field_name in yaml_config:
+                source = "yaml"
+            else:
+                source = "default"
+
+            # Format value
+            if isinstance(value, list):
+                value_str = ", ".join(str(v) for v in value) if value else "(empty)"
+            elif isinstance(value, Path):
+                value_str = str(value)
+            else:
+                value_str = str(value)
+
+            table.add_row(field_name, value_str, source)
+
+        console.print(table)
+
+
+@app.command()
 def pull(
     model: str = typer.Argument(
         ...,
@@ -255,23 +326,50 @@ def pull(
         "-t",
         help="Model type (embedding or reranker)",
     ),
+    quantize_bits: Optional[int] = typer.Option(
+        None,
+        "--quantize",
+        "-q",
+        help="Quantize model after download (4 or 8 bits)",
+    ),
 ) -> None:
     """Download and convert a model from Hugging Face."""
+    if quantize_bits is not None and quantize_bits not in [4, 8]:
+        console.print("[red]Quantize bits must be 4 or 8[/red]")
+        raise typer.Exit(1)
+
     console.print(f"[blue]Pulling model: {model}[/blue]")
 
+    model_name = None
+
     async def _pull():
+        nonlocal model_name
         async for status in model_manager.pull_model(model, model_type):
             if status["status"] == "downloading":
                 console.print("[yellow]Downloading...[/yellow]")
             elif status["status"] == "converting":
                 console.print("[yellow]Converting to MLX format...[/yellow]")
             elif status["status"] == "success":
+                model_name = status["name"]
                 console.print(f"[green]Successfully pulled {status['name']}[/green]")
             elif status["status"] == "error":
                 console.print(f"[red]Error: {status['message']}[/red]")
                 raise typer.Exit(1)
 
     asyncio.run(_pull())
+
+    # Quantize if requested
+    if quantize_bits is not None and model_name is not None:
+        from mlx_serve.core.quantizer import get_quantized_model_name, quantize_model
+
+        console.print(f"[blue]Quantizing to {quantize_bits}-bit...[/blue]")
+        success, message = quantize_model(model_name, bits=quantize_bits)
+        if success:
+            quantized_name = get_quantized_model_name(model_name, quantize_bits)
+            console.print(f"[green]{message}[/green]")
+            console.print(f"[dim]Use model name: {quantized_name}[/dim]")
+        else:
+            console.print(f"[red]Quantization failed: {message}[/red]")
 
 
 @app.command("list")
@@ -319,6 +417,51 @@ def remove(
 
     model_manager.delete_model(model)
     console.print(f"[green]Removed model: {model}[/green]")
+
+
+@app.command()
+def quantize(
+    model: str = typer.Argument(..., help="Model name to quantize"),
+    bits: int = typer.Option(
+        4,
+        "--bits",
+        "-b",
+        help="Number of bits for quantization (4 or 8)",
+    ),
+    group_size: int = typer.Option(
+        64,
+        "--group-size",
+        "-g",
+        help="Group size for quantization",
+    ),
+) -> None:
+    """Quantize a model to reduce memory usage."""
+    from mlx_serve.core.quantizer import (
+        get_quantized_model_name,
+        list_quantization_options,
+        quantize_model,
+    )
+
+    if bits not in [4, 8]:
+        console.print("[red]Bits must be 4 or 8[/red]")
+        raise typer.Exit(1)
+
+    if not model_manager.is_model_installed(model):
+        console.print(f"[red]Model '{model}' not found[/red]")
+        console.print("Use 'mlx-serve list' to see installed models")
+        raise typer.Exit(1)
+
+    quantized_name = get_quantized_model_name(model, bits)
+    console.print(f"[blue]Quantizing {model} to {bits}-bit...[/blue]")
+    console.print(f"[dim]Output: {quantized_name}[/dim]")
+
+    success, message = quantize_model(model, bits=bits, group_size=group_size)
+
+    if success:
+        console.print(f"[green]{message}[/green]")
+    else:
+        console.print(f"[red]{message}[/red]")
+        raise typer.Exit(1)
 
 
 # Service management commands
