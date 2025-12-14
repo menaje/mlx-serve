@@ -1,13 +1,19 @@
 ---
 type: work_plan
-title: "MLX-Serve 프로덕션 개선: 모델 관리, 서버 제어, API 확장"
-reason: "현재 mlx-serve는 기본적인 기능만 구현되어 있어 프로덕션 환경에서의 안정성과 사용성이 부족함"
-purpose: "프로덕션 레벨의 안정적인 서버 운영을 위한 핵심 기능 구현"
-summary: "모델 캐시 관리(LRU/TTL), 서버 실행/종료 제어(PID 기반), 리랭커 API 확장(텍스트 출력) 구현"
-tags: ["mlx-serve", "production", "model-management", "server-control", "api"]
+title: 'MLX-Serve 프로덕션 개선: 모델 관리, 서버 제어, API 확장'
+reason: 현재 mlx-serve는 기본적인 기능만 구현되어 있어 프로덕션 환경에서의 안정성과 사용성이 부족함
+purpose: 프로덕션 레벨의 안정적인 서버 운영을 위한 핵심 기능 구현
+summary: '모델 캐시 관리(LRU/TTL), 서버 실행/종료 제어(PID 기반), 리랭커 API 확장(텍스트 출력) 구현'
+tags:
+  - mlx-serve
+  - production
+  - model-management
+  - server-control
+  - api
 category: feature
 requires_update:
   - README.md
+github_issue_number: 2
 ---
 
 # MLX-Serve 프로덕션 개선
@@ -108,6 +114,45 @@ preload_models:
   - Qwen3-Embedding-0.6B
 ```
 
+### 2.5 Phase 5: Linux systemd 서비스 지원 (우선순위 5)
+
+#### 2.5.1 개요
+- macOS: launchd 지원 (이미 구현됨)
+- Linux: systemd user service 추가
+- Windows: 미지원 (대상 외)
+
+#### 2.5.2 Linux systemd user service
+```ini
+# ~/.config/systemd/user/mlx-serve.service
+[Unit]
+Description=MLX-Serve Embedding Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mlx-serve start --foreground
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/bin
+
+[Install]
+WantedBy=default.target
+```
+
+#### 2.5.3 CLI 명령 확장
+```bash
+# 자동 OS 감지
+mlx-serve service install   # macOS: launchd, Linux: systemd
+mlx-serve service start
+mlx-serve service stop
+mlx-serve service status
+```
+
+#### 2.5.4 구현 방식
+- `platform.system()`으로 OS 감지
+- macOS → 기존 LaunchdManager 사용
+- Linux → 새로운 SystemdManager 구현
+
 ---
 
 ## 3. 기술 설계
@@ -120,7 +165,8 @@ src/mlx_serve/
 ├── server.py           # shutdown 핸들러 추가
 ├── core/
 │   ├── model_manager.py  # LRU/TTL 캐시 적용
-│   └── pid_manager.py    # 새 파일: PID 관리
+│   ├── pid_manager.py    # 새 파일: PID 관리
+│   └── service_manager.py  # 새 파일: OS별 서비스 관리
 └── routers/
     └── rerank.py         # return_text 옵션 추가
 ```
@@ -164,8 +210,9 @@ class Settings(BaseSettings):
 | 6 | 캐시 설정 추가 | `config.py` |
 | 7 | 리랭커 텍스트 출력 | `routers/rerank.py` |
 | 8 | 프리로드 옵션 구현 | `cli.py`, `server.py` |
-| 9 | 테스트 작성 | `tests/` |
-| 10 | 문서 업데이트 | `README.md` |
+| 9 | Linux systemd 서비스 관리 | `core/service_manager.py`, `cli.py` |
+| 10 | 테스트 작성 | `tests/` |
+| 11 | 문서 업데이트 | `README.md` |
 
 ### 4.2 테스트 계획
 - 단위 테스트: PID 관리, 캐시 동작
@@ -197,5 +244,7 @@ class Settings(BaseSettings):
 - [ ] LRU 캐시로 모델 수 제한 동작
 - [ ] TTL 후 미사용 모델 자동 언로드
 - [ ] 리랭커 API에서 `return_text` 옵션 동작
+- [ ] 프리로드 옵션으로 서버 시작 시 모델 로드
+- [ ] Linux에서 `mlx-serve service install/start/stop` 동작
 - [ ] 모든 테스트 통과
 - [ ] README.md 업데이트
