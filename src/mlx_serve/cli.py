@@ -13,6 +13,7 @@ from rich.table import Table
 from mlx_serve import __version__
 from mlx_serve.config import settings
 from mlx_serve.core.model_manager import ModelType, model_manager
+from mlx_serve.core.pid_manager import PIDManager, get_all_instances
 
 app = typer.Typer(
     name="mlx-serve",
@@ -72,23 +73,56 @@ def start(
         "--reload",
         help="Enable auto-reload for development",
     ),
+    preload: Optional[list[str]] = typer.Option(
+        None,
+        "--preload",
+        help="Model names to preload at startup (can be specified multiple times)",
+    ),
 ) -> None:
     """Start the mlx-serve server."""
+    import os
+
     import uvicorn
+
+    pid_manager = PIDManager(port)
+
+    # Check for existing server
+    if pid_manager.is_process_running():
+        console.print(f"[yellow]Server already running on port {port} (PID: {pid_manager.read_pid()})[/yellow]")
+        console.print("Use 'mlx-serve stop' to stop it first")
+        raise typer.Exit(1)
+
+    # Cleanup stale PID file if exists
+    pid_manager.cleanup_stale()
 
     console.print(f"[green]Starting mlx-serve on {host}:{port}[/green]")
 
+    # Set preload environment variable if specified
+    env = os.environ.copy()
+    if preload:
+        env["MLX_SERVE_PRELOAD_MODELS"] = ",".join(preload)
+        console.print(f"[blue]Preloading models: {', '.join(preload)}[/blue]")
+
     if foreground:
-        uvicorn.run(
-            "mlx_serve.server:app",
-            host=host,
-            port=port,
-            reload=reload,
-        )
+        # Apply preload to current environment
+        if preload:
+            os.environ["MLX_SERVE_PRELOAD_MODELS"] = ",".join(preload)
+
+        # Write PID for foreground mode
+        pid_manager.write_pid()
+        try:
+            uvicorn.run(
+                "mlx_serve.server:app",
+                host=host,
+                port=port,
+                reload=reload,
+            )
+        finally:
+            pid_manager.remove_pid()
     else:
         # Run in background
         console.print("[yellow]Running in background mode...[/yellow]")
-        subprocess.Popen(
+        process = subprocess.Popen(
             [
                 sys.executable,
                 "-m",
@@ -102,8 +136,111 @@ def start(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
-        console.print(f"[green]Server started at http://{host}:{port}[/green]")
+        # Write background process PID
+        pid_manager.write_pid(process.pid)
+        console.print(f"[green]Server started at http://{host}:{port} (PID: {process.pid})[/green]")
+
+
+@app.command()
+def stop(
+    port: int = typer.Option(
+        settings.port,
+        "--port",
+        "-p",
+        help="Port of the server to stop",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Force kill the server immediately",
+    ),
+    all_instances: bool = typer.Option(
+        False,
+        "--all",
+        "-a",
+        help="Stop all running instances",
+    ),
+) -> None:
+    """Stop the mlx-serve server."""
+    if all_instances:
+        instances = get_all_instances()
+        if not instances:
+            console.print("[yellow]No running mlx-serve instances found[/yellow]")
+            return
+
+        for inst_port, inst_pid in instances:
+            pid_manager = PIDManager(inst_port)
+            if pid_manager.stop_server(force=force):
+                console.print(f"[green]Stopped server on port {inst_port} (PID: {inst_pid})[/green]")
+            else:
+                console.print(f"[red]Failed to stop server on port {inst_port}[/red]")
+        return
+
+    pid_manager = PIDManager(port)
+    pid = pid_manager.read_pid()
+
+    if pid is None:
+        console.print(f"[yellow]No server running on port {port}[/yellow]")
+        return
+
+    if not pid_manager.is_process_running(pid):
+        pid_manager.remove_pid()
+        console.print(f"[yellow]Server on port {port} is not running (stale PID file cleaned)[/yellow]")
+        return
+
+    if pid_manager.stop_server(force=force):
+        console.print(f"[green]Server stopped on port {port} (PID: {pid})[/green]")
+    else:
+        console.print(f"[red]Failed to stop server on port {port}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("status")
+def server_status(
+    port: int = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="Port to check (if not specified, show all)",
+    ),
+) -> None:
+    """Check the status of mlx-serve server(s)."""
+    if port is not None:
+        # Check specific port
+        pid_manager = PIDManager(port)
+        pid = pid_manager.read_pid()
+
+        if pid is None:
+            console.print(f"[yellow]No server registered on port {port}[/yellow]")
+            return
+
+        if pid_manager.is_process_running(pid):
+            console.print(f"[green]Server running on port {port} (PID: {pid})[/green]")
+        else:
+            console.print(f"[yellow]Server not running on port {port} (stale PID file)[/yellow]")
+            pid_manager.remove_pid()
+        return
+
+    # Show all instances
+    instances = get_all_instances()
+
+    if not instances:
+        console.print("[yellow]No running mlx-serve instances[/yellow]")
+        console.print("Use 'mlx-serve start' to start a server")
+        return
+
+    table = Table(title="Running mlx-serve Instances")
+    table.add_column("Port", style="cyan")
+    table.add_column("PID", style="green")
+    table.add_column("URL", style="blue")
+
+    for inst_port, inst_pid in instances:
+        table.add_row(str(inst_port), str(inst_pid), f"http://localhost:{inst_port}")
+
+    console.print(table)
 
 
 @app.command()
@@ -185,148 +322,124 @@ def remove(
 
 
 # Service management commands
-PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.mlx-serve.server</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{python_path}</string>
-        <string>-m</string>
-        <string>mlx_serve</string>
-        <string>start</string>
-        <string>--foreground</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{log_dir}/mlx-serve.log</string>
-    <key>StandardErrorPath</key>
-    <string>{log_dir}/mlx-serve.error.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
-</dict>
-</plist>
-"""
+from mlx_serve.core.service_manager import get_platform_name, get_service_manager
 
 
-def _get_plist_path() -> Path:
-    """Get the path to the launchd plist file."""
-    return Path.home() / "Library" / "LaunchAgents" / "com.mlx-serve.server.plist"
-
-
-def _get_log_dir() -> Path:
-    """Get the log directory."""
-    log_dir = Path.home() / ".mlx-serve" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir
+def _check_service_support() -> None:
+    """Check if service management is supported on this platform."""
+    manager = get_service_manager()
+    if manager is None:
+        console.print("[red]Service management is not supported on this platform[/red]")
+        console.print("Supported platforms: macOS (launchd), Linux (systemd)")
+        raise typer.Exit(1)
 
 
 @service_app.command("install")
 def service_install() -> None:
-    """Install mlx-serve as a launchd service."""
-    plist_path = _get_plist_path()
-    log_dir = _get_log_dir()
+    """Install mlx-serve as a system service."""
+    _check_service_support()
+    manager = get_service_manager()
 
-    plist_content = PLIST_TEMPLATE.format(
-        python_path=sys.executable,
-        log_dir=str(log_dir),
-    )
+    console.print(f"[blue]Installing service for {get_platform_name()}...[/blue]")
+    success, message = manager.install()
 
-    plist_path.parent.mkdir(parents=True, exist_ok=True)
-    plist_path.write_text(plist_content)
-
-    console.print(f"[green]Service installed at {plist_path}[/green]")
-    console.print("Use 'mlx-serve service start' to start the service")
+    if success:
+        console.print(f"[green]{message}[/green]")
+        console.print("Use 'mlx-serve service start' to start the service")
+    else:
+        console.print(f"[red]{message}[/red]")
+        raise typer.Exit(1)
 
 
 @service_app.command("uninstall")
 def service_uninstall() -> None:
-    """Uninstall the mlx-serve launchd service."""
-    plist_path = _get_plist_path()
+    """Uninstall the mlx-serve system service."""
+    _check_service_support()
+    manager = get_service_manager()
 
-    # Stop service first
-    subprocess.run(
-        ["launchctl", "unload", str(plist_path)],
-        capture_output=True,
-    )
-
-    if plist_path.exists():
-        plist_path.unlink()
-        console.print("[green]Service uninstalled[/green]")
+    success, message = manager.uninstall()
+    if success:
+        console.print(f"[green]{message}[/green]")
     else:
-        console.print("[yellow]Service was not installed[/yellow]")
+        console.print(f"[yellow]{message}[/yellow]")
 
 
 @service_app.command("start")
 def service_start() -> None:
-    """Start the mlx-serve launchd service."""
-    plist_path = _get_plist_path()
+    """Start the mlx-serve system service."""
+    _check_service_support()
+    manager = get_service_manager()
 
-    if not plist_path.exists():
-        console.print("[red]Service not installed. Run 'mlx-serve service install' first[/red]")
-        raise typer.Exit(1)
-
-    result = subprocess.run(
-        ["launchctl", "load", str(plist_path)],
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode == 0:
-        console.print("[green]Service started[/green]")
+    success, message = manager.start()
+    if success:
+        console.print(f"[green]{message}[/green]")
     else:
-        console.print(f"[red]Failed to start service: {result.stderr}[/red]")
+        console.print(f"[red]{message}[/red]")
         raise typer.Exit(1)
 
 
 @service_app.command("stop")
 def service_stop() -> None:
-    """Stop the mlx-serve launchd service."""
-    plist_path = _get_plist_path()
+    """Stop the mlx-serve system service."""
+    _check_service_support()
+    manager = get_service_manager()
 
-    result = subprocess.run(
-        ["launchctl", "unload", str(plist_path)],
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode == 0:
-        console.print("[green]Service stopped[/green]")
+    success, message = manager.stop()
+    if success:
+        console.print(f"[green]{message}[/green]")
     else:
-        console.print(f"[yellow]Service may not be running: {result.stderr}[/yellow]")
+        console.print(f"[yellow]{message}[/yellow]")
 
 
 @service_app.command("status")
 def service_status() -> None:
     """Check the status of the mlx-serve service."""
-    result = subprocess.run(
-        ["launchctl", "list", "com.mlx-serve.server"],
-        capture_output=True,
-        text=True,
-    )
+    _check_service_support()
+    manager = get_service_manager()
 
-    if result.returncode == 0:
-        console.print("[green]Service is running[/green]")
-        # Parse PID from output
-        for line in result.stdout.strip().split("\n"):
-            if "PID" not in line and line.strip():
-                parts = line.split()
-                if len(parts) >= 1 and parts[0].isdigit():
-                    console.print(f"  PID: {parts[0]}")
+    status = manager.status()
+    console.print(f"[blue]Platform: {get_platform_name()}[/blue]")
+
+    if status["running"]:
+        console.print(f"[green]Service is running ({status['service_name']})[/green]")
+    elif status["installed"]:
+        console.print("[yellow]Service is installed but not running[/yellow]")
     else:
-        plist_path = _get_plist_path()
-        if plist_path.exists():
-            console.print("[yellow]Service is installed but not running[/yellow]")
+        console.print("[red]Service is not installed[/red]")
+
+    if status["installed"]:
+        if status["enabled"]:
+            console.print("  Auto-start at login: [green]enabled[/green]")
         else:
-            console.print("[red]Service is not installed[/red]")
+            console.print("  Auto-start at login: [yellow]disabled[/yellow]")
+
+
+@service_app.command("enable")
+def service_enable() -> None:
+    """Enable mlx-serve to start automatically at login."""
+    _check_service_support()
+    manager = get_service_manager()
+
+    success, message = manager.enable()
+    if success:
+        console.print(f"[green]{message}[/green]")
+    else:
+        console.print(f"[red]{message}[/red]")
+        raise typer.Exit(1)
+
+
+@service_app.command("disable")
+def service_disable() -> None:
+    """Disable mlx-serve from starting automatically at login."""
+    _check_service_support()
+    manager = get_service_manager()
+
+    success, message = manager.disable()
+    if success:
+        console.print(f"[green]{message}[/green]")
+    else:
+        console.print(f"[red]{message}[/red]")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

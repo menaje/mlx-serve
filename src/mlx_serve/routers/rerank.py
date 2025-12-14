@@ -14,7 +14,7 @@ router = APIRouter(tags=["rerank"])
 
 
 class RerankRequest(BaseModel):
-    """Jina-compatible rerank request."""
+    """Jina-compatible rerank request with extended options."""
 
     model: str = Field(..., description="Model name to use for reranking")
     query: str = Field(..., description="Search query")
@@ -23,6 +23,16 @@ class RerankRequest(BaseModel):
     return_documents: bool = Field(
         default=True,
         description="Whether to return document text in results",
+    )
+    return_text: bool = Field(
+        default=False,
+        description="Whether to return yes/no text output based on relevance",
+    )
+    decision_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Threshold for yes/no decision (0.0-1.0)",
     )
 
 
@@ -38,6 +48,7 @@ class RerankResult(BaseModel):
     index: int
     relevance_score: float
     document: DocumentResult | None = None
+    text_output: str | None = None
 
 
 class RerankUsage(BaseModel):
@@ -165,6 +176,9 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
                 index=idx,
                 relevance_score=score,
                 document=DocumentResult(text=doc) if request.return_documents else None,
+                text_output=("yes" if score >= request.decision_threshold else "no")
+                if request.return_text
+                else None,
             )
             for idx, score, doc in scored_docs
         ]
