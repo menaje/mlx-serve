@@ -9,11 +9,14 @@ MLX-based embedding and reranking server with OpenAI-compatible API for Apple Si
 - **Ollama-compatible API** for model management (`/api/pull`, `/api/tags`, etc.)
 - **Native Metal acceleration** on Apple Silicon
 - **CLI** for server and model management
-- **launchd integration** for running as a system service
+- **System service integration** - launchd (macOS) and systemd (Linux)
+- **Model caching** with LRU eviction and TTL-based expiration
+- **Server lifecycle control** - start, stop, status commands
+- **Model preloading** for faster startup
 
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3)
+- macOS with Apple Silicon (M1/M2/M3) or Linux
 - Python 3.10+
 
 ## Installation
@@ -71,7 +74,20 @@ curl http://localhost:8000/v1/rerank \
 ### Server Management
 
 ```bash
+# Start the server
 mlx-serve start [--host 0.0.0.0] [--port 8000] [--foreground]
+
+# Start with model preloading
+mlx-serve start --preload Qwen3-Embedding-0.6B --preload Qwen3-Reranker-0.6B
+
+# Check server status
+mlx-serve status [--port 8000]
+
+# Stop the server
+mlx-serve stop [--port 8000] [--force]
+
+# Stop all running instances
+mlx-serve stop --all
 ```
 
 ### Model Management
@@ -82,13 +98,15 @@ mlx-serve list
 mlx-serve remove <model>
 ```
 
-### Service Management (launchd)
+### Service Management (macOS launchd / Linux systemd)
 
 ```bash
-mlx-serve service install    # Install as launchd service
+mlx-serve service install    # Install as system service
 mlx-serve service start      # Start service
 mlx-serve service stop       # Stop service
 mlx-serve service status     # Check status
+mlx-serve service enable     # Enable auto-start at login
+mlx-serve service disable    # Disable auto-start
 mlx-serve service uninstall  # Remove service
 ```
 
@@ -131,16 +149,22 @@ Rerank documents by relevance to a query.
   "query": "search query",
   "documents": ["doc1", "doc2", "doc3"],
   "top_n": 3,
-  "return_documents": true
+  "return_documents": true,
+  "return_text": false,
+  "decision_threshold": 0.5
 }
 ```
+
+**Parameters:**
+- `return_text` (bool, optional): Return "yes"/"no" text output based on relevance threshold. Default: `false`
+- `decision_threshold` (float, optional): Threshold for yes/no decision (0.0-1.0). Default: `0.5`
 
 **Response:**
 ```json
 {
   "results": [
-    {"index": 2, "relevance_score": 0.98, "document": {"text": "doc3"}},
-    {"index": 0, "relevance_score": 0.76, "document": {"text": "doc1"}}
+    {"index": 2, "relevance_score": 0.98, "document": {"text": "doc3"}, "text_output": "yes"},
+    {"index": 0, "relevance_score": 0.76, "document": {"text": "doc1"}, "text_output": "yes"}
   ],
   "usage": {"prompt_tokens": 45, "total_tokens": 45}
 }
@@ -176,6 +200,20 @@ Environment variables:
 | `MLX_SERVE_PORT` | `8000` | Server port |
 | `MLX_SERVE_MODELS_DIR` | `~/.mlx-serve/models` | Model storage path |
 | `MLX_SERVE_LOG_LEVEL` | `INFO` | Log level |
+| `MLX_SERVE_CACHE_MAX_EMBEDDING_MODELS` | `3` | Max embedding models in cache (LRU) |
+| `MLX_SERVE_CACHE_MAX_RERANKER_MODELS` | `2` | Max reranker models in cache (LRU) |
+| `MLX_SERVE_CACHE_TTL_SECONDS` | `1800` | Model cache TTL in seconds (30 min) |
+| `MLX_SERVE_PRELOAD_MODELS` | `` | Comma-separated model names to preload |
+
+### Model Cache
+
+mlx-serve uses an LRU (Least Recently Used) cache with TTL (Time-To-Live) for loaded models:
+
+- **LRU eviction**: When the cache is full, the least recently used model is unloaded
+- **TTL expiration**: Models unused for longer than the TTL are automatically unloaded
+- **TTL refresh**: Accessing a model refreshes its TTL timer
+
+This ensures efficient memory usage while maintaining fast response times for frequently used models.
 
 ## Development
 
