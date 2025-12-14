@@ -9,9 +9,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from mlx_serve.core.config_loader import get_config_values
 
 
-def yaml_config_settings_source(settings: "Settings") -> dict[str, Any]:
-    """Load settings from YAML config file."""
-    return get_config_values()
+class YamlConfigSettingsSource:
+    """Custom settings source for YAML config file."""
+
+    def __init__(self, settings_cls):
+        self.settings_cls = settings_cls
+
+    def __call__(self):
+        """Load settings from YAML config file."""
+        return get_config_values()
 
 
 class Settings(BaseSettings):
@@ -143,7 +149,7 @@ class Settings(BaseSettings):
             init_settings,
             env_settings,
             dotenv_settings,
-            yaml_config_settings_source,
+            YamlConfigSettingsSource(settings_cls),
             file_secret_settings,
         )
 
