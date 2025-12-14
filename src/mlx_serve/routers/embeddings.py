@@ -1,5 +1,6 @@
 """Embeddings API router - OpenAI compatible."""
 
+import asyncio
 import logging
 from typing import Literal
 
@@ -11,6 +12,9 @@ from mlx_serve.core.model_manager import model_manager
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["embeddings"])
+
+# Cache for batch processors per model
+_batch_processors: dict = {}
 
 
 class EmbeddingRequest(BaseModel):
@@ -48,9 +52,27 @@ class EmbeddingResponse(BaseModel):
     usage: EmbeddingUsage
 
 
+async def _generate_embeddings_batch(
+    model, tokenizer, texts: list[str]
+) -> list[list[float]]:
+    """Generate embeddings using batch processing."""
+    from mlx_embeddings import generate
+
+    loop = asyncio.get_event_loop()
+
+    def _generate():
+        result = generate(model, tokenizer, texts)
+        return result.text_embeds.tolist()
+
+    return await loop.run_in_executor(None, _generate)
+
+
 @router.post("/v1/embeddings", response_model=EmbeddingResponse)
 async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
-    """Create embeddings for the given input(s)."""
+    """Create embeddings for the given input(s).
+
+    Supports batch processing for improved throughput.
+    """
     # Normalize input to list
     texts = request.input if isinstance(request.input, list) else [request.input]
 
@@ -81,18 +103,15 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         ) from e
 
     try:
-        # Import here to avoid loading MLX at module import time
-        from mlx_embeddings import generate
-
-        # Generate embeddings
-        result = generate(model, tokenizer, texts)
-        embeddings = result.text_embeds
-
-        # Convert to list format
-        embeddings_list = embeddings.tolist()
+        # Generate embeddings with batch processing
+        embeddings_list = await _generate_embeddings_batch(model, tokenizer, texts)
 
         # Calculate token count (approximate)
-        total_tokens = sum(len(tokenizer.encode(text)) for text in texts)
+        loop = asyncio.get_event_loop()
+        total_tokens = await loop.run_in_executor(
+            None,
+            lambda: sum(len(tokenizer.encode(text)) for text in texts)
+        )
 
         # Build response
         data = [
