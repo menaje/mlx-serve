@@ -14,6 +14,7 @@ class Settings(BaseSettings):
         env_prefix="MLX_SERVE_",
         env_file=".env",
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
     # Server settings

@@ -59,35 +59,56 @@ def compute_rerank_score(
     tokenizer,
     query: str,
     document: str,
+    instruction: str | None = None,
 ) -> float:
-    """Compute relevance score between query and document using the reranker model."""
+    """Compute relevance score between query and document using Qwen3-Reranker."""
     import mlx.core as mx
+    import mlx.nn as nn
 
-    # Format input for cross-encoder reranking
-    # Most rerankers expect: [CLS] query [SEP] document [SEP]
-    prompt = f"Query: {query}\nDocument: {document}\nRelevant:"
+    # Default instruction for retrieval tasks
+    if instruction is None:
+        instruction = "Given a web search query, retrieve relevant passages that answer the query"
 
-    # Tokenize
-    tokens = tokenizer.encode(prompt, return_tensors="mlx")
+    # Qwen3-Reranker format
+    prompt = f"<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {document}"
+
+    # Get token IDs for "yes" and "no"
+    token_true_id = tokenizer.convert_tokens_to_ids("yes")
+    token_false_id = tokenizer.convert_tokens_to_ids("no")
+
+    # Tokenize with prefix/suffix tokens for Qwen3
+    prefix_tokens = [tokenizer.bos_token_id] if tokenizer.bos_token_id else []
+    suffix_tokens = [tokenizer.eos_token_id] if tokenizer.eos_token_id else []
+
+    # Encode the prompt
+    input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    input_ids = prefix_tokens + input_ids + suffix_tokens
+
+    # Convert to MLX array
+    tokens = mx.array([input_ids])
 
     # Get model output
     outputs = model(tokens)
 
-    # Extract logits for relevance scoring
-    # For rerankers, we typically look at the logits for "yes"/"no" or similar
-    # This is a simplified scoring - actual implementation depends on model architecture
+    # Extract logits
     if hasattr(outputs, "logits"):
         logits = outputs.logits
     else:
         logits = outputs
 
-    # Get the last token's logits and convert to probability
+    # Get the last token's logits
     last_logits = logits[0, -1, :]
 
-    # Simple scoring: use the mean of positive logits
-    score = float(mx.sigmoid(mx.mean(last_logits)))
+    # Get scores for "yes" and "no" tokens
+    true_score = last_logits[token_true_id]
+    false_score = last_logits[token_false_id]
 
-    return score
+    # Compute probability using softmax over [false, true]
+    scores = mx.stack([false_score, true_score])
+    probs = mx.softmax(scores)
+
+    # Return probability of "yes"
+    return float(probs[1])
 
 
 @router.post("/v1/rerank", response_model=RerankResponse)

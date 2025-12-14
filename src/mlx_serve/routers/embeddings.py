@@ -82,10 +82,11 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
     try:
         # Import here to avoid loading MLX at module import time
-        from mlx_embeddings import embed
+        from mlx_embeddings import generate
 
         # Generate embeddings
-        embeddings = embed(model, tokenizer, texts)
+        result = generate(model, tokenizer, texts)
+        embeddings = result.text_embeds
 
         # Convert to list format
         embeddings_list = embeddings.tolist()
