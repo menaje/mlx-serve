@@ -143,6 +143,23 @@ def start(
         console.print(f"[green]Server started at http://{host}:{port} (PID: {process.pid})[/green]")
 
 
+def _stop_service_if_running() -> bool:
+    """Stop the launchd/systemd service if it's running.
+
+    Returns:
+        True if service was stopped, False if not running as service.
+    """
+    from mlx_serve.core.service_manager import get_service_manager
+
+    service_manager = get_service_manager()
+    if service_manager and service_manager.is_installed and service_manager.is_running:
+        success, message = service_manager.stop()
+        if success:
+            console.print(f"[green]Service stopped ({message})[/green]")
+        return success
+    return False
+
+
 @app.command()
 def stop(
     port: int = typer.Option(
@@ -165,6 +182,10 @@ def stop(
     ),
 ) -> None:
     """Stop the mlx-serve server."""
+    # Check if running as a service first (prevents auto-restart)
+    if _stop_service_if_running():
+        return
+
     if all_instances:
         instances = get_all_instances()
         if not instances:
