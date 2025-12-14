@@ -1,7 +1,7 @@
 """Tests for service manager."""
 
 import platform
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -108,11 +108,16 @@ class TestLaunchdManager:
 
     def test_status(self, manager):
         """Test status returns correct info."""
-        with patch.object(manager, "is_running", False):
-            status = manager.status()
-            assert status["installed"] is False
-            assert status["running"] is False
-            assert status["service_name"] == "com.mlx-serve.server"
+        with patch.object(
+            type(manager), "is_running", new_callable=PropertyMock, return_value=False
+        ):
+            with patch.object(
+                type(manager), "is_enabled", new_callable=PropertyMock, return_value=False
+            ):
+                status = manager.status()
+                assert status["installed"] is False
+                assert status["running"] is False
+                assert status["service_name"] == "com.mlx-serve.server"
 
 
 class TestSystemdManager:
@@ -165,8 +170,13 @@ class TestSystemdManager:
 
     def test_status(self, manager):
         """Test status returns correct info."""
-        with patch.object(manager, "is_running", False):
-            status = manager.status()
-            assert status["installed"] is False
-            assert status["running"] is False
-            assert status["service_name"] == "mlx-serve"
+        with patch.object(
+            type(manager), "is_running", new_callable=PropertyMock, return_value=False
+        ):
+            with patch.object(
+                type(manager), "is_enabled", new_callable=PropertyMock, return_value=False
+            ):
+                status = manager.status()
+                assert status["installed"] is False
+                assert status["running"] is False
+                assert status["service_name"] == "mlx-serve"

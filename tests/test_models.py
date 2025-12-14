@@ -27,8 +27,8 @@ def test_show_model_not_found(client):
     assert response.status_code == 404
 
     data = response.json()
-    assert "error" in data
-    assert data["error"]["code"] == "model_not_found"
+    assert "detail" in data
+    assert data["detail"]["error"]["code"] == "model_not_found"
 
 
 def test_delete_model_not_found(client):

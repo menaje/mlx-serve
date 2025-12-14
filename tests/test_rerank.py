@@ -14,8 +14,8 @@ def test_rerank_model_not_found(client):
     assert response.status_code == 404
 
     data = response.json()
-    assert "error" in data
-    assert data["error"]["code"] == "model_not_found"
+    assert "detail" in data
+    assert data["detail"]["error"]["code"] == "model_not_found"
 
 
 def test_rerank_empty_documents(client):
@@ -31,8 +31,8 @@ def test_rerank_empty_documents(client):
     assert response.status_code == 400
 
     data = response.json()
-    assert "error" in data
-    assert data["error"]["code"] == "invalid_input"
+    assert "detail" in data
+    assert data["detail"]["error"]["code"] == "invalid_input"
 
 
 def test_rerank_request_schema():
