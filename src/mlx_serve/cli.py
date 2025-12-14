@@ -326,23 +326,50 @@ def pull(
         "-t",
         help="Model type (embedding or reranker)",
     ),
+    quantize_bits: Optional[int] = typer.Option(
+        None,
+        "--quantize",
+        "-q",
+        help="Quantize model after download (4 or 8 bits)",
+    ),
 ) -> None:
     """Download and convert a model from Hugging Face."""
+    if quantize_bits is not None and quantize_bits not in [4, 8]:
+        console.print("[red]Quantize bits must be 4 or 8[/red]")
+        raise typer.Exit(1)
+
     console.print(f"[blue]Pulling model: {model}[/blue]")
 
+    model_name = None
+
     async def _pull():
+        nonlocal model_name
         async for status in model_manager.pull_model(model, model_type):
             if status["status"] == "downloading":
                 console.print("[yellow]Downloading...[/yellow]")
             elif status["status"] == "converting":
                 console.print("[yellow]Converting to MLX format...[/yellow]")
             elif status["status"] == "success":
+                model_name = status["name"]
                 console.print(f"[green]Successfully pulled {status['name']}[/green]")
             elif status["status"] == "error":
                 console.print(f"[red]Error: {status['message']}[/red]")
                 raise typer.Exit(1)
 
     asyncio.run(_pull())
+
+    # Quantize if requested
+    if quantize_bits is not None and model_name is not None:
+        from mlx_serve.core.quantizer import get_quantized_model_name, quantize_model
+
+        console.print(f"[blue]Quantizing to {quantize_bits}-bit...[/blue]")
+        success, message = quantize_model(model_name, bits=quantize_bits)
+        if success:
+            quantized_name = get_quantized_model_name(model_name, quantize_bits)
+            console.print(f"[green]{message}[/green]")
+            console.print(f"[dim]Use model name: {quantized_name}[/dim]")
+        else:
+            console.print(f"[red]Quantization failed: {message}[/red]")
 
 
 @app.command("list")

@@ -407,12 +407,15 @@ class ModelManager:
             True if download succeeded, False otherwise.
         """
         import asyncio
+        import concurrent.futures
 
         if model_name is None:
             model_name = hf_repo.split("/")[-1]
 
+        timeout = settings.auto_download_timeout
+
         try:
-            # Run async download synchronously
+            # Run async download synchronously with timeout
             async def _download():
                 async for status in self.pull_model(hf_repo, model_type, model_name):
                     if status["status"] == "error":
@@ -422,7 +425,14 @@ class ModelManager:
                         return True
                 return False
 
-            return asyncio.run(_download())
+            # Use ThreadPoolExecutor to run with timeout
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, _download())
+                try:
+                    return future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    logger.error(f"Auto-download timed out after {timeout}s for {hf_repo}")
+                    return False
 
         except Exception as e:
             logger.error(f"Auto-download failed for {hf_repo}: {e}")

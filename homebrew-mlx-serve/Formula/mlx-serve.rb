@@ -3,7 +3,7 @@ class MlxServe < Formula
 
   desc "MLX-based embedding and reranking server with OpenAI-compatible API"
   homepage "https://github.com/menaje/mlx-serve"
-  url "https://github.com/menaje/mlx-serve/archive/refs/tags/v0.2.0.tar.gz"
+  url "https://github.com/menaje/mlx-serve/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "PLACEHOLDER_SHA256"
   license "MIT"
   head "https://github.com/menaje/mlx-serve.git", branch: "main"
