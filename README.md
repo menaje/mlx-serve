@@ -140,16 +140,23 @@ mlx-serve service uninstall  # Remove service
 
 ### POST /v1/embeddings
 
-Create embeddings for text input.
+Create embeddings for text input (OpenAI-compatible).
 
 **Request:**
 ```json
 {
   "model": "Qwen3-Embedding-0.6B",
   "input": ["text1", "text2"],
-  "encoding_format": "float"
+  "encoding_format": "float",
+  "dimensions": 256
 }
 ```
+
+**Parameters:**
+- `model` (string, required): Model name to use for embedding
+- `input` (string or array, required): Text(s) to embed
+- `encoding_format` (string, optional): Output format - `"float"` (default) or `"base64"`. Base64 uses float32 little-endian encoding for efficiency
+- `dimensions` (integer, optional): Number of dimensions for the output embedding. Requires MRL-trained model (e.g., Qwen3-Embedding). Embeddings are truncated and L2-normalized
 
 **Response:**
 ```json
@@ -163,6 +170,8 @@ Create embeddings for text input.
   "usage": {"prompt_tokens": 10, "total_tokens": 10}
 }
 ```
+
+**Note:** When using `encoding_format: "base64"`, the `embedding` field contains a base64-encoded string instead of a float array. This reduces response size by ~25-35%.
 
 ### POST /v1/rerank
 
