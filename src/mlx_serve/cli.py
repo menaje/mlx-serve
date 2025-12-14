@@ -392,6 +392,51 @@ def remove(
     console.print(f"[green]Removed model: {model}[/green]")
 
 
+@app.command()
+def quantize(
+    model: str = typer.Argument(..., help="Model name to quantize"),
+    bits: int = typer.Option(
+        4,
+        "--bits",
+        "-b",
+        help="Number of bits for quantization (4 or 8)",
+    ),
+    group_size: int = typer.Option(
+        64,
+        "--group-size",
+        "-g",
+        help="Group size for quantization",
+    ),
+) -> None:
+    """Quantize a model to reduce memory usage."""
+    from mlx_serve.core.quantizer import (
+        get_quantized_model_name,
+        list_quantization_options,
+        quantize_model,
+    )
+
+    if bits not in [4, 8]:
+        console.print("[red]Bits must be 4 or 8[/red]")
+        raise typer.Exit(1)
+
+    if not model_manager.is_model_installed(model):
+        console.print(f"[red]Model '{model}' not found[/red]")
+        console.print("Use 'mlx-serve list' to see installed models")
+        raise typer.Exit(1)
+
+    quantized_name = get_quantized_model_name(model, bits)
+    console.print(f"[blue]Quantizing {model} to {bits}-bit...[/blue]")
+    console.print(f"[dim]Output: {quantized_name}[/dim]")
+
+    success, message = quantize_model(model, bits=bits, group_size=group_size)
+
+    if success:
+        console.print(f"[green]{message}[/green]")
+    else:
+        console.print(f"[red]{message}[/red]")
+        raise typer.Exit(1)
+
+
 # Service management commands
 from mlx_serve.core.service_manager import get_platform_name, get_service_manager
 
