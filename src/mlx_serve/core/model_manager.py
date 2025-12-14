@@ -19,6 +19,40 @@ logger = logging.getLogger(__name__)
 
 ModelType = Literal["embedding", "reranker"]
 
+# Model aliases for short names
+MODEL_ALIASES: dict[str, tuple[str, ModelType]] = {
+    # Embedding models
+    "qwen-embedding": ("Qwen/Qwen3-Embedding-0.6B", "embedding"),
+    "qwen-embedding-0.6b": ("Qwen/Qwen3-Embedding-0.6B", "embedding"),
+    "bge-small": ("BAAI/bge-small-en-v1.5", "embedding"),
+    "bge-base": ("BAAI/bge-base-en-v1.5", "embedding"),
+    "bge-large": ("BAAI/bge-large-en-v1.5", "embedding"),
+    # Reranker models
+    "qwen-reranker": ("Qwen/Qwen3-Reranker-0.6B", "reranker"),
+    "qwen-reranker-0.6b": ("Qwen/Qwen3-Reranker-0.6B", "reranker"),
+    "bge-reranker-base": ("BAAI/bge-reranker-base", "reranker"),
+    "bge-reranker-large": ("BAAI/bge-reranker-large", "reranker"),
+}
+
+
+def resolve_model_alias(model_name: str) -> tuple[str, str, ModelType | None]:
+    """
+    Resolve model alias to HuggingFace repo and model type.
+
+    Args:
+        model_name: Model name or alias.
+
+    Returns:
+        Tuple of (resolved_name, hf_repo, model_type).
+        If not an alias, returns (model_name, model_name, None).
+    """
+    lower_name = model_name.lower()
+    if lower_name in MODEL_ALIASES:
+        hf_repo, model_type = MODEL_ALIASES[lower_name]
+        resolved_name = hf_repo.split("/")[-1]
+        return resolved_name, hf_repo, model_type
+    return model_name, model_name, None
+
 
 @dataclass
 class ModelInfo:
@@ -288,44 +322,111 @@ class ModelManager:
         return False
 
     def get_embedding_model(self, model_name: str) -> Any:
-        """Get or load an embedding model."""
-        cached = self._embedding_cache.get(model_name)
+        """Get or load an embedding model.
+
+        If auto_download is enabled and model is not found, attempts to download it.
+        """
+        # Resolve alias
+        resolved_name, hf_repo, _ = resolve_model_alias(model_name)
+
+        cached = self._embedding_cache.get(resolved_name)
         if cached is not None:
-            logger.debug(f"Embedding model cache hit: {model_name}")
+            logger.debug(f"Embedding model cache hit: {resolved_name}")
             return cached
 
-        model_dir = self._get_model_dir(model_name)
-        if not model_dir.exists():
-            raise ValueError(f"Model '{model_name}' not found")
+        model_dir = self._get_model_dir(resolved_name)
 
-        logger.info(f"Loading embedding model: {model_name}")
+        # Try auto-download if enabled and model not found
+        if not model_dir.exists():
+            if settings.auto_download:
+                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                success = self._auto_download_model(hf_repo, "embedding", resolved_name)
+                if not success:
+                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+            else:
+                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+
+        logger.info(f"Loading embedding model: {resolved_name}")
 
         # Import here to avoid loading MLX at module import time
         from mlx_embeddings import load
 
         model, tokenizer = load(str(model_dir))
-        self._embedding_cache.set(model_name, (model, tokenizer))
+        self._embedding_cache.set(resolved_name, (model, tokenizer))
         return model, tokenizer
 
     def get_reranker_model(self, model_name: str) -> Any:
-        """Get or load a reranker model."""
-        cached = self._reranker_cache.get(model_name)
+        """Get or load a reranker model.
+
+        If auto_download is enabled and model is not found, attempts to download it.
+        """
+        # Resolve alias
+        resolved_name, hf_repo, _ = resolve_model_alias(model_name)
+
+        cached = self._reranker_cache.get(resolved_name)
         if cached is not None:
-            logger.debug(f"Reranker model cache hit: {model_name}")
+            logger.debug(f"Reranker model cache hit: {resolved_name}")
             return cached
 
-        model_dir = self._get_model_dir(model_name)
-        if not model_dir.exists():
-            raise ValueError(f"Model '{model_name}' not found")
+        model_dir = self._get_model_dir(resolved_name)
 
-        logger.info(f"Loading reranker model: {model_name}")
+        # Try auto-download if enabled and model not found
+        if not model_dir.exists():
+            if settings.auto_download:
+                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                success = self._auto_download_model(hf_repo, "reranker", resolved_name)
+                if not success:
+                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+            else:
+                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+
+        logger.info(f"Loading reranker model: {resolved_name}")
 
         # Import here to avoid loading MLX at module import time
         from mlx_lm import load
 
         model, tokenizer = load(str(model_dir))
-        self._reranker_cache.set(model_name, (model, tokenizer))
+        self._reranker_cache.set(resolved_name, (model, tokenizer))
         return model, tokenizer
+
+    def _auto_download_model(
+        self,
+        hf_repo: str,
+        model_type: ModelType,
+        model_name: str | None = None,
+    ) -> bool:
+        """
+        Automatically download a model from HuggingFace.
+
+        Args:
+            hf_repo: HuggingFace repository ID.
+            model_type: Type of model (embedding or reranker).
+            model_name: Optional custom name for the model.
+
+        Returns:
+            True if download succeeded, False otherwise.
+        """
+        import asyncio
+
+        if model_name is None:
+            model_name = hf_repo.split("/")[-1]
+
+        try:
+            # Run async download synchronously
+            async def _download():
+                async for status in self.pull_model(hf_repo, model_type, model_name):
+                    if status["status"] == "error":
+                        logger.error(f"Auto-download failed: {status.get('message', 'Unknown error')}")
+                        return False
+                    elif status["status"] == "success":
+                        return True
+                return False
+
+            return asyncio.run(_download())
+
+        except Exception as e:
+            logger.error(f"Auto-download failed for {hf_repo}: {e}")
+            return False
 
     def get_cache_stats(self) -> dict:
         """Get cache statistics."""
