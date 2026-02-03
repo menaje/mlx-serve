@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from mlx_serve import __version__
-from mlx_serve.routers import chat_router, embeddings_router, models_router, rerank_router, tokenize_router
+from mlx_serve.routers import audio_router, chat_router, embeddings_router, models_router, rerank_router, tokenize_router
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ def create_app() -> FastAPI:
     )
 
     # Include routers
+    app.include_router(audio_router)
     app.include_router(chat_router)
     app.include_router(embeddings_router)
     app.include_router(rerank_router)

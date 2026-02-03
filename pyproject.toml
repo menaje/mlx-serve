@@ -54,6 +54,8 @@ dependencies = [
     "cachetools",
     "prometheus-client",
     "Pillow",
+    "soundfile",
+    "python-multipart",
 ]
 
 [project.optional-dependencies]
