@@ -1,0 +1,500 @@
+"""Chat completions API router - OpenAI compatible."""
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from typing import Any, Literal
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from mlx_serve.core.model_manager import model_manager
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["chat"])
+
+
+# Request/Response Models
+class FunctionDefinition(BaseModel):
+    """Function definition for tool use."""
+
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+
+
+class ToolDefinition(BaseModel):
+    """Tool definition for function calling."""
+
+    type: Literal["function"] = "function"
+    function: FunctionDefinition
+
+
+class FunctionCall(BaseModel):
+    """Function call in assistant message."""
+
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    """Tool call in assistant message."""
+
+    id: str
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
+class ChatMessage(BaseModel):
+    """Chat message."""
+
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | None = None
+    name: str | None = None
+    tool_calls: list[ToolCall] | None = None
+    tool_call_id: str | None = None
+
+
+class ChatCompletionRequest(BaseModel):
+    """OpenAI-compatible chat completion request."""
+
+    model: str = Field(..., description="Model name to use")
+    messages: list[ChatMessage] = Field(..., description="List of messages")
+    temperature: float = Field(default=0.7, ge=0, le=2)
+    top_p: float = Field(default=1.0, ge=0, le=1)
+    max_tokens: int | None = Field(default=None, description="Maximum tokens to generate")
+    stream: bool = Field(default=False)
+    stop: str | list[str] | None = Field(default=None)
+    tools: list[ToolDefinition] | None = Field(default=None)
+    tool_choice: str | dict | None = Field(default=None)
+    frequency_penalty: float = Field(default=0.0, ge=-2, le=2)
+    presence_penalty: float = Field(default=0.0, ge=-2, le=2)
+    n: int = Field(default=1, ge=1, le=1)  # Only support n=1 for now
+    user: str | None = None
+
+
+class ChatCompletionChoice(BaseModel):
+    """Chat completion choice."""
+
+    index: int
+    message: ChatMessage
+    finish_reason: Literal["stop", "length", "tool_calls"] | None = None
+
+
+class ChatCompletionUsage(BaseModel):
+    """Token usage information."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class ChatCompletionResponse(BaseModel):
+    """OpenAI-compatible chat completion response."""
+
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: list[ChatCompletionChoice]
+    usage: ChatCompletionUsage
+
+
+class DeltaMessage(BaseModel):
+    """Delta message for streaming."""
+
+    role: str | None = None
+    content: str | None = None
+    tool_calls: list[dict] | None = None
+
+
+class StreamChoice(BaseModel):
+    """Streaming choice."""
+
+    index: int
+    delta: DeltaMessage
+    finish_reason: Literal["stop", "length", "tool_calls"] | None = None
+
+
+class ChatCompletionChunk(BaseModel):
+    """OpenAI-compatible streaming chunk."""
+
+    id: str
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: list[StreamChoice]
+
+
+def _format_messages_for_model(
+    messages: list[ChatMessage],
+    tokenizer: Any,
+    tools: list[ToolDefinition] | None = None,
+) -> str:
+    """Format messages for the model using chat template."""
+    # Convert to the format expected by the tokenizer
+    formatted_messages = []
+    for msg in messages:
+        message_dict = {"role": msg.role, "content": msg.content or ""}
+        if msg.tool_calls:
+            message_dict["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ]
+        if msg.tool_call_id:
+            message_dict["tool_call_id"] = msg.tool_call_id
+        formatted_messages.append(message_dict)
+
+    # Add tools to the conversation if provided
+    tools_dict = None
+    if tools:
+        tools_dict = [
+            {"type": t.type, "function": t.function.model_dump()} for t in tools
+        ]
+
+    try:
+        # Try to use chat template with tools
+        if tools_dict and hasattr(tokenizer, "apply_chat_template"):
+            return tokenizer.apply_chat_template(
+                formatted_messages,
+                tools=tools_dict,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        elif hasattr(tokenizer, "apply_chat_template"):
+            return tokenizer.apply_chat_template(
+                formatted_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+    except Exception as e:
+        logger.warning(f"Chat template failed, using fallback: {e}")
+
+    # Fallback: simple concatenation
+    prompt_parts = []
+    for msg in formatted_messages:
+        role = msg["role"]
+        content = msg.get("content", "")
+        if role == "system":
+            prompt_parts.append(f"System: {content}")
+        elif role == "user":
+            prompt_parts.append(f"User: {content}")
+        elif role == "assistant":
+            prompt_parts.append(f"Assistant: {content}")
+        elif role == "tool":
+            prompt_parts.append(f"Tool Result: {content}")
+    prompt_parts.append("Assistant:")
+    return "\n".join(prompt_parts)
+
+
+def _parse_tool_calls(text: str) -> list[ToolCall] | None:
+    """Parse tool calls from model output."""
+    # Try to parse JSON tool calls from model output
+    # Different models have different formats, try common ones
+
+    # Try Qwen format: <tool_call>{"name": ..., "arguments": ...}</tool_call>
+    import re
+
+    tool_call_pattern = r"<tool_call>(.*?)</tool_call>"
+    matches = re.findall(tool_call_pattern, text, re.DOTALL)
+
+    tool_calls = []
+    for i, match in enumerate(matches):
+        try:
+            data = json.loads(match.strip())
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    function=FunctionCall(
+                        name=data.get("name", ""),
+                        arguments=json.dumps(data.get("arguments", {})),
+                    ),
+                )
+            )
+        except json.JSONDecodeError:
+            continue
+
+    # Try function call format: {"function_call": {"name": ..., "arguments": ...}}
+    if not tool_calls:
+        try:
+            # Look for JSON objects that might be function calls
+            json_pattern = r'\{[^{}]*"name"[^{}]*"arguments"[^{}]*\}'
+            json_matches = re.findall(json_pattern, text)
+            for i, match in enumerate(json_matches):
+                try:
+                    data = json.loads(match)
+                    if "name" in data and "arguments" in data:
+                        tool_calls.append(
+                            ToolCall(
+                                id=f"call_{uuid.uuid4().hex[:8]}",
+                                function=FunctionCall(
+                                    name=data["name"],
+                                    arguments=(
+                                        json.dumps(data["arguments"])
+                                        if isinstance(data["arguments"], dict)
+                                        else str(data["arguments"])
+                                    ),
+                                ),
+                            )
+                        )
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
+
+    return tool_calls if tool_calls else None
+
+
+async def _generate_completion(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    stop: list[str] | None,
+) -> tuple[str, int, int]:
+    """Generate completion synchronously."""
+    from mlx_lm import generate
+
+    loop = asyncio.get_event_loop()
+
+    def _generate():
+        prompt_tokens = len(tokenizer.encode(prompt))
+        response = generate(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temp=temperature,
+            top_p=top_p,
+        )
+        completion_tokens = len(tokenizer.encode(response))
+        return response, prompt_tokens, completion_tokens
+
+    return await loop.run_in_executor(None, _generate)
+
+
+async def _stream_completion(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    stop: list[str] | None,
+    request_id: str,
+    model_name: str,
+    created: int,
+):
+    """Stream completion tokens."""
+    from mlx_lm import stream_generate
+
+    # Send initial chunk with role
+    initial_chunk = ChatCompletionChunk(
+        id=request_id,
+        created=created,
+        model=model_name,
+        choices=[
+            StreamChoice(
+                index=0,
+                delta=DeltaMessage(role="assistant"),
+                finish_reason=None,
+            )
+        ],
+    )
+    yield f"data: {initial_chunk.model_dump_json()}\n\n"
+
+    # Stream tokens
+    loop = asyncio.get_event_loop()
+
+    def _stream():
+        for chunk in stream_generate(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temp=temperature,
+            top_p=top_p,
+        ):
+            yield chunk
+
+    # Run stream in thread and yield results
+    import queue
+    import threading
+
+    q: queue.Queue = queue.Queue()
+    finished = threading.Event()
+
+    def producer():
+        try:
+            for chunk in _stream():
+                q.put(chunk)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=producer)
+    thread.start()
+
+    full_response = ""
+    while not finished.is_set() or not q.empty():
+        try:
+            chunk = q.get(timeout=0.1)
+            if hasattr(chunk, "text"):
+                text = chunk.text
+            else:
+                text = str(chunk)
+
+            full_response += text
+
+            content_chunk = ChatCompletionChunk(
+                id=request_id,
+                created=created,
+                model=model_name,
+                choices=[
+                    StreamChoice(
+                        index=0,
+                        delta=DeltaMessage(content=text),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield f"data: {content_chunk.model_dump_json()}\n\n"
+        except queue.Empty:
+            continue
+
+    thread.join()
+
+    # Send final chunk
+    final_chunk = ChatCompletionChunk(
+        id=request_id,
+        created=created,
+        model=model_name,
+        choices=[
+            StreamChoice(
+                index=0,
+                delta=DeltaMessage(),
+                finish_reason="stop",
+            )
+        ],
+    )
+    yield f"data: {final_chunk.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@router.post("/v1/chat/completions")
+async def create_chat_completion(request: ChatCompletionRequest):
+    """Create a chat completion.
+
+    Supports streaming and tool/function calling.
+    """
+    try:
+        model, tokenizer = model_manager.get_llm_model(request.model)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Model '{request.model}' not found",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            },
+        ) from e
+
+    # Format messages
+    prompt = _format_messages_for_model(request.messages, tokenizer, request.tools)
+
+    # Prepare generation parameters
+    max_tokens = request.max_tokens or 2048
+    stop = [request.stop] if isinstance(request.stop, str) else request.stop
+
+    request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    if request.stream:
+        # Streaming response
+        return StreamingResponse(
+            _stream_completion(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=stop,
+                request_id=request_id,
+                model_name=request.model,
+                created=created,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Non-streaming response
+    try:
+        response_text, prompt_tokens, completion_tokens = await _generate_completion(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            stop=stop,
+        )
+
+        # Check for tool calls in response
+        tool_calls = None
+        finish_reason: Literal["stop", "length", "tool_calls"] = "stop"
+
+        if request.tools:
+            tool_calls = _parse_tool_calls(response_text)
+            if tool_calls:
+                finish_reason = "tool_calls"
+
+        return ChatCompletionResponse(
+            id=request_id,
+            created=created,
+            model=request.model,
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant",
+                        content=response_text if not tool_calls else None,
+                        tool_calls=tool_calls,
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=ChatCompletionUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+        )
+
+    except Exception as e:
+        logger.error(f"Chat completion failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "message": f"Chat completion failed: {str(e)}",
+                    "type": "server_error",
+                    "code": "completion_failed",
+                }
+            },
+        ) from e
