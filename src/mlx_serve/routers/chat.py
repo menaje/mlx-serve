@@ -436,8 +436,6 @@ async def _stream_completion(
     yield f"data: {initial_chunk.model_dump_json()}\n\n"
 
     # Stream tokens
-    loop = asyncio.get_event_loop()
-
     def _stream():
         for chunk in stream_generate(
             model,

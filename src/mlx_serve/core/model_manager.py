@@ -395,7 +395,10 @@ class ModelManager:
                 if not success:
                     raise ValueError(f"Model '{model_name}' not found and auto-download failed")
             else:
-                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+                raise ValueError(
+                    f"Model '{model_name}' not found. "
+                    "Enable auto_download or use 'mlx-serve pull'"
+                )
 
         logger.info(f"Loading embedding model: {resolved_name}")
 
@@ -429,7 +432,10 @@ class ModelManager:
                 if not success:
                     raise ValueError(f"Model '{model_name}' not found and auto-download failed")
             else:
-                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+                raise ValueError(
+                    f"Model '{model_name}' not found. "
+                    "Enable auto_download or use 'mlx-serve pull'"
+                )
 
         logger.info(f"Loading reranker model: {resolved_name}")
 
@@ -461,7 +467,10 @@ class ModelManager:
                 if not success:
                     raise ValueError(f"Model '{model_name}' not found and auto-download failed")
             else:
-                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+                raise ValueError(
+                    f"Model '{model_name}' not found. "
+                    "Enable auto_download or use 'mlx-serve pull'"
+                )
 
         logger.info(f"Loading LLM model: {resolved_name}")
 
@@ -492,7 +501,10 @@ class ModelManager:
                 if not success:
                     raise ValueError(f"Model '{model_name}' not found and auto-download failed")
             else:
-                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+                raise ValueError(
+                    f"Model '{model_name}' not found. "
+                    "Enable auto_download or use 'mlx-serve pull'"
+                )
 
         logger.info(f"Loading VLM model: {resolved_name}")
 
@@ -523,7 +535,10 @@ class ModelManager:
                 if not success:
                     raise ValueError(f"Model '{model_name}' not found and auto-download failed")
             else:
-                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+                raise ValueError(
+                    f"Model '{model_name}' not found. "
+                    "Enable auto_download or use 'mlx-serve pull'"
+                )
 
         logger.info(f"Loading TTS model: {resolved_name}")
 
@@ -554,7 +569,10 @@ class ModelManager:
                 if not success:
                     raise ValueError(f"Model '{model_name}' not found and auto-download failed")
             else:
-                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+                raise ValueError(
+                    f"Model '{model_name}' not found. "
+                    "Enable auto_download or use 'mlx-serve pull'"
+                )
 
         logger.info(f"Loading STT model: {resolved_name}")
 
