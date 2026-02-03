@@ -53,6 +53,7 @@ dependencies = [
     "huggingface-hub",
     "cachetools",
     "prometheus-client",
+    "Pillow",
 ]
 
 [project.optional-dependencies]

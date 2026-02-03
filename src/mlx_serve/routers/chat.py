@@ -1,17 +1,26 @@
 """Chat completions API router - OpenAI compatible."""
 
 import asyncio
+import base64
 import json
 import logging
 import time
 import uuid
+from io import BytesIO
 from typing import Any, Literal
+from urllib.request import urlopen
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from mlx_serve.core.model_manager import model_manager
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +58,35 @@ class ToolCall(BaseModel):
     function: FunctionCall
 
 
+class ImageUrl(BaseModel):
+    """Image URL for vision models."""
+
+    url: str
+    detail: Literal["auto", "low", "high"] = "auto"
+
+
+class ContentPartText(BaseModel):
+    """Text content part."""
+
+    type: Literal["text"] = "text"
+    text: str
+
+
+class ContentPartImage(BaseModel):
+    """Image content part."""
+
+    type: Literal["image_url"] = "image_url"
+    image_url: ImageUrl
+
+
+ContentPart = ContentPartText | ContentPartImage
+
+
 class ChatMessage(BaseModel):
     """Chat message."""
 
     role: Literal["system", "user", "assistant", "tool"]
-    content: str | None = None
+    content: str | list[ContentPart] | None = None
     name: str | None = None
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
@@ -130,6 +163,62 @@ class ChatCompletionChunk(BaseModel):
     choices: list[StreamChoice]
 
 
+def _load_image_from_url(url: str) -> "Image.Image":
+    """Load an image from a URL or base64 data URI."""
+    if not HAS_PIL:
+        raise ImportError("PIL is required for vision features. Install with: pip install Pillow")
+
+    if url.startswith("data:"):
+        # Parse base64 data URI
+        # Format: data:image/png;base64,<data>
+        header, data = url.split(",", 1)
+        image_data = base64.b64decode(data)
+        return Image.open(BytesIO(image_data))
+    else:
+        # Load from URL
+        with urlopen(url) as response:
+            return Image.open(BytesIO(response.read()))
+
+
+def _extract_images_from_messages(messages: list[ChatMessage]) -> list["Image.Image"]:
+    """Extract all images from messages."""
+    images = []
+    for msg in messages:
+        if isinstance(msg.content, list):
+            for part in msg.content:
+                if hasattr(part, "image_url") and part.image_url:
+                    try:
+                        img = _load_image_from_url(part.image_url.url)
+                        images.append(img)
+                    except Exception as e:
+                        logger.warning(f"Failed to load image: {e}")
+    return images
+
+
+def _extract_text_from_content(content: str | list[ContentPart] | None) -> str:
+    """Extract text from content (handles both string and list formats)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    # Extract text parts from list
+    text_parts = []
+    for part in content:
+        if hasattr(part, "text"):
+            text_parts.append(part.text)
+    return " ".join(text_parts)
+
+
+def _has_images(messages: list[ChatMessage]) -> bool:
+    """Check if any message contains images."""
+    for msg in messages:
+        if isinstance(msg.content, list):
+            for part in msg.content:
+                if hasattr(part, "image_url") and part.image_url:
+                    return True
+    return False
+
+
 def _format_messages_for_model(
     messages: list[ChatMessage],
     tokenizer: Any,
@@ -139,7 +228,9 @@ def _format_messages_for_model(
     # Convert to the format expected by the tokenizer
     formatted_messages = []
     for msg in messages:
-        message_dict = {"role": msg.role, "content": msg.content or ""}
+        # Extract text content (handles both string and list formats)
+        content = _extract_text_from_content(msg.content)
+        message_dict = {"role": msg.role, "content": content}
         if msg.tool_calls:
             message_dict["tool_calls"] = [
                 {
@@ -283,6 +374,37 @@ async def _generate_completion(
     return await loop.run_in_executor(None, _generate)
 
 
+async def _generate_vlm_completion(
+    model: Any,
+    processor: Any,
+    prompt: str,
+    images: list["Image.Image"],
+    max_tokens: int,
+    temperature: float,
+) -> tuple[str, int, int]:
+    """Generate completion with vision model."""
+    from mlx_vlm import generate
+
+    loop = asyncio.get_event_loop()
+
+    def _generate():
+        # VLM generate expects images and prompt
+        response = generate(
+            model,
+            processor,
+            prompt,
+            images[0] if images else None,  # Most VLMs handle single image
+            max_tokens=max_tokens,
+            temp=temperature,
+        )
+        # Approximate token counts
+        prompt_tokens = len(prompt.split()) * 2  # Rough estimate
+        completion_tokens = len(response.split()) * 2
+        return response, prompt_tokens, completion_tokens
+
+    return await loop.run_in_executor(None, _generate)
+
+
 async def _stream_completion(
     model: Any,
     tokenizer: Any,
@@ -394,21 +516,44 @@ async def _stream_completion(
 async def create_chat_completion(request: ChatCompletionRequest):
     """Create a chat completion.
 
-    Supports streaming and tool/function calling.
+    Supports streaming, tool/function calling, and vision (image inputs).
     """
-    try:
-        model, tokenizer = model_manager.get_llm_model(request.model)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": {
-                    "message": f"Model '{request.model}' not found",
-                    "type": "invalid_request_error",
-                    "code": "model_not_found",
-                }
-            },
-        ) from e
+    # Check if request contains images
+    has_vision = _has_images(request.messages)
+    images = []
+
+    if has_vision:
+        # Use VLM model for vision requests
+        try:
+            model, processor = model_manager.get_vlm_model(request.model)
+            images = _extract_images_from_messages(request.messages)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "message": f"Vision model '{request.model}' not found",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            ) from e
+        tokenizer = processor  # VLM uses processor instead of tokenizer
+    else:
+        # Use LLM model for text-only requests
+        try:
+            model, tokenizer = model_manager.get_llm_model(request.model)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "message": f"Model '{request.model}' not found",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            ) from e
 
     # Format messages
     prompt = _format_messages_for_model(request.messages, tokenizer, request.tools)
@@ -420,8 +565,9 @@ async def create_chat_completion(request: ChatCompletionRequest):
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
-    if request.stream:
-        # Streaming response
+    # Vision models don't support streaming yet
+    if request.stream and not has_vision:
+        # Streaming response (text-only)
         return StreamingResponse(
             _stream_completion(
                 model=model,
@@ -445,15 +591,27 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     # Non-streaming response
     try:
-        response_text, prompt_tokens, completion_tokens = await _generate_completion(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            stop=stop,
-        )
+        if has_vision:
+            # Use VLM generation
+            response_text, prompt_tokens, completion_tokens = await _generate_vlm_completion(
+                model=model,
+                processor=tokenizer,
+                prompt=prompt,
+                images=images,
+                max_tokens=max_tokens,
+                temperature=request.temperature,
+            )
+        else:
+            # Use LLM generation
+            response_text, prompt_tokens, completion_tokens = await _generate_completion(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=stop,
+            )
 
         # Check for tool calls in response
         tool_calls = None
