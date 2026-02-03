@@ -498,3 +498,273 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 }
             },
         ) from e
+
+
+# Text Completions API (Legacy)
+class CompletionRequest(BaseModel):
+    """OpenAI-compatible text completion request."""
+
+    model: str = Field(..., description="Model name to use")
+    prompt: str | list[str] = Field(..., description="Prompt(s) to complete")
+    max_tokens: int | None = Field(default=16, description="Maximum tokens to generate")
+    temperature: float = Field(default=1.0, ge=0, le=2)
+    top_p: float = Field(default=1.0, ge=0, le=1)
+    n: int = Field(default=1, ge=1, le=1)
+    stream: bool = Field(default=False)
+    stop: str | list[str] | None = Field(default=None)
+    presence_penalty: float = Field(default=0.0, ge=-2, le=2)
+    frequency_penalty: float = Field(default=0.0, ge=-2, le=2)
+    logprobs: int | None = Field(default=None)
+    echo: bool = Field(default=False)
+    suffix: str | None = Field(default=None)
+    user: str | None = None
+
+
+class CompletionChoice(BaseModel):
+    """Text completion choice."""
+
+    text: str
+    index: int
+    logprobs: dict | None = None
+    finish_reason: Literal["stop", "length"] | None = None
+
+
+class CompletionUsage(BaseModel):
+    """Token usage information."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class CompletionResponse(BaseModel):
+    """OpenAI-compatible text completion response."""
+
+    id: str
+    object: Literal["text_completion"] = "text_completion"
+    created: int
+    model: str
+    choices: list[CompletionChoice]
+    usage: CompletionUsage
+
+
+class CompletionStreamChoice(BaseModel):
+    """Streaming completion choice."""
+
+    text: str
+    index: int
+    logprobs: dict | None = None
+    finish_reason: Literal["stop", "length"] | None = None
+
+
+class CompletionChunk(BaseModel):
+    """OpenAI-compatible streaming completion chunk."""
+
+    id: str
+    object: Literal["text_completion"] = "text_completion"
+    created: int
+    model: str
+    choices: list[CompletionStreamChoice]
+
+
+async def _stream_text_completion(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    stop: list[str] | None,
+    request_id: str,
+    model_name: str,
+    created: int,
+    echo: bool = False,
+):
+    """Stream text completion tokens."""
+    from mlx_lm import stream_generate
+
+    # Echo the prompt if requested
+    if echo:
+        echo_chunk = CompletionChunk(
+            id=request_id,
+            created=created,
+            model=model_name,
+            choices=[
+                CompletionStreamChoice(
+                    text=prompt,
+                    index=0,
+                    finish_reason=None,
+                )
+            ],
+        )
+        yield f"data: {echo_chunk.model_dump_json()}\n\n"
+
+    # Stream tokens
+    import queue
+    import threading
+
+    def _stream():
+        for chunk in stream_generate(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temp=temperature,
+            top_p=top_p,
+        ):
+            yield chunk
+
+    q: queue.Queue = queue.Queue()
+    finished = threading.Event()
+
+    def producer():
+        try:
+            for chunk in _stream():
+                q.put(chunk)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=producer)
+    thread.start()
+
+    while not finished.is_set() or not q.empty():
+        try:
+            chunk = q.get(timeout=0.1)
+            if hasattr(chunk, "text"):
+                text = chunk.text
+            else:
+                text = str(chunk)
+
+            content_chunk = CompletionChunk(
+                id=request_id,
+                created=created,
+                model=model_name,
+                choices=[
+                    CompletionStreamChoice(
+                        text=text,
+                        index=0,
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield f"data: {content_chunk.model_dump_json()}\n\n"
+        except queue.Empty:
+            continue
+
+    thread.join()
+
+    # Send final chunk
+    final_chunk = CompletionChunk(
+        id=request_id,
+        created=created,
+        model=model_name,
+        choices=[
+            CompletionStreamChoice(
+                text="",
+                index=0,
+                finish_reason="stop",
+            )
+        ],
+    )
+    yield f"data: {final_chunk.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@router.post("/v1/completions", response_model=CompletionResponse)
+async def create_completion(request: CompletionRequest):
+    """Create a text completion.
+
+    This is the legacy completions API. For new applications,
+    use /v1/chat/completions instead.
+    """
+    try:
+        model, tokenizer = model_manager.get_llm_model(request.model)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Model '{request.model}' not found",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            },
+        ) from e
+
+    # Normalize prompt to string (take first if list)
+    prompt = request.prompt if isinstance(request.prompt, str) else request.prompt[0]
+
+    max_tokens = request.max_tokens or 16
+    stop = [request.stop] if isinstance(request.stop, str) else request.stop
+
+    request_id = f"cmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    if request.stream:
+        return StreamingResponse(
+            _stream_text_completion(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=stop,
+                request_id=request_id,
+                model_name=request.model,
+                created=created,
+                echo=request.echo,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Non-streaming response
+    try:
+        response_text, prompt_tokens, completion_tokens = await _generate_completion(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            stop=stop,
+        )
+
+        # Handle echo option
+        output_text = (prompt + response_text) if request.echo else response_text
+
+        return CompletionResponse(
+            id=request_id,
+            created=created,
+            model=request.model,
+            choices=[
+                CompletionChoice(
+                    text=output_text,
+                    index=0,
+                    finish_reason="stop",
+                )
+            ],
+            usage=CompletionUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+        )
+
+    except Exception as e:
+        logger.error(f"Text completion failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "message": f"Text completion failed: {str(e)}",
+                    "type": "server_error",
+                    "code": "completion_failed",
+                }
+            },
+        ) from e
