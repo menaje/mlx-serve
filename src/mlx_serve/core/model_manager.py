@@ -638,7 +638,8 @@ class ModelManager:
             async def _download():
                 async for status in self.pull_model(hf_repo, model_type, model_name):
                     if status["status"] == "error":
-                        logger.error(f"Auto-download failed: {status.get('message', 'Unknown error')}")
+                        err_msg = status.get('message', 'Unknown error')
+                        logger.error(f"Auto-download failed: {err_msg}")
                         return False
                     elif status["status"] == "success":
                         return True

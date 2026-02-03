@@ -5,7 +5,6 @@ import base64
 import io
 import logging
 import time
-import uuid
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
