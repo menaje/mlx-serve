@@ -162,18 +162,22 @@ class ModelManager:
     """Singleton manager for MLX models."""
 
     _instance: "ModelManager | None" = None
+    _lock: threading.Lock = threading.Lock()
 
     def __new__(cls) -> "ModelManager":
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
+            with cls._lock:
+                # Double-check locking pattern
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
         return cls._instance
 
     def __init__(self) -> None:
-        if self._initialized:
-            return
-
-        self._initialized = True
+        with self._lock:
+            if self._initialized:
+                return
+            self._initialized = True
         self._embedding_cache = TTLLRUCache(
             maxsize=settings.cache_max_embedding_models,
             ttl=settings.cache_ttl_seconds,
@@ -237,7 +241,11 @@ class ModelManager:
     def _load_metadata(self) -> None:
         """Load model metadata from disk."""
         if self._metadata_path.exists():
-            self._metadata = json.loads(self._metadata_path.read_text())
+            try:
+                self._metadata = json.loads(self._metadata_path.read_text())
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse metadata file, resetting: {e}")
+                self._metadata = {}
         else:
             self._metadata = {}
 
@@ -301,51 +309,212 @@ class ModelManager:
         """Check if a model is installed."""
         return model_name in self._metadata and self._get_model_dir(model_name).exists()
 
+    def get_model_type(self, model_name: str) -> ModelType | None:
+        """Get the type of an installed model."""
+        resolved_name, _, _ = resolve_model_alias(model_name)
+        if resolved_name in self._metadata:
+            return self._metadata[resolved_name].get("type")
+        return None
+
     async def pull_model(
         self,
         hf_repo: str,
         model_type: ModelType,
         model_name: str | None = None,
+        quantize: int | None = None,
+        keep_original: bool = False,
     ) -> AsyncIterator[dict]:
         """
-        Download and convert a model from Hugging Face.
+        Download and convert a model from Hugging Face to MLX format.
+
+        Args:
+            hf_repo: HuggingFace repository ID.
+            model_type: Type of model.
+            model_name: Optional custom name for the model.
+            quantize: Quantization bits (4 or 8). None for no quantization.
+            keep_original: If False, delete HF cache after conversion (default: False).
 
         Yields status updates during the process.
         """
         if model_name is None:
             model_name = hf_repo.split("/")[-1]
 
-        model_dir = self._get_model_dir(model_name)
+        # Add quantization suffix to model name
+        if quantize:
+            output_name = f"{model_name}-{quantize}bit"
+        else:
+            output_name = model_name
+
+        model_dir = self._get_model_dir(output_name)
 
         try:
-            yield {"status": "downloading", "name": model_name}
+            yield {"status": "downloading", "name": output_name, "hf_repo": hf_repo}
 
-            # Download from Hugging Face
-            snapshot_download(
-                repo_id=hf_repo,
-                local_dir=str(model_dir),
-                local_dir_use_symlinks=False,
-            )
+            # Check if model is already in MLX format (from mlx-community etc)
+            is_mlx_model = self._is_mlx_format_repo(hf_repo)
 
-            yield {"status": "converting", "name": model_name}
+            if is_mlx_model and not quantize:
+                # MLX model without quantization: direct download
+                snapshot_download(
+                    repo_id=hf_repo,
+                    local_dir=str(model_dir),
+                    local_dir_use_symlinks=False,
+                )
+                yield {"status": "converting", "name": output_name, "detail": "Already MLX format"}
+            else:
+                # Need conversion: download to temp then convert
+                yield {"status": "converting", "name": output_name}
 
-            # For MLX models, conversion is handled by the respective libraries
-            # mlx-embeddings and mlx-lm handle conversion on first load
+                convert_success = await self._convert_model(
+                    hf_repo=hf_repo,
+                    output_dir=model_dir,
+                    model_type=model_type,
+                    quantize=quantize,
+                )
+
+                if not convert_success:
+                    yield {"status": "error", "message": "Conversion failed"}
+                    return
+
+                # Clean up HF cache if not keeping original
+                if not keep_original:
+                    yield {"status": "cleaning", "name": output_name, "detail": "Removing HF cache"}
+                    self._cleanup_hf_cache(hf_repo)
 
             # Update metadata
-            self._metadata[model_name] = {
+            metadata_entry = {
                 "type": model_type,
                 "hf_repo": hf_repo,
                 "size": self._get_dir_size(model_dir),
                 "modified_at": datetime.now().isoformat(),
             }
+            if quantize:
+                metadata_entry["quantization"] = {"bits": quantize}
+
+            self._metadata[output_name] = metadata_entry
             self._save_metadata()
 
-            yield {"status": "success", "name": model_name}
+            yield {"status": "success", "name": output_name}
 
         except Exception as e:
             logger.error(f"Failed to pull model {hf_repo}: {e}")
             yield {"status": "error", "message": str(e)}
+
+    def _is_mlx_format_repo(self, hf_repo: str) -> bool:
+        """Check if a HuggingFace repo is already in MLX format."""
+        mlx_indicators = ["mlx-community", "mlx-", "-mlx", "4bit", "8bit"]
+        repo_lower = hf_repo.lower()
+        return any(indicator in repo_lower for indicator in mlx_indicators)
+
+    def _cleanup_hf_cache(self, hf_repo: str) -> bool:
+        """
+        Remove a model from the HuggingFace cache.
+
+        Args:
+            hf_repo: HuggingFace repository ID.
+
+        Returns:
+            True if cleanup succeeded, False otherwise.
+        """
+        try:
+            from huggingface_hub import scan_cache_dir
+
+            cache_info = scan_cache_dir()
+
+            # Find the repo in cache
+            for repo in cache_info.repos:
+                if repo.repo_id == hf_repo:
+                    # Delete all revisions of this repo
+                    delete_strategy = cache_info.delete_revisions(
+                        *[rev.commit_hash for rev in repo.revisions]
+                    )
+                    delete_strategy.execute()
+                    # Log cleanup (freed_size_str may not exist in all versions)
+                    freed_size = getattr(delete_strategy, 'freed_size_str', 'unknown size')
+                    logger.info(f"Cleaned up HF cache for {hf_repo}: freed {freed_size}")
+                    return True
+
+            logger.debug(f"Model {hf_repo} not found in HF cache")
+            return True  # Not an error if not in cache
+
+        except Exception as e:
+            logger.warning(f"Failed to cleanup HF cache for {hf_repo}: {e}")
+            return False
+
+    async def _convert_model(
+        self,
+        hf_repo: str,
+        output_dir: Path,
+        model_type: ModelType,
+        quantize: int | None = None,
+    ) -> bool:
+        """
+        Convert a HuggingFace model to MLX format.
+
+        Args:
+            hf_repo: HuggingFace repository ID.
+            output_dir: Output directory for converted model.
+            model_type: Type of model (determines which converter to use).
+            quantize: Quantization bits (4 or 8). None for no quantization.
+
+        Returns:
+            True if conversion succeeded, False otherwise.
+        """
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+
+        def _do_convert():
+            try:
+                if model_type in ("llm", "reranker"):
+                    from mlx_lm import convert
+
+                    convert(
+                        hf_repo,
+                        mlx_path=str(output_dir),
+                        quantize=quantize is not None,
+                        q_bits=quantize or 4,
+                    )
+                elif model_type == "vlm":
+                    from mlx_vlm import convert
+
+                    convert(
+                        hf_repo,
+                        mlx_path=str(output_dir),
+                        quantize=quantize is not None,
+                        q_bits=quantize or 4,
+                    )
+                elif model_type == "embedding":
+                    try:
+                        from mlx_embeddings import convert
+
+                        convert(
+                            hf_repo,
+                            mlx_path=str(output_dir),
+                            quantize=quantize is not None,
+                            q_bits=quantize or 4,
+                        )
+                    except (ImportError, AttributeError):
+                        # mlx_embeddings may not have convert, use snapshot_download
+                        snapshot_download(
+                            repo_id=hf_repo,
+                            local_dir=str(output_dir),
+                            local_dir_use_symlinks=False,
+                        )
+                else:
+                    # For tts, stt, image_gen: direct download (specialized formats)
+                    snapshot_download(
+                        repo_id=hf_repo,
+                        local_dir=str(output_dir),
+                        local_dir_use_symlinks=False,
+                    )
+
+                return True
+            except Exception as e:
+                logger.error(f"Conversion failed: {e}")
+                return False
+
+        return await loop.run_in_executor(None, _do_convert)
 
     def delete_model(self, model_name: str) -> bool:
         """Delete a model from disk."""

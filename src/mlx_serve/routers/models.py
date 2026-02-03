@@ -52,6 +52,12 @@ class PullRequest(BaseModel):
 
     name: str = Field(..., description="Hugging Face repo ID (e.g., Qwen/Qwen3-Embedding-0.6B)")
     type: ModelType = Field(default="embedding", description="Model type")
+    quantize: int | None = Field(
+        default=None, description="Quantization bits (4 or 8). None for no quantization."
+    )
+    keep_original: bool = Field(
+        default=False, description="Keep original model in HuggingFace cache after conversion"
+    )
 
 
 class DeleteRequest(BaseModel):
@@ -115,13 +121,19 @@ async def list_models_ollama() -> OllamaTagsResponse:
 
 @router.post("/api/pull")
 async def pull_model(request: PullRequest) -> StreamingResponse:
-    """Download and convert a model from Hugging Face."""
+    """Download and convert a model from Hugging Face to MLX format.
+
+    Supports optional quantization (4-bit or 8-bit) during conversion.
+    By default, HuggingFace cache is cleaned up after conversion.
+    """
     import json
 
     async def generate():
         async for status in model_manager.pull_model(
             hf_repo=request.name,
             model_type=request.type,
+            quantize=request.quantize,
+            keep_original=request.keep_original,
         ):
             yield json.dumps(status) + "\n"
 

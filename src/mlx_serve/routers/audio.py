@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["audio"])
 
+# Security constants
+MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024  # 25MB max (OpenAI limit)
+
 
 # TTS Models
 class SpeechRequest(BaseModel):
@@ -30,6 +33,10 @@ class SpeechRequest(BaseModel):
         description="Audio format",
     )
     speed: float = Field(default=1.0, ge=0.25, le=4.0, description="Speed of speech")
+    instructions: str | None = Field(
+        default=None,
+        description="Instructions for voice style (model-dependent)",
+    )
 
 
 async def _generate_speech(
@@ -40,7 +47,7 @@ async def _generate_speech(
     response_format: str,
 ) -> bytes:
     """Generate speech from text."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _synthesize():
         from mlx_audio.tts import generate
@@ -189,17 +196,24 @@ async def _transcribe_audio(
     audio_path: str,
     language: str | None,
     response_format: str,
+    timestamp_granularities: list[str] | None = None,
 ) -> dict:
     """Transcribe audio to text."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _transcribe():
         from mlx_audio.stt import transcribe
+
+        # Determine if word-level timestamps are requested
+        word_timestamps = (
+            timestamp_granularities is not None and "word" in timestamp_granularities
+        )
 
         result = transcribe(
             model,
             audio_path,
             language=language,
+            word_timestamps=word_timestamps,
         )
         return result
 
@@ -214,6 +228,10 @@ async def create_transcription(
     prompt: str | None = Form(default=None, description="Optional prompt to guide transcription"),
     response_format: str = Form(default="json", description="Response format"),
     temperature: float = Form(default=0.0, description="Sampling temperature"),
+    timestamp_granularities: list[str] | None = Form(
+        default=None,
+        description="Timestamp granularities: 'word' and/or 'segment' (verbose_json only)",
+    ),
 ):
     """Transcribe audio to text.
 
@@ -233,19 +251,34 @@ async def create_transcription(
             },
         ) from e
 
+    # Read and validate file size
+    content = await file.read()
+    if len(content) > MAX_AUDIO_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": {
+                    "message": f"Audio file too large. Maximum size is {MAX_AUDIO_FILE_SIZE // (1024 * 1024)}MB",
+                    "type": "invalid_request_error",
+                    "code": "file_too_large",
+                }
+            },
+        )
+
     # Save uploaded file temporarily
     suffix = Path(file.filename).suffix if file.filename else ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
+    tmp_path: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
         result = await _transcribe_audio(
             model=stt_model,
             audio_path=tmp_path,
             language=language,
             response_format=response_format,
+            timestamp_granularities=timestamp_granularities,
         )
 
         # Handle different result formats
@@ -267,6 +300,8 @@ async def create_transcription(
 
         return TranscriptionResponse(text=text)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Transcription failed: {e}")
         raise HTTPException(
@@ -281,7 +316,8 @@ async def create_transcription(
         ) from e
     finally:
         # Clean up temp file
-        try:
-            Path(tmp_path).unlink()
-        except Exception:
-            pass
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink()
+            except Exception:
+                pass

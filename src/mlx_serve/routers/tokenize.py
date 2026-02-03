@@ -45,7 +45,7 @@ async def _tokenize_texts(
     tokenizer, texts: list[str], return_tokens: bool
 ) -> list[TokenData]:
     """Tokenize texts and return token counts."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _tokenize():
         results = []

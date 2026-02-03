@@ -104,7 +104,7 @@ async def _generate_embeddings_batch(
     """Generate embeddings using batch processing."""
     from mlx_embeddings import generate
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _generate():
         result = generate(model, tokenizer, texts)
@@ -153,7 +153,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         embeddings_list = await _generate_embeddings_batch(model, tokenizer, texts)
 
         # Calculate token count (approximate)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         total_tokens = await loop.run_in_executor(
             None,
             lambda: sum(len(tokenizer.encode(text)) for text in texts)
@@ -163,8 +163,20 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         processed_embeddings: list[list[float] | str] = []
         for emb in embeddings_list:
             # 1. Apply dimensions truncation if requested
-            if request.dimensions and request.dimensions < len(emb):
-                emb = truncate_embedding(emb, request.dimensions)
+            if request.dimensions:
+                if request.dimensions > len(emb):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": {
+                                "message": f"Requested dimensions ({request.dimensions}) exceeds model embedding size ({len(emb)})",
+                                "type": "invalid_request_error",
+                                "code": "invalid_dimensions",
+                            }
+                        },
+                    )
+                if request.dimensions < len(emb):
+                    emb = truncate_embedding(emb, request.dimensions)
 
             # 2. Apply encoding format
             if request.encoding_format == "base64":

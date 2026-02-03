@@ -127,7 +127,7 @@ async def _compute_batch_scores(
     model, tokenizer, query: str, documents: list[str], instruction: str | None = None
 ) -> tuple[list[float], int]:
     """Compute rerank scores for all documents using batch processing."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _compute():
         import mlx.core as mx

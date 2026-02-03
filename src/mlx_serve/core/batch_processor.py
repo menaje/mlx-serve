@@ -152,7 +152,7 @@ class BatchProcessor(Generic[T, R]):
 
         try:
             # Run processing in executor to avoid blocking event loop
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(None, self.process_fn, inputs)
 
             # Distribute results
@@ -213,7 +213,7 @@ class EmbeddingBatchProcessor:
             return [await self._processor.submit(texts[0])]
 
         # For multi-text requests, process directly as a batch
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, self._generate_embeddings, texts
         )
@@ -322,7 +322,7 @@ class RerankBatchProcessor:
         Returns:
             List of relevance scores.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             self.compute_scores,

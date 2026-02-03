@@ -345,52 +345,63 @@ def pull(
         "embedding",
         "--type",
         "-t",
-        help="Model type (embedding or reranker)",
+        help="Model type (embedding, reranker, llm, vlm, tts, stt, image_gen)",
     ),
     quantize_bits: Optional[int] = typer.Option(
         None,
         "--quantize",
         "-q",
-        help="Quantize model after download (4 or 8 bits)",
+        help="Quantize model during conversion (4 or 8 bits)",
+    ),
+    keep_original: bool = typer.Option(
+        False,
+        "--keep-original",
+        "-k",
+        help="Keep original model in HuggingFace cache after conversion",
     ),
 ) -> None:
-    """Download and convert a model from Hugging Face."""
+    """Download and convert a model from Hugging Face to MLX format.
+
+    By default, the original HuggingFace cache is deleted after conversion
+    to save disk space. Use --keep-original to preserve it.
+
+    Examples:
+        mlx-serve pull Qwen/Qwen3-Embedding-0.6B --type embedding
+        mlx-serve pull meta-llama/Llama-3.2-1B-Instruct --type llm --quantize 4
+        mlx-serve pull mlx-community/Qwen2.5-7B-Instruct-4bit --type llm
+        mlx-serve pull meta-llama/Llama-3.2-1B --type llm --keep-original
+    """
     if quantize_bits is not None and quantize_bits not in [4, 8]:
         console.print("[red]Quantize bits must be 4 or 8[/red]")
         raise typer.Exit(1)
 
     console.print(f"[blue]Pulling model: {model}[/blue]")
-
-    model_name = None
+    if quantize_bits:
+        console.print(f"[blue]Quantization: {quantize_bits}-bit[/blue]")
 
     async def _pull():
-        nonlocal model_name
-        async for status in model_manager.pull_model(model, model_type):
+        async for status in model_manager.pull_model(
+            hf_repo=model,
+            model_type=model_type,
+            quantize=quantize_bits,
+            keep_original=keep_original,
+        ):
             if status["status"] == "downloading":
-                console.print("[yellow]Downloading...[/yellow]")
+                hf_repo = status.get("hf_repo", model)
+                console.print(f"[yellow]Downloading from {hf_repo}...[/yellow]")
             elif status["status"] == "converting":
-                console.print("[yellow]Converting to MLX format...[/yellow]")
+                detail = status.get("detail", "Converting to MLX format")
+                console.print(f"[yellow]{detail}...[/yellow]")
+            elif status["status"] == "cleaning":
+                console.print("[yellow]Cleaning up HuggingFace cache...[/yellow]")
             elif status["status"] == "success":
-                model_name = status["name"]
-                console.print(f"[green]Successfully pulled {status['name']}[/green]")
+                console.print(f"[green]Successfully pulled: {status['name']}[/green]")
+                console.print(f"[dim]Use model name: {status['name']}[/dim]")
             elif status["status"] == "error":
                 console.print(f"[red]Error: {status['message']}[/red]")
                 raise typer.Exit(1)
 
     asyncio.run(_pull())
-
-    # Quantize if requested
-    if quantize_bits is not None and model_name is not None:
-        from mlx_serve.core.quantizer import get_quantized_model_name, quantize_model
-
-        console.print(f"[blue]Quantizing to {quantize_bits}-bit...[/blue]")
-        success, message = quantize_model(model_name, bits=quantize_bits)
-        if success:
-            quantized_name = get_quantized_model_name(model_name, quantize_bits)
-            console.print(f"[green]{message}[/green]")
-            console.print(f"[dim]Use model name: {quantized_name}[/dim]")
-        else:
-            console.print(f"[red]Quantization failed: {message}[/red]")
 
 
 @app.command("list")
