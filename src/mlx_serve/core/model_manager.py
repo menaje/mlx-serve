@@ -17,7 +17,7 @@ from mlx_serve.config import settings
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["embedding", "reranker"]
+ModelType = Literal["embedding", "reranker", "llm", "vlm", "tts", "stt", "image_gen"]
 
 # Model aliases for short names
 MODEL_ALIASES: dict[str, tuple[str, ModelType]] = {
@@ -32,6 +32,25 @@ MODEL_ALIASES: dict[str, tuple[str, ModelType]] = {
     "qwen-reranker-0.6b": ("Qwen/Qwen3-Reranker-0.6B", "reranker"),
     "bge-reranker-base": ("BAAI/bge-reranker-base", "reranker"),
     "bge-reranker-large": ("BAAI/bge-reranker-large", "reranker"),
+    # LLM models
+    "llama-3.2-1b": ("mlx-community/Llama-3.2-1B-Instruct-4bit", "llm"),
+    "llama-3.2-3b": ("mlx-community/Llama-3.2-3B-Instruct-4bit", "llm"),
+    "qwen2.5-3b": ("mlx-community/Qwen2.5-3B-Instruct-4bit", "llm"),
+    "qwen2.5-7b": ("mlx-community/Qwen2.5-7B-Instruct-4bit", "llm"),
+    "mistral-7b": ("mlx-community/Mistral-7B-Instruct-v0.3-4bit", "llm"),
+    # VLM models
+    "qwen2-vl-2b": ("mlx-community/Qwen2-VL-2B-Instruct-4bit", "vlm"),
+    "qwen2-vl-7b": ("mlx-community/Qwen2-VL-7B-Instruct-4bit", "vlm"),
+    "llava-1.5-7b": ("mlx-community/llava-1.5-7b-4bit", "vlm"),
+    # TTS models
+    "kokoro": ("prince-canuma/Kokoro-82M", "tts"),
+    "kokoro-82m": ("prince-canuma/Kokoro-82M", "tts"),
+    # STT models
+    "whisper-large-v3-turbo": ("mlx-community/whisper-large-v3-turbo", "stt"),
+    "whisper-small": ("mlx-community/whisper-small-mlx", "stt"),
+    # Image generation models
+    "flux-schnell": ("black-forest-labs/FLUX.1-schnell", "image_gen"),
+    "flux-dev": ("black-forest-labs/FLUX.1-dev", "image_gen"),
 }
 
 
@@ -163,6 +182,26 @@ class ModelManager:
             maxsize=settings.cache_max_reranker_models,
             ttl=settings.cache_ttl_seconds,
         )
+        self._llm_cache = TTLLRUCache(
+            maxsize=settings.cache_max_llm_models,
+            ttl=settings.cache_ttl_seconds,
+        )
+        self._vlm_cache = TTLLRUCache(
+            maxsize=settings.cache_max_vlm_models,
+            ttl=settings.cache_ttl_seconds,
+        )
+        self._tts_cache = TTLLRUCache(
+            maxsize=settings.cache_max_tts_models,
+            ttl=settings.cache_ttl_seconds,
+        )
+        self._stt_cache = TTLLRUCache(
+            maxsize=settings.cache_max_stt_models,
+            ttl=settings.cache_ttl_seconds,
+        )
+        self._image_gen_cache = TTLLRUCache(
+            maxsize=settings.cache_max_image_gen_models,
+            ttl=settings.cache_ttl_seconds,
+        )
         self._metadata_path = settings.models_dir.parent / "metadata.json"
         self._metadata: dict[str, dict] = {}
 
@@ -178,12 +217,19 @@ class ModelManager:
         def cleanup_loop():
             while True:
                 time.sleep(60)  # Check every minute
-                expired_embeddings = self._embedding_cache.cleanup_expired()
-                expired_rerankers = self._reranker_cache.cleanup_expired()
-                if expired_embeddings:
-                    logger.info(f"Cleaned up expired embedding models: {expired_embeddings}")
-                if expired_rerankers:
-                    logger.info(f"Cleaned up expired reranker models: {expired_rerankers}")
+                caches = [
+                    ("embedding", self._embedding_cache),
+                    ("reranker", self._reranker_cache),
+                    ("llm", self._llm_cache),
+                    ("vlm", self._vlm_cache),
+                    ("tts", self._tts_cache),
+                    ("stt", self._stt_cache),
+                    ("image_gen", self._image_gen_cache),
+                ]
+                for cache_name, cache in caches:
+                    expired = cache.cleanup_expired()
+                    if expired:
+                        logger.info(f"Cleaned up expired {cache_name} models: {expired}")
 
         thread = threading.Thread(target=cleanup_loop, daemon=True)
         thread.start()
@@ -305,9 +351,14 @@ class ModelManager:
         """Delete a model from disk."""
         model_dir = self._get_model_dir(model_name)
 
-        # Remove from cache
+        # Remove from all caches
         self._embedding_cache.remove(model_name)
         self._reranker_cache.remove(model_name)
+        self._llm_cache.remove(model_name)
+        self._vlm_cache.remove(model_name)
+        self._tts_cache.remove(model_name)
+        self._stt_cache.remove(model_name)
+        self._image_gen_cache.remove(model_name)
 
         # Remove from metadata
         if model_name in self._metadata:
@@ -389,6 +440,156 @@ class ModelManager:
         self._reranker_cache.set(resolved_name, (model, tokenizer))
         return model, tokenizer
 
+    def get_llm_model(self, model_name: str) -> Any:
+        """Get or load an LLM model for text generation.
+
+        If auto_download is enabled and model is not found, attempts to download it.
+        """
+        resolved_name, hf_repo, _ = resolve_model_alias(model_name)
+
+        cached = self._llm_cache.get(resolved_name)
+        if cached is not None:
+            logger.debug(f"LLM model cache hit: {resolved_name}")
+            return cached
+
+        model_dir = self._get_model_dir(resolved_name)
+
+        if not model_dir.exists():
+            if settings.auto_download:
+                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                success = self._auto_download_model(hf_repo, "llm", resolved_name)
+                if not success:
+                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+            else:
+                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+
+        logger.info(f"Loading LLM model: {resolved_name}")
+
+        from mlx_lm import load
+
+        model, tokenizer = load(str(model_dir))
+        self._llm_cache.set(resolved_name, (model, tokenizer))
+        return model, tokenizer
+
+    def get_vlm_model(self, model_name: str) -> Any:
+        """Get or load a Vision-Language model.
+
+        If auto_download is enabled and model is not found, attempts to download it.
+        """
+        resolved_name, hf_repo, _ = resolve_model_alias(model_name)
+
+        cached = self._vlm_cache.get(resolved_name)
+        if cached is not None:
+            logger.debug(f"VLM model cache hit: {resolved_name}")
+            return cached
+
+        model_dir = self._get_model_dir(resolved_name)
+
+        if not model_dir.exists():
+            if settings.auto_download:
+                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                success = self._auto_download_model(hf_repo, "vlm", resolved_name)
+                if not success:
+                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+            else:
+                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+
+        logger.info(f"Loading VLM model: {resolved_name}")
+
+        from mlx_vlm import load
+
+        model, processor = load(str(model_dir))
+        self._vlm_cache.set(resolved_name, (model, processor))
+        return model, processor
+
+    def get_tts_model(self, model_name: str) -> Any:
+        """Get or load a TTS (Text-to-Speech) model.
+
+        If auto_download is enabled and model is not found, attempts to download it.
+        """
+        resolved_name, hf_repo, _ = resolve_model_alias(model_name)
+
+        cached = self._tts_cache.get(resolved_name)
+        if cached is not None:
+            logger.debug(f"TTS model cache hit: {resolved_name}")
+            return cached
+
+        model_dir = self._get_model_dir(resolved_name)
+
+        if not model_dir.exists():
+            if settings.auto_download:
+                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                success = self._auto_download_model(hf_repo, "tts", resolved_name)
+                if not success:
+                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+            else:
+                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+
+        logger.info(f"Loading TTS model: {resolved_name}")
+
+        from mlx_audio.tts import load
+
+        model = load(str(model_dir))
+        self._tts_cache.set(resolved_name, model)
+        return model
+
+    def get_stt_model(self, model_name: str) -> Any:
+        """Get or load an STT (Speech-to-Text) model.
+
+        If auto_download is enabled and model is not found, attempts to download it.
+        """
+        resolved_name, hf_repo, _ = resolve_model_alias(model_name)
+
+        cached = self._stt_cache.get(resolved_name)
+        if cached is not None:
+            logger.debug(f"STT model cache hit: {resolved_name}")
+            return cached
+
+        model_dir = self._get_model_dir(resolved_name)
+
+        if not model_dir.exists():
+            if settings.auto_download:
+                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                success = self._auto_download_model(hf_repo, "stt", resolved_name)
+                if not success:
+                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+            else:
+                raise ValueError(f"Model '{model_name}' not found. Enable auto_download or use 'mlx-serve pull'")
+
+        logger.info(f"Loading STT model: {resolved_name}")
+
+        from mlx_audio.stt import load
+
+        model = load(str(model_dir))
+        self._stt_cache.set(resolved_name, model)
+        return model
+
+    def get_image_gen_model(self, model_name: str) -> Any:
+        """Get or load an image generation model.
+
+        If auto_download is enabled and model is not found, attempts to download it.
+        """
+        resolved_name, hf_repo, _ = resolve_model_alias(model_name)
+
+        cached = self._image_gen_cache.get(resolved_name)
+        if cached is not None:
+            logger.debug(f"Image gen model cache hit: {resolved_name}")
+            return cached
+
+        # For FLUX models, we use mflux which handles model loading differently
+        logger.info(f"Loading image generation model: {resolved_name}")
+
+        from mflux import Flux1
+
+        # Determine model variant from alias
+        if "schnell" in resolved_name.lower() or "schnell" in hf_repo.lower():
+            model = Flux1.from_alias("flux1-schnell")
+        else:
+            model = Flux1.from_alias("flux1-dev")
+
+        self._image_gen_cache.set(resolved_name, model)
+        return model
+
     def _auto_download_model(
         self,
         hf_repo: str,
@@ -446,6 +647,31 @@ class ModelManager:
                 "max_size": settings.cache_max_embedding_models,
                 "models": self._embedding_cache.keys(),
             },
+            "llm_models": {
+                "count": len(self._llm_cache),
+                "max_size": settings.cache_max_llm_models,
+                "models": self._llm_cache.keys(),
+            },
+            "vlm_models": {
+                "count": len(self._vlm_cache),
+                "max_size": settings.cache_max_vlm_models,
+                "models": self._vlm_cache.keys(),
+            },
+            "tts_models": {
+                "count": len(self._tts_cache),
+                "max_size": settings.cache_max_tts_models,
+                "models": self._tts_cache.keys(),
+            },
+            "stt_models": {
+                "count": len(self._stt_cache),
+                "max_size": settings.cache_max_stt_models,
+                "models": self._stt_cache.keys(),
+            },
+            "image_gen_models": {
+                "count": len(self._image_gen_cache),
+                "max_size": settings.cache_max_image_gen_models,
+                "models": self._image_gen_cache.keys(),
+            },
             "reranker_models": {
                 "count": len(self._reranker_cache),
                 "max_size": settings.cache_max_reranker_models,
@@ -473,12 +699,22 @@ class ModelManager:
             return False
 
         try:
-            if model_info.model_type == "embedding":
-                self.get_embedding_model(model_name)
-                logger.info(f"Preloaded embedding model: {model_name}")
-            elif model_info.model_type == "reranker":
-                self.get_reranker_model(model_name)
-                logger.info(f"Preloaded reranker model: {model_name}")
+            model_type = model_info.model_type
+            loaders = {
+                "embedding": self.get_embedding_model,
+                "reranker": self.get_reranker_model,
+                "llm": self.get_llm_model,
+                "vlm": self.get_vlm_model,
+                "tts": self.get_tts_model,
+                "stt": self.get_stt_model,
+                "image_gen": self.get_image_gen_model,
+            }
+            if model_type in loaders:
+                loaders[model_type](model_name)
+                logger.info(f"Preloaded {model_type} model: {model_name}")
+            else:
+                logger.warning(f"Unknown model type '{model_type}' for model '{model_name}'")
+                return False
             return True
         except Exception as e:
             logger.error(f"Failed to preload model '{model_name}': {e}")

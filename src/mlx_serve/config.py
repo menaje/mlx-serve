@@ -66,6 +66,26 @@ class Settings(BaseSettings):
         default=2,
         description="Maximum number of reranker models to keep in cache (LRU)",
     )
+    cache_max_llm_models: int = Field(
+        default=1,
+        description="Maximum number of LLM models to keep in cache (LRU)",
+    )
+    cache_max_vlm_models: int = Field(
+        default=1,
+        description="Maximum number of VLM models to keep in cache (LRU)",
+    )
+    cache_max_tts_models: int = Field(
+        default=1,
+        description="Maximum number of TTS models to keep in cache (LRU)",
+    )
+    cache_max_stt_models: int = Field(
+        default=1,
+        description="Maximum number of STT models to keep in cache (LRU)",
+    )
+    cache_max_image_gen_models: int = Field(
+        default=1,
+        description="Maximum number of image generation models to keep in cache (LRU)",
+    )
     cache_ttl_seconds: int = Field(
         default=1800,
         description="Time-to-live for cached models in seconds (30 minutes default)",
