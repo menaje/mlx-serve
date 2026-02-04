@@ -28,26 +28,23 @@ MLX-based multimodal AI server with OpenAI-compatible API for Apple Silicon.
 
 ## Installation
 
-### Using Homebrew (macOS)
+### From source (recommended)
 
 ```bash
-brew tap menaje/mlx-serve
-brew install mlx-serve
+# Using pipx
+pipx install git+https://github.com/menaje/mlx-serve.git
+
+# For VLM model conversion, inject torch dependencies
+pipx inject mlx-serve torch torchvision
 ```
 
 ### Using pip
 
 ```bash
-pip install mlx-serve
-```
+pip install git+https://github.com/menaje/mlx-serve.git
 
-### Using pipx (recommended)
-
-```bash
-pipx install mlx-serve
-
-# For VLM model conversion, inject torch dependencies
-pipx inject mlx-serve torch torchvision
+# With VLM conversion support
+pip install "mlx-serve[vlm-convert] @ git+https://github.com/menaje/mlx-serve.git"
 ```
 
 ## Quick Start
