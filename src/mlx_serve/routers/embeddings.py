@@ -102,12 +102,30 @@ async def _generate_embeddings_batch(
     model, tokenizer, texts: list[str]
 ) -> list[list[float]]:
     """Generate embeddings using batch processing."""
-    from mlx_embeddings import generate
+    import mlx.core as mx
 
     loop = asyncio.get_running_loop()
 
     def _generate():
-        result = generate(model, tokenizer, texts)
+        # Get the underlying tokenizer if wrapped (TokenizerWrapper doesn't support __call__)
+        tok = getattr(tokenizer, "_tokenizer", tokenizer)
+
+        # Tokenize texts - use __call__ instead of batch_encode_plus for compatibility
+        # with tokenizers that don't support batch_encode_plus (e.g., Qwen2Tokenizer)
+        inputs = tok(
+            texts,
+            return_tensors="np",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+
+        # Convert to MLX arrays
+        input_ids = mx.array(inputs["input_ids"])
+        attention_mask = mx.array(inputs["attention_mask"])
+
+        # Generate embeddings
+        result = model(input_ids, attention_mask=attention_mask)
         return result.text_embeds.tolist()
 
     return await loop.run_in_executor(None, _generate)
