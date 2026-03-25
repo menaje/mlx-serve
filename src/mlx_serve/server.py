@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from mlx_serve import __version__
@@ -82,16 +83,85 @@ def create_app() -> FastAPI:
     app.include_router(models_router)
     app.include_router(tokenize_router)
 
-    # Middleware to track active requests
+    # Middleware to track active requests and log request bodies
     @app.middleware("http")
     async def track_requests(request: Request, call_next):
         global _active_requests
         _active_requests += 1
+
+        # Log request body for /v1/chat/completions
+        if request.url.path == "/v1/chat/completions" and request.method == "POST":
+            try:
+                import json
+                from pathlib import Path
+                body = await request.body()
+                body_str = body.decode('utf-8')
+
+                # Write to debug file
+                debug_file = Path.home() / ".mlx-serve" / "logs" / "request_debug.log"
+                with open(debug_file, "a") as f:
+                    f.write(f"\n\n========== REQUEST at {request.url} ==========\n")
+                    f.write(f"Body: {body_str}\n")
+                    try:
+                        body_json = json.loads(body_str)
+                        f.write(f"Parsed JSON:\n{json.dumps(body_json, indent=2)}\n")
+                    except:
+                        pass
+                    f.write(f"==================================\n\n")
+
+                logger.info(f"[REQUEST BODY] /v1/chat/completions: {body_str}")
+                # Re-create request with body for downstream processing
+                from starlette.datastructures import Headers
+                async def receive():
+                    return {"type": "http.request", "body": body}
+                request._receive = receive
+            except Exception as e:
+                logger.error(f"[REQUEST BODY] Failed to read body: {e}")
+
         try:
             response = await call_next(request)
             return response
         finally:
             _active_requests -= 1
+
+    # Validation error handler to log request validation failures
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # Log the full request body and validation errors
+        body = None
+        try:
+            import json
+            from pathlib import Path
+
+            body = await request.body()
+            body_str = body.decode('utf-8')
+
+            # Write to debug file
+            debug_file = Path.home() / ".mlx-serve" / "logs" / "validation_errors.log"
+            debug_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(debug_file, "a") as f:
+                f.write(f"\n\n========== VALIDATION ERROR at {request.url.path} ==========\n")
+                f.write(f"Timestamp: {__import__('datetime').datetime.now()}\n")
+                f.write(f"Request body: {body_str}\n")
+                try:
+                    body_json = json.loads(body_str)
+                    f.write(f"Parsed JSON:\n{json.dumps(body_json, indent=2)}\n")
+                except:
+                    pass
+                f.write(f"Validation errors:\n{json.dumps(exc.errors(), indent=2)}\n")
+                f.write(f"==================================\n\n")
+
+            logger.error(f"[VALIDATION ERROR] Request to {request.url.path}")
+            logger.error(f"[VALIDATION ERROR] Request body: {body_str}")
+            logger.error(f"[VALIDATION ERROR] Validation errors: {exc.errors()}")
+        except Exception as e:
+            logger.error(f"[VALIDATION ERROR] Could not read request body: {e}")
+            logger.error(f"[VALIDATION ERROR] Validation errors: {exc.errors()}")
+
+        return JSONResponse(
+            status_code=422,
+            content={"detail": exc.errors()},
+        )
 
     # Global exception handler for OpenAI-compatible errors
     @app.exception_handler(Exception)

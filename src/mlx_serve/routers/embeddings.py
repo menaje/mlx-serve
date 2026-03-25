@@ -3,12 +3,19 @@
 import asyncio
 import base64
 import logging
+import threading
 from typing import Literal
 
 import numpy as np
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from mlx_serve.core.batch_processor import EmbeddingBatchProcessor
+from mlx_serve.core.inference_control import (
+    InferenceOverloadedError,
+    build_inference_key,
+    build_overload_detail,
+)
 from mlx_serve.core.model_manager import model_manager
 
 logger = logging.getLogger(__name__)
@@ -16,7 +23,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["embeddings"])
 
 # Cache for batch processors per model
-_batch_processors: dict = {}
+_batch_processors: dict[str, EmbeddingBatchProcessor] = {}
+_batch_processors_lock = threading.Lock()
 
 
 def truncate_embedding(embedding: list[float], dimensions: int) -> list[float]:
@@ -131,6 +139,24 @@ async def _generate_embeddings_batch(
     return await loop.run_in_executor(None, _generate)
 
 
+async def _embed_texts(
+    model_name: str,
+    model,
+    tokenizer,
+    texts: list[str],
+) -> list[list[float]]:
+    """Route requests through the shared embedding batch processor."""
+    processor_key = build_inference_key("embedding", model_name)
+
+    with _batch_processors_lock:
+        processor = _batch_processors.get(processor_key)
+        if processor is None or processor.model is not model or processor.tokenizer is not tokenizer:
+            processor = EmbeddingBatchProcessor(model, tokenizer)
+            _batch_processors[processor_key] = processor
+
+    return await processor.embed(texts)
+
+
 @router.post("/v1/embeddings", response_model=EmbeddingResponse)
 async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     """Create embeddings for the given input(s).
@@ -168,8 +194,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
     try:
         # Generate embeddings with batch processing
-        embeddings_list = await _generate_embeddings_batch(model, tokenizer, texts)
-
+        embeddings_list = await _embed_texts(request.model, model, tokenizer, texts)
         # Calculate token count (approximate)
         loop = asyncio.get_running_loop()
         total_tokens = await loop.run_in_executor(
@@ -217,6 +242,13 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
             ),
         )
 
+    except InferenceOverloadedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(
+                f"Embedding model '{request.model}' is overloaded. {e}"
+            ),
+        ) from e
     except Exception as e:
         logger.error(f"Embedding generation failed: {e}")
         raise HTTPException(

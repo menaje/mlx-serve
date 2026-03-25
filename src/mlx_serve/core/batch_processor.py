@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Generic, TypeVar
 
 from mlx_serve.config import settings
+from mlx_serve.core.inference_control import InferenceOverloadedError
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class BatchProcessor(Generic[T, R]):
         process_fn: Callable[[list[T]], list[R]],
         max_batch_size: int | None = None,
         max_wait_ms: int | None = None,
+        max_queue_size: int | None = None,
     ):
         """
         Initialize the batch processor.
@@ -49,22 +51,31 @@ class BatchProcessor(Generic[T, R]):
         self.process_fn = process_fn
         self.max_batch_size = max_batch_size or settings.batch_max_size
         self.max_wait_ms = max_wait_ms or settings.batch_max_wait_ms
+        self.max_queue_size = (
+            settings.inference_max_queue_per_model
+            if max_queue_size is None
+            else max_queue_size
+        )
+        queue_maxsize = 0 if self.max_queue_size is None else self.max_queue_size
 
-        self._queue: asyncio.Queue[BatchRequest[T]] = asyncio.Queue()
+        self._queue: asyncio.Queue[BatchRequest[T]] = asyncio.Queue(maxsize=queue_maxsize)
         self._running = False
         self._task: asyncio.Task | None = None
+        self._start_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Start the batch processing loop."""
-        if self._running:
-            return
+        async with self._start_lock:
+            if self._running:
+                return
 
-        self._running = True
-        self._task = asyncio.create_task(self._process_loop())
-        logger.info(
-            f"BatchProcessor started (max_batch={self.max_batch_size}, "
-            f"max_wait={self.max_wait_ms}ms)"
-        )
+            self._running = True
+            self._task = asyncio.create_task(self._process_loop())
+            logger.info(
+                f"BatchProcessor started (max_batch={self.max_batch_size}, "
+                f"max_wait={self.max_wait_ms}ms, "
+                f"max_queue={'unbounded' if self.max_queue_size is None else self.max_queue_size})"
+            )
 
     async def stop(self) -> None:
         """Stop the batch processing loop."""
@@ -94,7 +105,10 @@ class BatchProcessor(Generic[T, R]):
             await self.start()
 
         request: BatchRequest[T] = BatchRequest(data=data)
-        await self._queue.put(request)
+        try:
+            self._queue.put_nowait(request)
+        except asyncio.QueueFull as exc:
+            raise InferenceOverloadedError("Batch queue is full") from exc
         return await request.future
 
     async def _process_loop(self) -> None:
@@ -187,12 +201,38 @@ class EmbeddingBatchProcessor:
             process_fn=self._generate_embeddings,
         )
 
-    def _generate_embeddings(self, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings for a batch of texts."""
-        from mlx_embeddings import generate
+    def _generate_embeddings(
+        self,
+        batched_texts: list[list[str]],
+    ) -> list[list[list[float]]]:
+        """Generate embeddings for multiple requests in one model call."""
+        import mlx.core as mx
 
-        result = generate(self.model, self.tokenizer, texts)
-        return result.text_embeds.tolist()
+        flat_texts = [text for texts in batched_texts for text in texts]
+
+        tok = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
+        inputs = tok(
+            flat_texts,
+            return_tensors="np",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+
+        input_ids = mx.array(inputs["input_ids"])
+        attention_mask = mx.array(inputs["attention_mask"])
+
+        result = self.model(input_ids, attention_mask=attention_mask)
+        embeddings = result.text_embeds.tolist()
+
+        outputs: list[list[list[float]]] = []
+        offset = 0
+        for texts in batched_texts:
+            next_offset = offset + len(texts)
+            outputs.append(embeddings[offset:next_offset])
+            offset = next_offset
+
+        return outputs
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """
@@ -207,16 +247,7 @@ class EmbeddingBatchProcessor:
         Returns:
             List of embedding vectors.
         """
-        # For single-request batching, submit each text separately
-        # The processor will batch concurrent requests
-        if len(texts) == 1:
-            return [await self._processor.submit(texts[0])]
-
-        # For multi-text requests, process directly as a batch
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, self._generate_embeddings, texts
-        )
+        return await self._processor.submit(texts)
 
     async def start(self) -> None:
         """Start the batch processor."""

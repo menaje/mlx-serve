@@ -11,6 +11,12 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from mlx_serve.core.inference_control import (
+    InferenceOverloadedError,
+    build_inference_key,
+    build_overload_detail,
+    inference_controller,
+)
 from mlx_serve.core.model_manager import model_manager
 
 logger = logging.getLogger(__name__)
@@ -133,13 +139,26 @@ async def create_speech(request: SpeechRequest):
         ) from e
 
     try:
-        audio_bytes = await _generate_speech(
-            model=model,
-            text=request.input,
-            voice=request.voice,
-            speed=request.speed,
-            response_format=request.response_format,
+        lease = await inference_controller.acquire(
+            build_inference_key("tts", request.model)
         )
+    except InferenceOverloadedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(
+                f"TTS model '{request.model}' is overloaded. {e}"
+            ),
+        ) from e
+
+    try:
+        async with lease:
+            audio_bytes = await _generate_speech(
+                model=model,
+                text=request.input,
+                voice=request.voice,
+                speed=request.speed,
+                response_format=request.response_format,
+            )
 
         # Determine content type
         content_types = {
@@ -273,13 +292,23 @@ async def create_transcription(
             tmp.write(content)
             tmp_path = tmp.name
 
-        result = await _transcribe_audio(
-            model=stt_model,
-            audio_path=tmp_path,
-            language=language,
-            response_format=response_format,
-            timestamp_granularities=timestamp_granularities,
-        )
+        lease = await inference_controller.acquire(build_inference_key("stt", model))
+    except InferenceOverloadedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(
+                f"STT model '{model}' is overloaded. {e}"
+            ),
+        ) from e
+    try:
+        async with lease:
+            result = await _transcribe_audio(
+                model=stt_model,
+                audio_path=tmp_path,
+                language=language,
+                response_format=response_format,
+                timestamp_granularities=timestamp_granularities,
+            )
 
         # Handle different result formats
         if isinstance(result, dict):

@@ -18,6 +18,12 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from mlx_serve.core.inference_control import (
+    InferenceOverloadedError,
+    build_inference_key,
+    build_overload_detail,
+    inference_controller,
+)
 from mlx_serve.core.model_manager import model_manager
 
 try:
@@ -631,6 +637,23 @@ def _truncate_at_stop_sequences(text: str, stop: list[str] | None) -> tuple[str,
     return text, False
 
 
+async def _acquire_model_lease(
+    model_type: str,
+    model_name: str,
+    label: str,
+):
+    """Acquire a per-model inference lease or raise a 503 response."""
+    try:
+        return await inference_controller.acquire(build_inference_key(model_type, model_name))
+    except InferenceOverloadedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(
+                f"{label} model '{model_name}' is overloaded. {e}"
+            ),
+        ) from e
+
+
 async def _generate_completion(
     model: Any,
     tokenizer: Any,
@@ -875,12 +898,22 @@ async def _stream_completion(
     yield "data: [DONE]\n\n"
 
 
+async def _stream_completion_with_lease(lease, **kwargs):
+    """Hold an inference lease for the lifetime of a streaming response."""
+    async with lease:
+        async for chunk in _stream_completion(**kwargs):
+            yield chunk
+
+
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
     """Create a chat completion.
 
     Supports streaming, tool/function calling, and vision (image inputs).
     """
+    # DEBUG: Log incoming request for troubleshooting
+    logger.info(f"[DEBUG] Received chat completion request: {request.model_dump()}")
+
     # Check if request contains images
     has_vision = _has_images(request.messages)
     images = []
@@ -956,6 +989,9 @@ async def create_chat_completion(request: ChatCompletionRequest):
     system_fingerprint = f"fp_{uuid.uuid4().hex[:12]}"
 
     # Vision models don't support streaming yet
+    inference_model_type = "vlm" if (has_vision or is_vlm_model) else "llm"
+    lease = await _acquire_model_lease(inference_model_type, request.model, "Chat")
+
     if request.stream and not has_vision and not is_vlm_model:
         # Check if usage should be included in stream
         include_usage = (
@@ -966,7 +1002,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
         # Streaming response (text-only)
         return StreamingResponse(
-            _stream_completion(
+            _stream_completion_with_lease(
+                lease=lease,
                 model=model,
                 tokenizer=tokenizer,
                 prompt=prompt,
@@ -991,27 +1028,28 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     # Non-streaming response
     try:
-        if has_vision or is_vlm_model:
-            # Use VLM generation
-            response_text, prompt_tokens, completion_tokens = await _generate_vlm_completion(
-                model=model,
-                processor=tokenizer,
-                prompt=prompt,
-                images=images,
-                max_tokens=max_tokens,
-                temperature=request.temperature,
-            )
-        else:
-            # Use LLM generation
-            response_text, prompt_tokens, completion_tokens = await _generate_completion(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                stop=stop,
-            )
+        async with lease:
+            if has_vision or is_vlm_model:
+                # Use VLM generation
+                response_text, prompt_tokens, completion_tokens = await _generate_vlm_completion(
+                    model=model,
+                    processor=tokenizer,
+                    prompt=prompt,
+                    images=images,
+                    max_tokens=max_tokens,
+                    temperature=request.temperature,
+                )
+            else:
+                # Use LLM generation
+                response_text, prompt_tokens, completion_tokens = await _generate_completion(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    stop=stop,
+                )
 
         # Validate and process response based on response_format
         response_text = _validate_json_response(response_text, request.response_format)
@@ -1067,22 +1105,35 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
 # Text Completions API (Legacy)
 class CompletionRequest(BaseModel):
-    """OpenAI-compatible text completion request."""
+    """OpenAI-compatible text completion request (legacy).
+
+    Note: This is a legacy endpoint. Use /v1/chat/completions for new applications.
+    Only core parameters are supported. Advanced features like logit_bias, best_of,
+    presence_penalty, frequency_penalty are not implemented.
+
+    Supports both 'prompt' and 'messages' fields for compatibility.
+    If both are provided, 'prompt' takes precedence.
+    """
 
     model: str = Field(..., description="Model name to use")
-    prompt: str | list[str] = Field(..., description="Prompt(s) to complete")
+    prompt: str | list[str] | None = Field(default=None, description="Prompt(s) to complete")
+    messages: list[ChatMessage] | None = Field(default=None, description="Messages (alternative to prompt)")
     max_tokens: int | None = Field(default=16, description="Maximum tokens to generate")
-    temperature: float = Field(default=1.0, ge=0, le=2)
-    top_p: float = Field(default=1.0, ge=0, le=1)
-    n: int = Field(default=1, ge=1, le=1)
-    stream: bool = Field(default=False)
-    stop: str | list[str] | None = Field(default=None)
-    presence_penalty: float = Field(default=0.0, ge=-2, le=2)
-    frequency_penalty: float = Field(default=0.0, ge=-2, le=2)
-    logprobs: int | None = Field(default=None)
-    echo: bool = Field(default=False)
-    suffix: str | None = Field(default=None)
-    user: str | None = None
+    temperature: float = Field(default=1.0, ge=0, le=2, description="Sampling temperature")
+    top_p: float = Field(default=1.0, ge=0, le=1, description="Nucleus sampling parameter")
+    n: int = Field(default=1, ge=1, le=1, description="Number of completions (only 1 supported)")
+    stream: bool = Field(default=False, description="Stream response chunks")
+    stop: str | list[str] | None = Field(default=None, description="Stop sequences")
+    echo: bool = Field(default=False, description="Echo the prompt in the response")
+    user: str | None = Field(default=None, description="User identifier")
+
+    # Unsupported parameters (accepted but ignored for compatibility)
+    suffix: str | None = Field(default=None, description="NOT SUPPORTED: Suffix for insertions")
+    logprobs: int | None = Field(default=None, description="NOT SUPPORTED: Log probabilities")
+    best_of: int | None = Field(default=None, ge=1, description="NOT SUPPORTED: Generate best_of completions")
+    logit_bias: dict[str, float] | None = Field(default=None, description="NOT SUPPORTED: Token bias")
+    presence_penalty: float = Field(default=0.0, ge=-2, le=2, description="NOT SUPPORTED: Presence penalty")
+    frequency_penalty: float = Field(default=0.0, ge=-2, le=2, description="NOT SUPPORTED: Frequency penalty")
 
 
 class CompletionChoice(BaseModel):
@@ -1238,13 +1289,65 @@ async def _stream_text_completion(
     yield "data: [DONE]\n\n"
 
 
+async def _stream_text_completion_with_lease(lease, **kwargs):
+    """Hold an inference lease for the lifetime of a streaming response."""
+    async with lease:
+        async for chunk in _stream_text_completion(**kwargs):
+            yield chunk
+
+
 @router.post("/v1/completions", response_model=CompletionResponse)
 async def create_completion(request: CompletionRequest):
-    """Create a text completion.
+    """Create a text completion (Legacy API).
 
-    This is the legacy completions API. For new applications,
-    use /v1/chat/completions instead.
+    **DEPRECATED**: This is the legacy completions API that uses freeform text prompts.
+    For new applications, use `/v1/chat/completions` instead which supports chat format.
+
+    **Supported Parameters:**
+    - `model`, `prompt`, `max_tokens`, `temperature`, `top_p`, `stream`, `stop`, `echo`
+
+    **Unsupported Parameters (ignored):**
+    - `suffix`, `logprobs`, `best_of`, `logit_bias`, `presence_penalty`, `frequency_penalty`
+
+    The unsupported parameters are accepted for API compatibility but have no effect.
+    Only `n=1` is supported (generating a single completion per request).
     """
+    # DEBUG: Log incoming request for troubleshooting
+    logger.info(f"[DEBUG] Received completion request: {request.model_dump()}")
+
+    # Log warning for unsupported parameters
+    unsupported_params = []
+    if request.suffix is not None:
+        unsupported_params.append("suffix")
+    if request.logprobs is not None:
+        unsupported_params.append("logprobs")
+    if request.best_of is not None and request.best_of > 1:
+        unsupported_params.append("best_of")
+    if request.logit_bias is not None:
+        unsupported_params.append("logit_bias")
+    if request.presence_penalty != 0.0:
+        unsupported_params.append("presence_penalty")
+    if request.frequency_penalty != 0.0:
+        unsupported_params.append("frequency_penalty")
+
+    if unsupported_params:
+        logger.warning(
+            f"Unsupported parameters in /v1/completions request (ignored): {', '.join(unsupported_params)}"
+        )
+
+    # Validate that either prompt or messages is provided
+    if request.prompt is None and request.messages is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": "Either 'prompt' or 'messages' field is required",
+                    "type": "invalid_request_error",
+                    "code": "missing_required_field",
+                }
+            },
+        )
+
     try:
         model, tokenizer = model_manager.get_llm_model(request.model)
     except ValueError as e:
@@ -1259,18 +1362,32 @@ async def create_completion(request: CompletionRequest):
             },
         ) from e
 
-    # Normalize prompt to string (take first if list)
-    prompt = request.prompt if isinstance(request.prompt, str) else request.prompt[0]
+    # Convert messages to prompt if provided (prompt takes precedence)
+    if request.prompt is not None:
+        # Normalize prompt to string (take first if list)
+        prompt = request.prompt if isinstance(request.prompt, str) else request.prompt[0]
+    else:
+        # Convert messages to a single prompt string
+        prompt_parts = []
+        for msg in request.messages:
+            role_prefix = f"{msg.role}: " if msg.role != "user" else ""
+            content_str = msg.content if isinstance(msg.content, str) else " ".join(
+                part.text for part in msg.content if isinstance(part, ContentPartText)
+            )
+            prompt_parts.append(f"{role_prefix}{content_str}")
+        prompt = "\n".join(prompt_parts)
 
     max_tokens = request.max_tokens or 16
     stop = [request.stop] if isinstance(request.stop, str) else request.stop
 
     request_id = f"cmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+    lease = await _acquire_model_lease("llm", request.model, "Completion")
 
     if request.stream:
         return StreamingResponse(
-            _stream_text_completion(
+            _stream_text_completion_with_lease(
+                lease=lease,
                 model=model,
                 tokenizer=tokenizer,
                 prompt=prompt,
@@ -1293,15 +1410,16 @@ async def create_completion(request: CompletionRequest):
 
     # Non-streaming response
     try:
-        response_text, prompt_tokens, completion_tokens = await _generate_completion(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            stop=stop,
-        )
+        async with lease:
+            response_text, prompt_tokens, completion_tokens = await _generate_completion(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=stop,
+            )
 
         # Handle echo option
         output_text = (prompt + response_text) if request.echo else response_text
@@ -1336,3 +1454,11 @@ async def create_completion(request: CompletionRequest):
                 }
             },
         ) from e
+
+
+# OpenClaw compatibility: add /responses endpoint as alias for chat/completions
+@router.post("/responses")
+async def create_responses(request: ChatCompletionRequest):
+    """OpenClaw compatibility endpoint - redirects to chat completions."""
+    logger.info("[OpenClaw] Received request at /responses, forwarding to chat completions")
+    return await create_chat_completion(request)

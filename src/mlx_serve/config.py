@@ -106,6 +106,21 @@ class Settings(BaseSettings):
         default=50,
         description="Maximum wait time in milliseconds for batch collection",
     )
+    inference_max_concurrency_per_model: int = Field(
+        default=1,
+        description="Maximum concurrent in-flight inferences per model",
+        ge=1,
+    )
+    inference_max_queue_per_model: int | None = Field(
+        default=None,
+        description="Maximum queued requests per model before rejecting (None waits indefinitely)",
+        ge=0,
+    )
+    inference_queue_timeout_seconds: float | None = Field(
+        default=None,
+        description="Maximum time to wait for a per-model inference slot (None waits indefinitely)",
+        gt=0,
+    )
 
     # Metrics settings
     metrics_enabled: bool = Field(

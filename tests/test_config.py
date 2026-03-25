@@ -68,6 +68,9 @@ class TestSettings:
         assert settings.port == 8000
         assert settings.log_level == "INFO"
         assert settings.cache_max_embedding_models == 3
+        assert settings.inference_max_concurrency_per_model == 1
+        assert settings.inference_max_queue_per_model is None
+        assert settings.inference_queue_timeout_seconds is None
 
     def test_preload_models_parsing(self):
         """Test parsing preload_models from string."""

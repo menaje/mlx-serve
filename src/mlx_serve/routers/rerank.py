@@ -7,6 +7,12 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from mlx_serve.core.inference_control import (
+    InferenceOverloadedError,
+    build_inference_key,
+    build_overload_detail,
+    inference_controller,
+)
 from mlx_serve.core.model_manager import model_manager
 
 logger = logging.getLogger(__name__)
@@ -210,44 +216,57 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
         ) from e
 
     try:
-        # Compute scores for all documents using batch processing
-        scores, total_tokens = await _compute_batch_scores(
-            model, tokenizer, request.query, request.documents
+        lease = await inference_controller.acquire(
+            build_inference_key("reranker", request.model)
         )
-
-        # Create scored docs list
-        scored_docs = [
-            (idx, score, doc)
-            for idx, (score, doc) in enumerate(zip(scores, request.documents))
-        ]
-
-        # Sort by score descending
-        scored_docs.sort(key=lambda x: x[1], reverse=True)
-
-        # Apply top_n limit
-        if request.top_n is not None:
-            scored_docs = scored_docs[: request.top_n]
-
-        # Build results
-        results = [
-            RerankResult(
-                index=idx,
-                relevance_score=score,
-                document=DocumentResult(text=doc) if request.return_documents else None,
-                text_output=("yes" if score >= request.decision_threshold else "no")
-                if request.return_text
-                else None,
-            )
-            for idx, score, doc in scored_docs
-        ]
-
-        return RerankResponse(
-            results=results,
-            usage=RerankUsage(
-                prompt_tokens=total_tokens,
-                total_tokens=total_tokens,
+    except InferenceOverloadedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(
+                f"Reranker model '{request.model}' is overloaded. {e}"
             ),
-        )
+        ) from e
+
+    try:
+        async with lease:
+            # Compute scores for all documents using batch processing
+            scores, total_tokens = await _compute_batch_scores(
+                model, tokenizer, request.query, request.documents
+            )
+
+            # Create scored docs list
+            scored_docs = [
+                (idx, score, doc)
+                for idx, (score, doc) in enumerate(zip(scores, request.documents))
+            ]
+
+            # Sort by score descending
+            scored_docs.sort(key=lambda x: x[1], reverse=True)
+
+            # Apply top_n limit
+            if request.top_n is not None:
+                scored_docs = scored_docs[: request.top_n]
+
+            # Build results
+            results = [
+                RerankResult(
+                    index=idx,
+                    relevance_score=score,
+                    document=DocumentResult(text=doc) if request.return_documents else None,
+                    text_output=("yes" if score >= request.decision_threshold else "no")
+                    if request.return_text
+                    else None,
+                )
+                for idx, score, doc in scored_docs
+            ]
+
+            return RerankResponse(
+                results=results,
+                usage=RerankUsage(
+                    prompt_tokens=total_tokens,
+                    total_tokens=total_tokens,
+                ),
+            )
 
     except Exception as e:
         logger.error(f"Reranking failed: {e}")

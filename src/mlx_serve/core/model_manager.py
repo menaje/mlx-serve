@@ -208,6 +208,8 @@ class ModelManager:
         )
         self._metadata_path = settings.models_dir.parent / "metadata.json"
         self._metadata: dict[str, dict] = {}
+        self._load_locks: dict[str, threading.Lock] = {}
+        self._load_locks_guard = threading.Lock()
 
         settings.ensure_dirs()
         self._load_metadata()
@@ -253,6 +255,15 @@ class ModelManager:
         """Save model metadata to disk."""
         self._metadata_path.parent.mkdir(parents=True, exist_ok=True)
         self._metadata_path.write_text(json.dumps(self._metadata, indent=2))
+
+    def _get_load_lock(self, key: str) -> threading.Lock:
+        """Get a per-model lock for cache misses and model loading."""
+        with self._load_locks_guard:
+            lock = self._load_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._load_locks[key] = lock
+            return lock
 
     def _get_model_dir(self, model_name: str) -> Path:
         """Get the directory path for a model."""
@@ -554,29 +565,35 @@ class ModelManager:
             logger.debug(f"Embedding model cache hit: {resolved_name}")
             return cached
 
-        model_dir = self._get_model_dir(resolved_name)
+        with self._get_load_lock(f"embedding:{resolved_name}"):
+            cached = self._embedding_cache.get(resolved_name)
+            if cached is not None:
+                logger.debug(f"Embedding model cache hit after wait: {resolved_name}")
+                return cached
 
-        # Try auto-download if enabled and model not found
-        if not model_dir.exists():
-            if settings.auto_download:
-                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
-                success = self._auto_download_model(hf_repo, "embedding", resolved_name)
-                if not success:
-                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
-            else:
-                raise ValueError(
-                    f"Model '{model_name}' not found. "
-                    "Enable auto_download or use 'mlx-serve pull'"
-                )
+            model_dir = self._get_model_dir(resolved_name)
 
-        logger.info(f"Loading embedding model: {resolved_name}")
+            # Try auto-download if enabled and model not found
+            if not model_dir.exists():
+                if settings.auto_download:
+                    logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                    success = self._auto_download_model(hf_repo, "embedding", resolved_name)
+                    if not success:
+                        raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+                else:
+                    raise ValueError(
+                        f"Model '{model_name}' not found. "
+                        "Enable auto_download or use 'mlx-serve pull'"
+                    )
 
-        # Import here to avoid loading MLX at module import time
-        from mlx_embeddings import load
+            logger.info(f"Loading embedding model: {resolved_name}")
 
-        model, tokenizer = load(str(model_dir))
-        self._embedding_cache.set(resolved_name, (model, tokenizer))
-        return model, tokenizer
+            # Import here to avoid loading MLX at module import time
+            from mlx_embeddings import load
+
+            model, tokenizer = load(str(model_dir))
+            self._embedding_cache.set(resolved_name, (model, tokenizer))
+            return model, tokenizer
 
     def get_reranker_model(self, model_name: str) -> Any:
         """Get or load a reranker model.
@@ -591,29 +608,35 @@ class ModelManager:
             logger.debug(f"Reranker model cache hit: {resolved_name}")
             return cached
 
-        model_dir = self._get_model_dir(resolved_name)
+        with self._get_load_lock(f"reranker:{resolved_name}"):
+            cached = self._reranker_cache.get(resolved_name)
+            if cached is not None:
+                logger.debug(f"Reranker model cache hit after wait: {resolved_name}")
+                return cached
 
-        # Try auto-download if enabled and model not found
-        if not model_dir.exists():
-            if settings.auto_download:
-                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
-                success = self._auto_download_model(hf_repo, "reranker", resolved_name)
-                if not success:
-                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
-            else:
-                raise ValueError(
-                    f"Model '{model_name}' not found. "
-                    "Enable auto_download or use 'mlx-serve pull'"
-                )
+            model_dir = self._get_model_dir(resolved_name)
 
-        logger.info(f"Loading reranker model: {resolved_name}")
+            # Try auto-download if enabled and model not found
+            if not model_dir.exists():
+                if settings.auto_download:
+                    logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                    success = self._auto_download_model(hf_repo, "reranker", resolved_name)
+                    if not success:
+                        raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+                else:
+                    raise ValueError(
+                        f"Model '{model_name}' not found. "
+                        "Enable auto_download or use 'mlx-serve pull'"
+                    )
 
-        # Import here to avoid loading MLX at module import time
-        from mlx_lm import load
+            logger.info(f"Loading reranker model: {resolved_name}")
 
-        model, tokenizer = load(str(model_dir))
-        self._reranker_cache.set(resolved_name, (model, tokenizer))
-        return model, tokenizer
+            # Import here to avoid loading MLX at module import time
+            from mlx_lm import load
+
+            model, tokenizer = load(str(model_dir))
+            self._reranker_cache.set(resolved_name, (model, tokenizer))
+            return model, tokenizer
 
     def get_llm_model(self, model_name: str) -> Any:
         """Get or load an LLM model for text generation.
@@ -627,27 +650,33 @@ class ModelManager:
             logger.debug(f"LLM model cache hit: {resolved_name}")
             return cached
 
-        model_dir = self._get_model_dir(resolved_name)
+        with self._get_load_lock(f"llm:{resolved_name}"):
+            cached = self._llm_cache.get(resolved_name)
+            if cached is not None:
+                logger.debug(f"LLM model cache hit after wait: {resolved_name}")
+                return cached
 
-        if not model_dir.exists():
-            if settings.auto_download:
-                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
-                success = self._auto_download_model(hf_repo, "llm", resolved_name)
-                if not success:
-                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
-            else:
-                raise ValueError(
-                    f"Model '{model_name}' not found. "
-                    "Enable auto_download or use 'mlx-serve pull'"
-                )
+            model_dir = self._get_model_dir(resolved_name)
 
-        logger.info(f"Loading LLM model: {resolved_name}")
+            if not model_dir.exists():
+                if settings.auto_download:
+                    logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                    success = self._auto_download_model(hf_repo, "llm", resolved_name)
+                    if not success:
+                        raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+                else:
+                    raise ValueError(
+                        f"Model '{model_name}' not found. "
+                        "Enable auto_download or use 'mlx-serve pull'"
+                    )
 
-        from mlx_lm import load
+            logger.info(f"Loading LLM model: {resolved_name}")
 
-        model, tokenizer = load(str(model_dir))
-        self._llm_cache.set(resolved_name, (model, tokenizer))
-        return model, tokenizer
+            from mlx_lm import load
+
+            model, tokenizer = load(str(model_dir))
+            self._llm_cache.set(resolved_name, (model, tokenizer))
+            return model, tokenizer
 
     def get_vlm_model(self, model_name: str) -> Any:
         """Get or load a Vision-Language model.
@@ -661,27 +690,33 @@ class ModelManager:
             logger.debug(f"VLM model cache hit: {resolved_name}")
             return cached
 
-        model_dir = self._get_model_dir(resolved_name)
+        with self._get_load_lock(f"vlm:{resolved_name}"):
+            cached = self._vlm_cache.get(resolved_name)
+            if cached is not None:
+                logger.debug(f"VLM model cache hit after wait: {resolved_name}")
+                return cached
 
-        if not model_dir.exists():
-            if settings.auto_download:
-                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
-                success = self._auto_download_model(hf_repo, "vlm", resolved_name)
-                if not success:
-                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
-            else:
-                raise ValueError(
-                    f"Model '{model_name}' not found. "
-                    "Enable auto_download or use 'mlx-serve pull'"
-                )
+            model_dir = self._get_model_dir(resolved_name)
 
-        logger.info(f"Loading VLM model: {resolved_name}")
+            if not model_dir.exists():
+                if settings.auto_download:
+                    logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                    success = self._auto_download_model(hf_repo, "vlm", resolved_name)
+                    if not success:
+                        raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+                else:
+                    raise ValueError(
+                        f"Model '{model_name}' not found. "
+                        "Enable auto_download or use 'mlx-serve pull'"
+                    )
 
-        from mlx_vlm import load
+            logger.info(f"Loading VLM model: {resolved_name}")
 
-        model, processor = load(str(model_dir))
-        self._vlm_cache.set(resolved_name, (model, processor))
-        return model, processor
+            from mlx_vlm import load
+
+            model, processor = load(str(model_dir))
+            self._vlm_cache.set(resolved_name, (model, processor))
+            return model, processor
 
     def get_tts_model(self, model_name: str) -> Any:
         """Get or load a TTS (Text-to-Speech) model.
@@ -695,27 +730,33 @@ class ModelManager:
             logger.debug(f"TTS model cache hit: {resolved_name}")
             return cached
 
-        model_dir = self._get_model_dir(resolved_name)
+        with self._get_load_lock(f"tts:{resolved_name}"):
+            cached = self._tts_cache.get(resolved_name)
+            if cached is not None:
+                logger.debug(f"TTS model cache hit after wait: {resolved_name}")
+                return cached
 
-        if not model_dir.exists():
-            if settings.auto_download:
-                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
-                success = self._auto_download_model(hf_repo, "tts", resolved_name)
-                if not success:
-                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
-            else:
-                raise ValueError(
-                    f"Model '{model_name}' not found. "
-                    "Enable auto_download or use 'mlx-serve pull'"
-                )
+            model_dir = self._get_model_dir(resolved_name)
 
-        logger.info(f"Loading TTS model: {resolved_name}")
+            if not model_dir.exists():
+                if settings.auto_download:
+                    logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                    success = self._auto_download_model(hf_repo, "tts", resolved_name)
+                    if not success:
+                        raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+                else:
+                    raise ValueError(
+                        f"Model '{model_name}' not found. "
+                        "Enable auto_download or use 'mlx-serve pull'"
+                    )
 
-        from mlx_audio.tts import load
+            logger.info(f"Loading TTS model: {resolved_name}")
 
-        model = load(str(model_dir))
-        self._tts_cache.set(resolved_name, model)
-        return model
+            from mlx_audio.tts import load
+
+            model = load(str(model_dir))
+            self._tts_cache.set(resolved_name, model)
+            return model
 
     def get_stt_model(self, model_name: str) -> Any:
         """Get or load an STT (Speech-to-Text) model.
@@ -729,27 +770,33 @@ class ModelManager:
             logger.debug(f"STT model cache hit: {resolved_name}")
             return cached
 
-        model_dir = self._get_model_dir(resolved_name)
+        with self._get_load_lock(f"stt:{resolved_name}"):
+            cached = self._stt_cache.get(resolved_name)
+            if cached is not None:
+                logger.debug(f"STT model cache hit after wait: {resolved_name}")
+                return cached
 
-        if not model_dir.exists():
-            if settings.auto_download:
-                logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
-                success = self._auto_download_model(hf_repo, "stt", resolved_name)
-                if not success:
-                    raise ValueError(f"Model '{model_name}' not found and auto-download failed")
-            else:
-                raise ValueError(
-                    f"Model '{model_name}' not found. "
-                    "Enable auto_download or use 'mlx-serve pull'"
-                )
+            model_dir = self._get_model_dir(resolved_name)
 
-        logger.info(f"Loading STT model: {resolved_name}")
+            if not model_dir.exists():
+                if settings.auto_download:
+                    logger.info(f"Model '{resolved_name}' not found, attempting auto-download...")
+                    success = self._auto_download_model(hf_repo, "stt", resolved_name)
+                    if not success:
+                        raise ValueError(f"Model '{model_name}' not found and auto-download failed")
+                else:
+                    raise ValueError(
+                        f"Model '{model_name}' not found. "
+                        "Enable auto_download or use 'mlx-serve pull'"
+                    )
 
-        from mlx_audio.stt import load
+            logger.info(f"Loading STT model: {resolved_name}")
 
-        model = load(str(model_dir))
-        self._stt_cache.set(resolved_name, model)
-        return model
+            from mlx_audio.stt import load
+
+            model = load(str(model_dir))
+            self._stt_cache.set(resolved_name, model)
+            return model
 
     def get_image_gen_model(self, model_name: str) -> Any:
         """Get or load an image generation model.
@@ -763,19 +810,25 @@ class ModelManager:
             logger.debug(f"Image gen model cache hit: {resolved_name}")
             return cached
 
-        # For FLUX models, we use mflux which handles model loading differently
-        logger.info(f"Loading image generation model: {resolved_name}")
+        with self._get_load_lock(f"image_gen:{resolved_name}"):
+            cached = self._image_gen_cache.get(resolved_name)
+            if cached is not None:
+                logger.debug(f"Image gen model cache hit after wait: {resolved_name}")
+                return cached
 
-        from mflux import Flux1
+            # For FLUX models, we use mflux which handles model loading differently
+            logger.info(f"Loading image generation model: {resolved_name}")
 
-        # Determine model variant from alias
-        if "schnell" in resolved_name.lower() or "schnell" in hf_repo.lower():
-            model = Flux1.from_alias("flux1-schnell")
-        else:
-            model = Flux1.from_alias("flux1-dev")
+            from mflux import Flux1
 
-        self._image_gen_cache.set(resolved_name, model)
-        return model
+            # Determine model variant from alias
+            if "schnell" in resolved_name.lower() or "schnell" in hf_repo.lower():
+                model = Flux1.from_alias("flux1-schnell")
+            else:
+                model = Flux1.from_alias("flux1-dev")
+
+            self._image_gen_cache.set(resolved_name, model)
+            return model
 
     def _auto_download_model(
         self,

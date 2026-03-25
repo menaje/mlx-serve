@@ -14,6 +14,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from mlx_serve.core.inference_control import (
+    InferenceOverloadedError,
+    build_inference_key,
+    build_overload_detail,
+    inference_controller,
+)
 from mlx_serve.core.model_manager import model_manager
 
 logger = logging.getLogger(__name__)
@@ -246,14 +252,27 @@ async def create_image(request: ImageGenerationRequest, http_request: Request):
     output_format = request.output_format or "png"
 
     try:
-        image_bytes = await _generate_image(
-            model=model,
-            prompt=request.prompt,
-            width=width,
-            height=height,
-            num_steps=num_steps,
-            output_format=output_format,
+        lease = await inference_controller.acquire(
+            build_inference_key("image_gen", request.model)
         )
+    except InferenceOverloadedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(
+                f"Image generation model '{request.model}' is overloaded. {e}"
+            ),
+        ) from e
+
+    try:
+        async with lease:
+            image_bytes = await _generate_image(
+                model=model,
+                prompt=request.prompt,
+                width=width,
+                height=height,
+                num_steps=num_steps,
+                output_format=output_format,
+            )
 
         if request.response_format == "url":
             # Save image and return URL with secure random ID
