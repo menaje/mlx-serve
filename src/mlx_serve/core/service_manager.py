@@ -1,8 +1,11 @@
 """Cross-platform service management for mlx-serve."""
 
+import os
 import platform
 import subprocess
 import sys
+import time
+from urllib import error, request
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -83,6 +86,10 @@ class ServiceManager(ABC):
 class LaunchdManager(ServiceManager):
     """macOS launchd service manager."""
 
+    _LAUNCHCTL_TIMEOUT_SECONDS = 5.0
+    _STATE_WAIT_TIMEOUT_SECONDS = 10.0
+    _STATE_WAIT_POLL_SECONDS = 0.25
+
     PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -123,8 +130,56 @@ class LaunchdManager(ServiceManager):
         ]
 
     @property
+    def _launchctl_domain(self) -> str:
+        return f"gui/{os.getuid()}"
+
+    @property
+    def _launchctl_target(self) -> str:
+        return f"{self._launchctl_domain}/{self.service_name}"
+
+    @property
     def service_name(self) -> str:
         return "com.mlx-serve.server"
+
+    def _run_launchctl(self, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess:
+        """Run launchctl with a bounded timeout."""
+        if timeout is None:
+            timeout = self._LAUNCHCTL_TIMEOUT_SECONDS
+        return subprocess.run(
+            ["launchctl", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def _wait_for_running_state(self, expected: bool) -> bool:
+        """Poll launchd until the service reaches the requested running state."""
+        deadline = time.monotonic() + self._STATE_WAIT_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if self.is_running is expected:
+                return True
+            time.sleep(self._STATE_WAIT_POLL_SECONDS)
+        return self.is_running is expected
+
+    @property
+    def _healthcheck_url(self) -> str:
+        host = settings.host
+        if host in {"0.0.0.0", "::"}:
+            host = "127.0.0.1"
+        return f"http://{host}:{settings.port}/health"
+
+    def _wait_for_http_ready(self) -> bool:
+        """Poll the local health endpoint until the server is ready."""
+        deadline = time.monotonic() + self._STATE_WAIT_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                with request.urlopen(self._healthcheck_url, timeout=1.0) as response:
+                    if response.status == 200:
+                        return True
+            except (error.URLError, TimeoutError):
+                pass
+            time.sleep(self._STATE_WAIT_POLL_SECONDS)
+        return False
 
     @property
     def is_installed(self) -> bool:
@@ -132,12 +187,13 @@ class LaunchdManager(ServiceManager):
 
     @property
     def is_running(self) -> bool:
-        result = subprocess.run(
-            ["launchctl", "list", self.service_name],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
+        try:
+            result = self._run_launchctl("print", self._launchctl_target, timeout=2.0)
+        except subprocess.TimeoutExpired:
+            return False
+        if result.returncode != 0:
+            return False
+        return "state = running" in result.stdout
 
     @property
     def is_enabled(self) -> bool:
@@ -162,17 +218,16 @@ class LaunchdManager(ServiceManager):
             if legacy_path == self._plist_path or not legacy_path.exists():
                 continue
             try:
-                subprocess.run(
-                    ["launchctl", "unload", str(legacy_path)],
-                    capture_output=True,
-                    text=True,
-                )
+                self._run_launchctl("bootout", self._launchctl_domain, str(legacy_path))
                 legacy_path.unlink()
                 removed_paths.append(legacy_path)
             except PermissionError as exc:
                 raise RuntimeError(
                     f"Legacy plist exists at {legacy_path} but could not be removed"
                 ) from exc
+            except subprocess.TimeoutExpired:
+                legacy_path.unlink()
+                removed_paths.append(legacy_path)
         return removed_paths
 
     def install(
@@ -214,22 +269,51 @@ class LaunchdManager(ServiceManager):
         if not self.is_installed:
             return False, "Service not installed. Run 'mlx-serve service install' first"
 
-        result = subprocess.run(
-            ["launchctl", "load", str(self._plist_path)],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            return True, "Service started"
-        return False, f"Failed to start service: {result.stderr}"
+        try:
+            bootstrap = self._run_launchctl(
+                "bootstrap",
+                self._launchctl_domain,
+                str(self._plist_path),
+            )
+        except subprocess.TimeoutExpired:
+            bootstrap = None
+        if (
+            bootstrap is not None
+            and bootstrap.returncode != 0
+            and "already bootstrapped" not in bootstrap.stderr.lower()
+        ):
+            return False, f"Failed to start service: {bootstrap.stderr}"
+
+        try:
+            kickstart = self._run_launchctl("kickstart", "-k", self._launchctl_target)
+        except subprocess.TimeoutExpired:
+            kickstart = None
+        if kickstart is not None and kickstart.returncode != 0:
+            return False, f"Failed to kickstart service: {kickstart.stderr}"
+        if not self._wait_for_running_state(expected=True):
+            return False, "Service did not reach running state after start"
+        if not self._wait_for_http_ready():
+            return False, "Service reached running state but health endpoint is not ready"
+        return True, "Service started"
 
     def stop(self) -> tuple[bool, str]:
-        result = subprocess.run(
-            ["launchctl", "unload", str(self._plist_path)],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
+        try:
+            result = self._run_launchctl("bootout", self._launchctl_target)
+        except subprocess.TimeoutExpired:
+            result = None
+        if result is not None and result.returncode == 0:
+            if self._wait_for_running_state(expected=False):
+                return True, "Service stopped"
+            return True, "Service may not be running"
+        try:
+            result = self._run_launchctl("bootout", self._launchctl_domain, str(self._plist_path))
+        except subprocess.TimeoutExpired:
+            result = None
+        if result is not None and result.returncode == 0:
+            if self._wait_for_running_state(expected=False):
+                return True, "Service stopped"
+            return True, "Service may not be running"
+        if self._wait_for_running_state(expected=False):
             return True, "Service stopped"
         return True, "Service may not be running"
 

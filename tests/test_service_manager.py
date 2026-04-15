@@ -1,5 +1,7 @@
 """Tests for service manager."""
 
+import os
+import subprocess
 from unittest.mock import PropertyMock, patch
 
 import pytest
@@ -67,6 +69,8 @@ class TestLaunchdManager:
     def test_service_name(self, manager):
         """Test service name."""
         assert manager.service_name == "com.mlx-serve.server"
+        assert manager._launchctl_domain == f"gui/{os.getuid()}"
+        assert manager._launchctl_target == f"gui/{os.getuid()}/com.mlx-serve.server"
 
     def test_is_installed_false(self, manager):
         """Test is_installed when not installed."""
@@ -125,6 +129,122 @@ class TestLaunchdManager:
 
         assert success is True
         assert not manager._plist_path.exists()
+
+    def test_start_uses_bootstrap_and_kickstart(self, manager):
+        """Test launchd start uses bootstrap and kickstart."""
+        manager.install()
+
+        with patch("subprocess.run") as run, patch.object(
+            manager, "_wait_for_http_ready", return_value=True
+        ):
+            run.side_effect = [
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="state = running\n",
+                    stderr="",
+                ),
+            ]
+            success, message = manager.start()
+
+        assert success is True
+        assert message == "Service started"
+        assert run.call_args_list[0].args[0][:3] == [
+            "launchctl",
+            "bootstrap",
+            manager._launchctl_domain,
+        ]
+        assert run.call_args_list[1].args[0] == [
+            "launchctl",
+            "kickstart",
+            "-k",
+            manager._launchctl_target,
+        ]
+        assert run.call_args_list[2].args[0] == [
+            "launchctl",
+            "print",
+            manager._launchctl_target,
+        ]
+
+    def test_start_waits_for_running_state(self, manager):
+        """Test launchd start tolerates the initial spawn-scheduled state."""
+        manager.install()
+
+        with (
+            patch("subprocess.run") as run,
+            patch("time.sleep"),
+            patch.object(manager, "_wait_for_http_ready", return_value=True),
+        ):
+            run.side_effect = [
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="state = spawn scheduled\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="state = running\n",
+                    stderr="",
+                ),
+            ]
+            success, message = manager.start()
+
+        assert success is True
+        assert message == "Service started"
+
+    def test_start_waits_for_http_ready(self, manager):
+        """Test launchd start waits for the health endpoint after launchd reports running."""
+        manager.install()
+
+        with patch("subprocess.run") as run, patch.object(
+            manager, "_wait_for_http_ready", return_value=True
+        ) as wait_for_http_ready:
+            run.side_effect = [
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="state = running\n",
+                    stderr="",
+                ),
+            ]
+            success, message = manager.start()
+
+        assert success is True
+        assert message == "Service started"
+        wait_for_http_ready.assert_called_once_with()
+
+    def test_stop_uses_bootout_target_first(self, manager):
+        """Test launchd stop uses bootout with the fully-qualified target."""
+        with patch("subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            success, message = manager.stop()
+
+        assert success is True
+        assert message == "Service stopped"
+        assert run.call_args_list[0].args[0] == [
+            "launchctl",
+            "bootout",
+            manager._launchctl_target,
+        ]
+
+    def test_is_running_checks_launchctl_print_state(self, manager):
+        """Test launchd running state is read from launchctl print output."""
+        with patch("subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="state = running\n",
+                stderr="",
+            )
+            assert manager.is_running is True
 
     def test_status(self, manager):
         """Test status returns correct info."""
