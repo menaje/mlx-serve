@@ -164,6 +164,15 @@ def _stop_service_if_running() -> bool:
     return False
 
 
+def _ensure_config_file_exists() -> None:
+    """Create the default config file if it does not already exist."""
+    from mlx_serve.core.config_loader import ensure_default_config
+
+    config_path, created = ensure_default_config()
+    if created:
+        console.print(f"[green]Created default config file at {config_path}[/green]")
+
+
 @app.command()
 def stop(
     port: int = typer.Option(
@@ -294,12 +303,30 @@ def config(
         "-p",
         help="Show config file path",
     ),
+    init: bool = typer.Option(
+        False,
+        "--init",
+        "-i",
+        help="Create the default config file if missing",
+    ),
 ) -> None:
     """Manage mlx-serve configuration."""
-    from mlx_serve.core.config_loader import DEFAULT_CONFIG_PATH, get_example_config
+    from mlx_serve.core.config_loader import (
+        DEFAULT_CONFIG_PATH,
+        ensure_default_config,
+        get_example_config,
+    )
 
     if example:
         console.print(get_example_config())
+        return
+
+    if init:
+        config_path, created = ensure_default_config()
+        if created:
+            console.print(f"[green]Created default config file at {config_path}[/green]")
+        else:
+            console.print(f"[yellow]Config file already exists at {config_path}[/yellow]")
         return
 
     if path:
@@ -307,7 +334,7 @@ def config(
         console.print(f"Exists: {DEFAULT_CONFIG_PATH.exists()}")
         return
 
-    if show or not any([example, path]):
+    if show or not any([example, path, init]):
         # Show current configuration
         table = Table(title="Current Configuration")
         table.add_column("Setting", style="cyan")
@@ -519,6 +546,7 @@ def _check_service_support() -> None:
 def service_install() -> None:
     """Install mlx-serve as a system service."""
     _check_service_support()
+    _ensure_config_file_exists()
     manager = get_service_manager()
 
     console.print(f"[blue]Installing service for {get_platform_name()}...[/blue]")
@@ -536,6 +564,7 @@ def service_install() -> None:
 def service_apply() -> None:
     """Apply config-driven service settings to the installed service."""
     _check_service_support()
+    _ensure_config_file_exists()
     manager = get_service_manager()
 
     success, message = manager.apply()
@@ -563,6 +592,7 @@ def service_uninstall() -> None:
 def service_start() -> None:
     """Start the mlx-serve system service."""
     _check_service_support()
+    _ensure_config_file_exists()
     manager = get_service_manager()
 
     success, message = manager.apply()

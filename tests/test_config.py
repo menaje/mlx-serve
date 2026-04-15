@@ -66,6 +66,45 @@ class TestConfigLoader:
         assert "metrics:" in example
         assert "service:" in example
 
+    def test_render_default_config(self):
+        """Test rendering the default config from effective settings."""
+        from mlx_serve.config import Settings
+        from mlx_serve.core.config_loader import render_default_config
+
+        config_text = render_default_config(Settings())
+        assert "server:" in config_text
+        assert "port: 8000" in config_text
+        assert "service:" in config_text
+        assert "auto_start: true" in config_text
+        assert "keep_alive: true" in config_text
+
+    def test_ensure_default_config_creates_file(self, tmp_path):
+        """Test creating a default config file when missing."""
+        from mlx_serve.core.config_loader import ensure_default_config
+
+        config_path = tmp_path / "config.yaml"
+        created_path, created = ensure_default_config(config_path)
+
+        assert created is True
+        assert created_path == config_path
+        assert config_path.exists()
+        content = config_path.read_text()
+        assert "server:" in content
+        assert "service:" in content
+
+    def test_ensure_default_config_does_not_overwrite(self, tmp_path):
+        """Test preserving an existing config file."""
+        from mlx_serve.core.config_loader import ensure_default_config
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("server:\n  port: 9000\n", encoding="utf-8")
+
+        created_path, created = ensure_default_config(config_path)
+
+        assert created is False
+        assert created_path == config_path
+        assert config_path.read_text(encoding="utf-8") == "server:\n  port: 9000\n"
+
 
 class TestSettings:
     """Tests for Settings class."""
