@@ -59,6 +59,12 @@ def build_default_config_dict(settings_obj: Any | None = None) -> dict[str, Any]
             "process_limit_fraction": settings_obj.memory_process_limit_fraction,
             "min_available_fraction": settings_obj.memory_min_available_fraction,
         },
+        "retrieval": {
+            "worker_isolation_enabled": settings_obj.retrieval_worker_isolation_enabled,
+            "worker_host": settings_obj.retrieval_worker_host,
+            "worker_ready_timeout_seconds": settings_obj.retrieval_worker_ready_timeout_seconds,
+            "worker_shutdown_timeout_seconds": settings_obj.retrieval_worker_shutdown_timeout_seconds,
+        },
         "logging": {
             "level": settings_obj.log_level,
             "format": settings_obj.log_format,
@@ -162,6 +168,14 @@ def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         ("memory", "poll_interval_seconds"): "memory_poll_interval_seconds",
         ("memory", "process_limit_fraction"): "memory_process_limit_fraction",
         ("memory", "min_available_fraction"): "memory_min_available_fraction",
+        # retrieval section
+        ("retrieval", "worker_isolation_enabled"): "retrieval_worker_isolation_enabled",
+        ("retrieval", "worker_host"): "retrieval_worker_host",
+        ("retrieval", "worker_ready_timeout_seconds"): "retrieval_worker_ready_timeout_seconds",
+        (
+            "retrieval",
+            "worker_shutdown_timeout_seconds",
+        ): "retrieval_worker_shutdown_timeout_seconds",
         # metrics section
         ("metrics", "enabled"): "metrics_enabled",
         ("metrics", "port"): "metrics_port",
@@ -245,6 +259,12 @@ memory:
   poll_interval_seconds: 2.0
   process_limit_fraction: 0.75
   min_available_fraction: 0.10
+
+retrieval:
+  worker_isolation_enabled: true
+  worker_host: 127.0.0.1
+  worker_ready_timeout_seconds: 30.0
+  worker_shutdown_timeout_seconds: 5.0
 
 logging:
   level: INFO

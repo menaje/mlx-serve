@@ -98,3 +98,24 @@ class TestTokenizeModels:
         assert response.object == "list"
         assert len(response.data) == 1
         assert response.model == "test-model"
+
+    def test_load_tokenizer_for_model_allows_unknown_kind_in_worker_mode(self, monkeypatch):
+        """Workers should still load local retrieval models when aliases/metadata are absent."""
+        from mlx_serve.routers import tokenize as tokenize_router
+
+        fake_tokenizer = object()
+
+        monkeypatch.setattr(tokenize_router, "resolve_retrieval_model_type", lambda model: None)
+        monkeypatch.setattr(
+            tokenize_router.model_manager,
+            "get_embedding_model",
+            lambda model: (object(), fake_tokenizer),
+        )
+
+        model_type, tokenizer = tokenize_router._load_tokenizer_for_model(
+            "manual-embedding",
+            allowed_kind="embedding",
+        )
+
+        assert model_type == "embedding"
+        assert tokenizer is fake_tokenizer

@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from mlx_serve.core.inference_control import (
@@ -14,7 +14,13 @@ from mlx_serve.core.inference_control import (
     get_model_execution_lock,
     raise_if_server_overloaded,
 )
+from mlx_serve.core.retrieval_model_routing import resolve_retrieval_model_type
+from mlx_serve.core.runtime_topology import (
+    get_retrieval_worker_kind,
+    retrieval_worker_isolation_enabled,
+)
 from mlx_serve.core.model_manager import model_manager
+from mlx_serve.routers.retrieval_proxy import forward_to_retrieval_worker
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +76,59 @@ async def _tokenize_texts(
     return await loop.run_in_executor(None, _tokenize)
 
 
+def _build_model_not_found_detail(model_name: str) -> dict:
+    """Build a consistent model-not-found error payload."""
+    return {
+        "error": {
+            "message": f"Model '{model_name}' not found",
+            "type": "invalid_request_error",
+            "code": "model_not_found",
+        }
+    }
+
+
+def _load_tokenizer_for_model(
+    model_name: str,
+    allowed_kind: Literal["embedding", "reranker"] | None = None,
+) -> tuple[str, object]:
+    """Load the tokenizer for a retrieval model."""
+    resolved_kind = resolve_retrieval_model_type(model_name)
+    if allowed_kind is not None:
+        if resolved_kind is not None and resolved_kind != allowed_kind:
+            raise ValueError(f"Model '{model_name}' does not belong to {allowed_kind}")
+        if allowed_kind == "embedding":
+            _, tokenizer = model_manager.get_embedding_model(model_name)
+            return allowed_kind, tokenizer
+        _, tokenizer = model_manager.get_reranker_model(model_name)
+        return allowed_kind, tokenizer
+
+    if resolved_kind == "embedding":
+        _, tokenizer = model_manager.get_embedding_model(model_name)
+        return resolved_kind, tokenizer
+    if resolved_kind == "reranker":
+        _, tokenizer = model_manager.get_reranker_model(model_name)
+        return resolved_kind, tokenizer
+
+    # Fallback for legacy local mode if the type cannot be inferred from aliases/metadata.
+    try:
+        _, tokenizer = model_manager.get_embedding_model(model_name)
+        return "embedding", tokenizer
+    except ValueError:
+        _, tokenizer = model_manager.get_reranker_model(model_name)
+        return "reranker", tokenizer
+
+
+async def _forward_tokenize_request_to_worker(
+    http_request: Request,
+    worker_kind: Literal["embedding", "reranker"],
+    body: bytes,
+) -> Response:
+    """Forward tokenize traffic to a single retrieval worker."""
+    return await forward_to_retrieval_worker(http_request, worker_kind, body=body)
+
+
 @router.post("/v1/tokenize", response_model=TokenizeResponse)
-async def tokenize_text(request: TokenizeRequest) -> TokenizeResponse:
+async def tokenize_text(request: TokenizeRequest, http_request: Request) -> TokenizeResponse | Response:
     """Count tokens for the given input(s).
 
     Returns the number of tokens for each input text.
@@ -92,34 +149,54 @@ async def tokenize_text(request: TokenizeRequest) -> TokenizeResponse:
             },
         )
 
-    # Try to get tokenizer from embedding model first, then reranker
-    tokenizer = None
-    model_type: str | None = None
-    try:
-        raise_if_server_overloaded()
-        _, tokenizer = model_manager.get_embedding_model(request.model)
-        model_type = "embedding"
-    except ValueError:
-        try:
-            _, tokenizer = model_manager.get_reranker_model(request.model)
-            model_type = "reranker"
-        except ValueError:
-            pass
+    if retrieval_worker_isolation_enabled():
+        body = request.model_dump_json().encode("utf-8")
+        resolved_kind = resolve_retrieval_model_type(request.model)
+        if resolved_kind is None:
+            candidate_kinds: list[Literal["embedding", "reranker"]] = [
+                "embedding",
+                "reranker",
+            ]
+        else:
+            candidate_kinds = [resolved_kind]
+            fallback_kind = "reranker" if resolved_kind == "embedding" else "embedding"
+            candidate_kinds.append(fallback_kind)
 
-    if tokenizer is None:
+        last_response: Response | None = None
+        for worker_kind in candidate_kinds:
+            response = await _forward_tokenize_request_to_worker(
+                http_request,
+                worker_kind,
+                body,
+            )
+            if response.status_code != 404:
+                return response
+            last_response = response
+
+        if last_response is not None:
+            return last_response
         raise HTTPException(
             status_code=404,
-            detail={
-                "error": {
-                    "message": f"Model '{request.model}' not found",
-                    "type": "invalid_request_error",
-                    "code": "model_not_found",
-                }
-            },
+            detail=_build_model_not_found_detail(request.model),
+        )
+
+    worker_kind = get_retrieval_worker_kind()
+    allowed_kind: Literal["embedding", "reranker"] | None = worker_kind
+
+    try:
+        raise_if_server_overloaded()
+        model_type, tokenizer = _load_tokenizer_for_model(
+            request.model,
+            allowed_kind=allowed_kind,
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail=_build_model_not_found_detail(request.model),
         )
 
     try:
-        model_key = build_inference_key(model_type or "embedding", request.model)
+        model_key = build_inference_key(model_type, request.model)
         async with get_model_execution_lock(model_key):
             data = await _tokenize_texts(tokenizer, texts, request.return_tokens)
 

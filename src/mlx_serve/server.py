@@ -1,7 +1,6 @@
 """FastAPI server for mlx-serve."""
 
 import logging
-import signal
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -11,6 +10,12 @@ from fastapi.responses import JSONResponse
 
 from mlx_serve import __version__
 from mlx_serve.config import settings
+from mlx_serve.core.retrieval_workers import RetrievalWorkerSupervisor
+from mlx_serve.core.runtime_topology import (
+    get_retrieval_worker_kind,
+    get_server_role,
+    retrieval_worker_isolation_enabled,
+)
 from mlx_serve.core.system_guard import memory_monitor
 from mlx_serve.routers import (
     audio_router,
@@ -18,6 +23,7 @@ from mlx_serve.routers import (
     embeddings_router,
     images_router,
     models_router,
+    retrieval_proxy_router,
     rerank_router,
     tokenize_router,
 )
@@ -34,25 +40,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Lifespan context manager for startup and shutdown events."""
     import asyncio
 
-    from mlx_serve.core.model_manager import model_manager
-
-    shutdown_event = asyncio.Event()
-
-    def handle_shutdown(signum: int, frame) -> None:
-        """Handle SIGTERM/SIGINT for graceful shutdown."""
-        global _shutting_down
-        _shutting_down = True
-        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-        shutdown_event.set()
-
-    # Register signal handlers
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
+    retrieval_supervisor: RetrievalWorkerSupervisor | None = None
+    global _shutting_down
+    _shutting_down = False
 
     memory_monitor.start()
 
-    # Preload models at startup
-    if settings.preload_models:
+    if retrieval_worker_isolation_enabled():
+        retrieval_supervisor = RetrievalWorkerSupervisor()
+        app.state.retrieval_worker_supervisor = retrieval_supervisor
+        app.state.retrieval_worker_urls = retrieval_supervisor.start()
+    elif settings.preload_models:
+        from mlx_serve.core.model_manager import model_manager
+
         logger.info(f"Preloading models: {settings.preload_models}")
         results = model_manager.preload_models()
         success = sum(1 for v in results.values() if v)
@@ -61,27 +61,59 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("mlx-serve server started")
     yield
 
+    _shutting_down = True
+
     # Graceful shutdown: wait for active requests to complete
-    if _shutting_down:
-        timeout = 30  # seconds
-        logger.info(
-            "Waiting for %s active requests to complete (timeout: %ss)...",
+    timeout = 30  # seconds
+    logger.info(
+        "Waiting for %s active requests to complete (timeout: %ss)...",
+        _active_requests,
+        timeout,
+    )
+
+    for _ in range(timeout * 10):
+        if _active_requests == 0:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        logger.warning(
+            "Shutdown timeout reached with %s requests still active",
             _active_requests,
-            timeout,
         )
 
-        for _ in range(timeout * 10):
-            if _active_requests == 0:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            logger.warning(
-                "Shutdown timeout reached with %s requests still active",
-                _active_requests,
-            )
+    if retrieval_supervisor is not None:
+        retrieval_supervisor.stop()
 
     memory_monitor.stop()
     logger.info("mlx-serve server stopped")
+
+
+def _include_routers(app: FastAPI) -> None:
+    """Attach routers based on the current runtime topology."""
+    role = get_server_role()
+    worker_kind = get_retrieval_worker_kind()
+
+    if role == "worker":
+        if worker_kind == "embedding":
+            app.include_router(embeddings_router)
+            app.include_router(tokenize_router)
+        elif worker_kind == "reranker":
+            app.include_router(rerank_router)
+            app.include_router(tokenize_router)
+        else:
+            raise RuntimeError("Worker process started without a valid retrieval worker kind")
+        return
+
+    app.include_router(audio_router)
+    app.include_router(chat_router)
+    if retrieval_worker_isolation_enabled():
+        app.include_router(retrieval_proxy_router)
+    else:
+        app.include_router(embeddings_router)
+        app.include_router(rerank_router)
+    app.include_router(images_router)
+    app.include_router(models_router)
+    app.include_router(tokenize_router)
 
 
 def create_app() -> FastAPI:
@@ -92,15 +124,10 @@ def create_app() -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    app.state.retrieval_worker_urls = {}
+    app.state.retrieval_worker_supervisor = None
 
-    # Include routers
-    app.include_router(audio_router)
-    app.include_router(chat_router)
-    app.include_router(embeddings_router)
-    app.include_router(images_router)
-    app.include_router(rerank_router)
-    app.include_router(models_router)
-    app.include_router(tokenize_router)
+    _include_routers(app)
 
     # Middleware to track active requests and log request bodies
     @app.middleware("http")
@@ -213,12 +240,18 @@ def create_app() -> FastAPI:
         """Health check endpoint."""
         memory = memory_monitor.health_payload()
         status = "degraded" if memory["overloaded"] else "healthy"
-        return {
+        payload = {
             "status": status,
             "version": __version__,
+            "role": get_server_role(),
+            "retrieval_worker_kind": get_retrieval_worker_kind(),
             "shutting_down": _shutting_down,
             "memory": memory,
         }
+        supervisor = getattr(app.state, "retrieval_worker_supervisor", None)
+        if supervisor is not None:
+            payload["retrieval_workers"] = supervisor.snapshot()
+        return payload
 
     if settings.metrics_enabled:
         from mlx_serve.core.metrics import MetricsMiddleware, get_metrics

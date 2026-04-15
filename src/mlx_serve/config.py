@@ -149,6 +149,27 @@ class Settings(BaseSettings):
         gt=0,
         lt=1,
     )
+    retrieval_worker_isolation_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run embeddings and rerank endpoints in dedicated subprocesses "
+            "so different retrieval model types can execute concurrently"
+        ),
+    )
+    retrieval_worker_host: str = Field(
+        default="127.0.0.1",
+        description="Bind host for internal retrieval worker subprocesses",
+    )
+    retrieval_worker_ready_timeout_seconds: float = Field(
+        default=30.0,
+        description="Maximum time to wait for an internal retrieval worker to become healthy",
+        gt=0,
+    )
+    retrieval_worker_shutdown_timeout_seconds: float = Field(
+        default=5.0,
+        description="Maximum time to wait for an internal retrieval worker to exit cleanly",
+        gt=0,
+    )
 
     # Metrics settings
     metrics_enabled: bool = Field(
