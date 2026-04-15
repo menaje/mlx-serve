@@ -6,6 +6,8 @@ import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from mlx_serve.config import settings
+
 
 class ServiceManager(ABC):
     """Abstract base class for OS-specific service managers."""
@@ -64,6 +66,10 @@ class ServiceManager(ABC):
         """Disable the service from starting at login. Returns (success, message)."""
         pass
 
+    def apply(self) -> tuple[bool, str]:
+        """Apply the current configuration to the service definition."""
+        return self.install()
+
     def status(self) -> dict:
         """Get service status information."""
         return {
@@ -94,7 +100,7 @@ class LaunchdManager(ServiceManager):
     <key>RunAtLoad</key>
     <{run_at_load}/>
     <key>KeepAlive</key>
-    <true/>
+    <{keep_alive}/>
     <key>StandardOutPath</key>
     <string>{log_dir}/mlx-serve.log</string>
     <key>StandardErrorPath</key>
@@ -111,6 +117,10 @@ class LaunchdManager(ServiceManager):
     def __init__(self):
         self._plist_path = Path.home() / "Library" / "LaunchAgents" / "com.mlx-serve.server.plist"
         self._log_dir = Path.home() / ".mlx-serve" / "logs"
+        self._legacy_plist_paths = [
+            Path("/Library/LaunchAgents/com.mlx-serve.server.plist"),
+            Path("/Library/LaunchDaemons/com.mlx-serve.server.plist"),
+        ]
 
     @property
     def service_name(self) -> str:
@@ -137,17 +147,61 @@ class LaunchdManager(ServiceManager):
         content = self._plist_path.read_text()
         return "<key>RunAtLoad</key>\n    <true/>" in content
 
-    def install(self, run_at_load: bool = False) -> tuple[bool, str]:
+    @property
+    def keep_alive_enabled(self) -> bool:
+        """Check if KeepAlive is enabled in the plist."""
+        if not self.is_installed:
+            return False
+        content = self._plist_path.read_text()
+        return "<key>KeepAlive</key>\n    <true/>" in content
+
+    def _remove_legacy_plists(self) -> list[Path]:
+        """Remove unmanaged legacy plist files with the same label."""
+        removed_paths: list[Path] = []
+        for legacy_path in self._legacy_plist_paths:
+            if legacy_path == self._plist_path or not legacy_path.exists():
+                continue
+            try:
+                subprocess.run(
+                    ["launchctl", "unload", str(legacy_path)],
+                    capture_output=True,
+                    text=True,
+                )
+                legacy_path.unlink()
+                removed_paths.append(legacy_path)
+            except PermissionError as exc:
+                raise RuntimeError(
+                    f"Legacy plist exists at {legacy_path} but could not be removed"
+                ) from exc
+        return removed_paths
+
+    def install(
+        self,
+        run_at_load: bool | None = None,
+        keep_alive: bool | None = None,
+    ) -> tuple[bool, str]:
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._plist_path.parent.mkdir(parents=True, exist_ok=True)
+        run_at_load = settings.service_auto_start if run_at_load is None else run_at_load
+        keep_alive = settings.service_keep_alive if keep_alive is None else keep_alive
+
+        try:
+            removed_paths = self._remove_legacy_plists()
+        except RuntimeError as exc:
+            return False, str(exc)
 
         plist_content = self.PLIST_TEMPLATE.format(
             python_path=sys.executable,
             log_dir=str(self._log_dir),
             run_at_load="true" if run_at_load else "false",
+            keep_alive="true" if keep_alive else "false",
         )
         self._plist_path.write_text(plist_content)
-        return True, f"Service installed at {self._plist_path}"
+        message = f"Service installed at {self._plist_path}"
+        if removed_paths:
+            removed = ", ".join(str(path) for path in removed_paths)
+            message += f" (removed legacy plist: {removed})"
+        return True, message
 
     def uninstall(self) -> tuple[bool, str]:
         self.stop()
@@ -183,13 +237,20 @@ class LaunchdManager(ServiceManager):
         if not self.is_installed:
             return False, "Service not installed"
         # Reinstall with RunAtLoad=true
-        return self.install(run_at_load=True)
+        return self.install(run_at_load=True, keep_alive=self.keep_alive_enabled)
 
     def disable(self) -> tuple[bool, str]:
         if not self.is_installed:
             return False, "Service not installed"
         # Reinstall with RunAtLoad=false
-        return self.install(run_at_load=False)
+        return self.install(run_at_load=False, keep_alive=self.keep_alive_enabled)
+
+    def status(self) -> dict:
+        """Get service status information."""
+        status = super().status()
+        status["managed_path"] = str(self._plist_path)
+        status["keep_alive"] = self.keep_alive_enabled
+        return status
 
 
 class SystemdManager(ServiceManager):

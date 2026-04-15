@@ -37,6 +37,7 @@ class TestConfigLoader:
             "cache": {"max_embedding_models": 5},
             "models": {"preload": ["model1", "model2"]},
             "batch": {"max_queue_per_model": 4, "queue_timeout_seconds": 12},
+            "service": {"auto_start": False, "keep_alive": False},
             "memory": {"guard_enabled": True, "min_available_fraction": 0.05},
             "logging": {"debug_chat_request_bodies": True},
         }
@@ -48,6 +49,8 @@ class TestConfigLoader:
         assert flat["preload_models"] == ["model1", "model2"]
         assert flat["inference_max_queue_per_model"] == 4
         assert flat["inference_queue_timeout_seconds"] == 12
+        assert flat["service_auto_start"] is False
+        assert flat["service_keep_alive"] is False
         assert flat["memory_guard_enabled"] is True
         assert flat["memory_min_available_fraction"] == 0.05
         assert flat["debug_log_chat_request_bodies"] is True
@@ -61,6 +64,7 @@ class TestConfigLoader:
         assert "models:" in example
         assert "cache:" in example
         assert "metrics:" in example
+        assert "service:" in example
 
 
 class TestSettings:
@@ -79,6 +83,8 @@ class TestSettings:
         assert settings.inference_max_queue_per_model == 8
         assert settings.inference_queue_timeout_seconds == 30.0
         assert settings.memory_guard_enabled is True
+        assert settings.service_auto_start is True
+        assert settings.service_keep_alive is True
         assert settings.debug_log_chat_request_bodies is False
 
     def test_preload_models_parsing(self):

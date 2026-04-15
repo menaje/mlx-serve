@@ -160,6 +160,16 @@ class Settings(BaseSettings):
         description="Port for Prometheus metrics endpoint",
     )
 
+    # Service settings
+    service_auto_start: bool = Field(
+        default=True,
+        description="Start the managed service automatically at login",
+    )
+    service_keep_alive: bool = Field(
+        default=True,
+        description="Restart the managed service automatically if it exits",
+    )
+
     # Auto-download settings
     auto_download: bool = Field(
         default=False,

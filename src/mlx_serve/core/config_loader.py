@@ -81,6 +81,9 @@ def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         # metrics section
         ("metrics", "enabled"): "metrics_enabled",
         ("metrics", "port"): "metrics_port",
+        # service section
+        ("service", "auto_start"): "service_auto_start",
+        ("service", "keep_alive"): "service_keep_alive",
         # logging section
         ("logging", "level"): "log_level",
         ("logging", "format"): "log_format",
@@ -148,6 +151,10 @@ batch:
 metrics:
   enabled: true
   port: 9090
+
+service:
+  auto_start: true
+  keep_alive: true
 
 memory:
   guard_enabled: true

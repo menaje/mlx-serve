@@ -94,6 +94,27 @@ class TestLaunchdManager:
         content = manager._plist_path.read_text()
         assert "<true/>" in content.split("RunAtLoad")[1].split("\n")[1]
 
+    def test_install_uses_config_keep_alive(self, manager, monkeypatch):
+        """Test install uses config keep_alive when not explicitly overridden."""
+        monkeypatch.setattr("mlx_serve.core.service_manager.settings.service_keep_alive", False)
+        success, _ = manager.install()
+        assert success is True
+        content = manager._plist_path.read_text()
+        assert "<false/>" in content.split("KeepAlive")[1].split("\n")[1]
+
+    def test_install_removes_legacy_plists(self, manager, tmp_path):
+        """Test install removes legacy plist files outside the managed path."""
+        legacy_path = tmp_path / "legacy.plist"
+        legacy_path.write_text("<plist>legacy</plist>")
+        manager._legacy_plist_paths = [legacy_path]
+
+        with patch("subprocess.run"):
+            success, message = manager.install()
+
+        assert success is True
+        assert not legacy_path.exists()
+        assert "removed legacy plist" in message
+
     def test_uninstall(self, manager):
         """Test uninstall removes plist file."""
         manager.install()
@@ -113,10 +134,18 @@ class TestLaunchdManager:
             with patch.object(
                 type(manager), "is_enabled", new_callable=PropertyMock, return_value=False
             ):
-                status = manager.status()
-                assert status["installed"] is False
-                assert status["running"] is False
-                assert status["service_name"] == "com.mlx-serve.server"
+                with patch.object(
+                    type(manager),
+                    "keep_alive_enabled",
+                    new_callable=PropertyMock,
+                    return_value=True,
+                ):
+                    status = manager.status()
+                    assert status["installed"] is False
+                    assert status["running"] is False
+                    assert status["service_name"] == "com.mlx-serve.server"
+                    assert status["managed_path"] == str(manager._plist_path)
+                    assert status["keep_alive"] is True
 
 
 class TestSystemdManager:

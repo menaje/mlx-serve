@@ -505,6 +505,7 @@ def quantize(
         console.print(f"[red]{message}[/red]")
         raise typer.Exit(1)
 
+
 def _check_service_support() -> None:
     """Check if service management is supported on this platform."""
     manager = get_service_manager()
@@ -531,6 +532,20 @@ def service_install() -> None:
         raise typer.Exit(1)
 
 
+@service_app.command("apply")
+def service_apply() -> None:
+    """Apply config-driven service settings to the installed service."""
+    _check_service_support()
+    manager = get_service_manager()
+
+    success, message = manager.apply()
+    if success:
+        console.print(f"[green]{message}[/green]")
+    else:
+        console.print(f"[red]{message}[/red]")
+        raise typer.Exit(1)
+
+
 @service_app.command("uninstall")
 def service_uninstall() -> None:
     """Uninstall the mlx-serve system service."""
@@ -549,6 +564,11 @@ def service_start() -> None:
     """Start the mlx-serve system service."""
     _check_service_support()
     manager = get_service_manager()
+
+    success, message = manager.apply()
+    if not success:
+        console.print(f"[red]{message}[/red]")
+        raise typer.Exit(1)
 
     success, message = manager.start()
     if success:
@@ -592,6 +612,12 @@ def service_status() -> None:
             console.print("  Auto-start at login: [green]enabled[/green]")
         else:
             console.print("  Auto-start at login: [yellow]disabled[/yellow]")
+        if status.get("keep_alive"):
+            console.print("  KeepAlive: [green]enabled[/green]")
+        else:
+            console.print("  KeepAlive: [yellow]disabled[/yellow]")
+        if status.get("managed_path"):
+            console.print(f"  Managed plist: {status['managed_path']}")
 
 
 @service_app.command("enable")
