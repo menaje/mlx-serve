@@ -125,23 +125,7 @@ async def create_speech(request: SpeechRequest):
     Returns audio in the requested format.
     """
     try:
-        model = model_manager.get_tts_model(request.model)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": {
-                    "message": f"TTS model '{request.model}' not found",
-                    "type": "invalid_request_error",
-                    "code": "model_not_found",
-                }
-            },
-        ) from e
-
-    try:
-        lease = await inference_controller.acquire(
-            build_inference_key("tts", request.model)
-        )
+        lease = await inference_controller.acquire(build_inference_key("tts", request.model))
     except InferenceOverloadedError as e:
         raise HTTPException(
             status_code=503,
@@ -151,14 +135,27 @@ async def create_speech(request: SpeechRequest):
         ) from e
 
     try:
-        async with lease:
-            audio_bytes = await _generate_speech(
-                model=model,
-                text=request.input,
-                voice=request.voice,
-                speed=request.speed,
-                response_format=request.response_format,
-            )
+        try:
+            model = model_manager.get_tts_model(request.model)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "message": f"TTS model '{request.model}' not found",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            ) from e
+
+        audio_bytes = await _generate_speech(
+            model=model,
+            text=request.input,
+            voice=request.voice,
+            speed=request.speed,
+            response_format=request.response_format,
+        )
 
         # Determine content type
         content_types = {
@@ -179,6 +176,8 @@ async def create_speech(request: SpeechRequest):
             },
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Speech synthesis failed: {e}")
         raise HTTPException(
@@ -191,6 +190,8 @@ async def create_speech(request: SpeechRequest):
                 }
             },
         ) from e
+    finally:
+        await lease.release()
 
 
 # STT Models
@@ -257,41 +258,6 @@ async def create_transcription(
     Supports various audio formats (mp3, wav, m4a, etc.).
     """
     try:
-        stt_model = model_manager.get_stt_model(model)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": {
-                    "message": f"STT model '{model}' not found",
-                    "type": "invalid_request_error",
-                    "code": "model_not_found",
-                }
-            },
-        ) from e
-
-    # Read and validate file size
-    content = await file.read()
-    if len(content) > MAX_AUDIO_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail={
-                "error": {
-                    "message": f"Audio file too large. Maximum size is {MAX_AUDIO_FILE_SIZE // (1024 * 1024)}MB",
-                    "type": "invalid_request_error",
-                    "code": "file_too_large",
-                }
-            },
-        )
-
-    # Save uploaded file temporarily
-    suffix = Path(file.filename).suffix if file.filename else ".wav"
-    tmp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-
         lease = await inference_controller.acquire(build_inference_key("stt", model))
     except InferenceOverloadedError as e:
         raise HTTPException(
@@ -300,15 +266,52 @@ async def create_transcription(
                 f"STT model '{model}' is overloaded. {e}"
             ),
         ) from e
+
+    tmp_path: str | None = None
     try:
-        async with lease:
-            result = await _transcribe_audio(
-                model=stt_model,
-                audio_path=tmp_path,
-                language=language,
-                response_format=response_format,
-                timestamp_granularities=timestamp_granularities,
+        try:
+            stt_model = model_manager.get_stt_model(model)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "message": f"STT model '{model}' not found",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            ) from e
+
+        # Read and validate file size after admission to avoid buffering work outside the guard.
+        content = await file.read()
+        if len(content) > MAX_AUDIO_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "error": {
+                        "message": (
+                            "Audio file too large. Maximum size is "
+                            f"{MAX_AUDIO_FILE_SIZE // (1024 * 1024)}MB"
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "file_too_large",
+                    }
+                },
             )
+
+        suffix = Path(file.filename).suffix if file.filename else ".wav"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        result = await _transcribe_audio(
+            model=stt_model,
+            audio_path=tmp_path,
+            language=language,
+            response_format=response_format,
+            timestamp_granularities=timestamp_granularities,
+        )
 
         # Handle different result formats
         if isinstance(result, dict):
@@ -344,6 +347,7 @@ async def create_transcription(
             },
         ) from e
     finally:
+        await lease.release()
         # Clean up temp file
         if tmp_path:
             try:

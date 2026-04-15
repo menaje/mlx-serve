@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from mlx_serve.config import settings
 from mlx_serve.core.inference_control import inference_controller
+from mlx_serve.core.system_guard import memory_monitor
 from mlx_serve.routers import embeddings as embeddings_router
 from mlx_serve.server import app
 
@@ -18,13 +20,16 @@ def client():
 
 
 @pytest.fixture(autouse=True)
-def reset_runtime_state():
+def reset_runtime_state(monkeypatch):
     """Reset singleton runtime state between tests."""
+    monkeypatch.setattr(settings, "memory_guard_enabled", False)
     inference_controller.reset()
     embeddings_router._batch_processors.clear()
+    memory_monitor.reset()
     yield
     inference_controller.reset()
     embeddings_router._batch_processors.clear()
+    memory_monitor.reset()
 
 
 @pytest.fixture

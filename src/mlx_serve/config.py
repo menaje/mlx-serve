@@ -56,6 +56,10 @@ class Settings(BaseSettings):
         default="text",
         description="Log format (text or json)",
     )
+    debug_log_chat_request_bodies: bool = Field(
+        default=False,
+        description="Write full /v1/chat/completions request bodies to debug logs",
+    )
 
     # Cache settings
     cache_max_embedding_models: int = Field(
@@ -112,14 +116,38 @@ class Settings(BaseSettings):
         ge=1,
     )
     inference_max_queue_per_model: int | None = Field(
-        default=None,
+        default=8,
         description="Maximum queued requests per model before rejecting (None waits indefinitely)",
         ge=0,
     )
     inference_queue_timeout_seconds: float | None = Field(
-        default=None,
+        default=30.0,
         description="Maximum time to wait for a per-model inference slot (None waits indefinitely)",
         gt=0,
+    )
+    memory_guard_enabled: bool = Field(
+        default=True,
+        description="Reject new requests when system memory pressure is high",
+    )
+    memory_poll_interval_seconds: float = Field(
+        default=2.0,
+        description="Interval in seconds between memory pressure samples",
+        gt=0,
+    )
+    memory_process_limit_fraction: float | None = Field(
+        default=0.75,
+        description="Reject new requests when process RSS exceeds this fraction of system memory",
+        gt=0,
+        lt=1,
+    )
+    memory_min_available_fraction: float | None = Field(
+        default=0.10,
+        description=(
+            "Reject new requests when estimated available system memory "
+            "drops below this fraction"
+        ),
+        gt=0,
+        lt=1,
     )
 
     # Metrics settings

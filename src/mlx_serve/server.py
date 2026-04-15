@@ -10,7 +10,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from mlx_serve import __version__
-from mlx_serve.routers import audio_router, chat_router, embeddings_router, images_router, models_router, rerank_router, tokenize_router
+from mlx_serve.config import settings
+from mlx_serve.core.system_guard import memory_monitor
+from mlx_serve.routers import (
+    audio_router,
+    chat_router,
+    embeddings_router,
+    images_router,
+    models_router,
+    rerank_router,
+    tokenize_router,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +34,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Lifespan context manager for startup and shutdown events."""
     import asyncio
 
-    from mlx_serve.config import settings
     from mlx_serve.core.model_manager import model_manager
 
     shutdown_event = asyncio.Event()
@@ -40,6 +49,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
 
+    memory_monitor.start()
+
     # Preload models at startup
     if settings.preload_models:
         logger.info(f"Preloading models: {settings.preload_models}")
@@ -53,15 +64,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Graceful shutdown: wait for active requests to complete
     if _shutting_down:
         timeout = 30  # seconds
-        logger.info(f"Waiting for {_active_requests} active requests to complete (timeout: {timeout}s)...")
+        logger.info(
+            "Waiting for %s active requests to complete (timeout: %ss)...",
+            _active_requests,
+            timeout,
+        )
 
         for _ in range(timeout * 10):
             if _active_requests == 0:
                 break
             await asyncio.sleep(0.1)
         else:
-            logger.warning(f"Shutdown timeout reached with {_active_requests} requests still active")
+            logger.warning(
+                "Shutdown timeout reached with %s requests still active",
+                _active_requests,
+            )
 
+    memory_monitor.stop()
     logger.info("mlx-serve server stopped")
 
 
@@ -89,31 +108,39 @@ def create_app() -> FastAPI:
         global _active_requests
         _active_requests += 1
 
-        # Log request body for /v1/chat/completions
-        if request.url.path == "/v1/chat/completions" and request.method == "POST":
+        # Full request body logging is opt-in because it duplicates large payloads in memory.
+        if (
+            settings.debug_log_chat_request_bodies
+            and logger.isEnabledFor(logging.DEBUG)
+            and request.url.path == "/v1/chat/completions"
+            and request.method == "POST"
+        ):
             try:
                 import json
                 from pathlib import Path
+
                 body = await request.body()
-                body_str = body.decode('utf-8')
+                body_str = body.decode("utf-8")
 
                 # Write to debug file
                 debug_file = Path.home() / ".mlx-serve" / "logs" / "request_debug.log"
+                debug_file.parent.mkdir(parents=True, exist_ok=True)
                 with open(debug_file, "a") as f:
                     f.write(f"\n\n========== REQUEST at {request.url} ==========\n")
                     f.write(f"Body: {body_str}\n")
                     try:
                         body_json = json.loads(body_str)
                         f.write(f"Parsed JSON:\n{json.dumps(body_json, indent=2)}\n")
-                    except:
+                    except json.JSONDecodeError:
                         pass
-                    f.write(f"==================================\n\n")
+                    f.write("==================================\n\n")
 
-                logger.info(f"[REQUEST BODY] /v1/chat/completions: {body_str}")
+                logger.debug("[REQUEST BODY] /v1/chat/completions captured")
                 # Re-create request with body for downstream processing
-                from starlette.datastructures import Headers
+
                 async def receive():
                     return {"type": "http.request", "body": body}
+
                 request._receive = receive
             except Exception as e:
                 logger.error(f"[REQUEST BODY] Failed to read body: {e}")
@@ -126,7 +153,10 @@ def create_app() -> FastAPI:
 
     # Validation error handler to log request validation failures
     @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    async def validation_exception_handler(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
         # Log the full request body and validation errors
         body = None
         try:
@@ -134,7 +164,7 @@ def create_app() -> FastAPI:
             from pathlib import Path
 
             body = await request.body()
-            body_str = body.decode('utf-8')
+            body_str = body.decode("utf-8")
 
             # Write to debug file
             debug_file = Path.home() / ".mlx-serve" / "logs" / "validation_errors.log"
@@ -146,10 +176,10 @@ def create_app() -> FastAPI:
                 try:
                     body_json = json.loads(body_str)
                     f.write(f"Parsed JSON:\n{json.dumps(body_json, indent=2)}\n")
-                except:
+                except json.JSONDecodeError:
                     pass
                 f.write(f"Validation errors:\n{json.dumps(exc.errors(), indent=2)}\n")
-                f.write(f"==================================\n\n")
+                f.write("==================================\n\n")
 
             logger.error(f"[VALIDATION ERROR] Request to {request.url.path}")
             logger.error(f"[VALIDATION ERROR] Request body: {body_str}")
@@ -181,10 +211,14 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health_check() -> dict:
         """Health check endpoint."""
-        return {"status": "healthy", "version": __version__, "shutting_down": _shutting_down}
-
-    # Add metrics endpoint if enabled
-    from mlx_serve.config import settings
+        memory = memory_monitor.health_payload()
+        status = "degraded" if memory["overloaded"] else "healthy"
+        return {
+            "status": status,
+            "version": __version__,
+            "shutting_down": _shutting_down,
+            "memory": memory,
+        }
 
     if settings.metrics_enabled:
         from mlx_serve.core.metrics import MetricsMiddleware, get_metrics

@@ -7,6 +7,13 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from mlx_serve.core.inference_control import (
+    InferenceOverloadedError,
+    build_inference_key,
+    build_overload_detail,
+    get_model_execution_lock,
+    raise_if_server_overloaded,
+)
 from mlx_serve.core.model_manager import model_manager
 
 logger = logging.getLogger(__name__)
@@ -87,11 +94,15 @@ async def tokenize_text(request: TokenizeRequest) -> TokenizeResponse:
 
     # Try to get tokenizer from embedding model first, then reranker
     tokenizer = None
+    model_type: str | None = None
     try:
+        raise_if_server_overloaded()
         _, tokenizer = model_manager.get_embedding_model(request.model)
+        model_type = "embedding"
     except ValueError:
         try:
             _, tokenizer = model_manager.get_reranker_model(request.model)
+            model_type = "reranker"
         except ValueError:
             pass
 
@@ -108,13 +119,22 @@ async def tokenize_text(request: TokenizeRequest) -> TokenizeResponse:
         )
 
     try:
-        data = await _tokenize_texts(tokenizer, texts, request.return_tokens)
+        model_key = build_inference_key(model_type or "embedding", request.model)
+        async with get_model_execution_lock(model_key):
+            data = await _tokenize_texts(tokenizer, texts, request.return_tokens)
 
         return TokenizeResponse(
             data=data,
             model=request.model,
         )
 
+    except InferenceOverloadedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(
+                f"Tokenizer for model '{request.model}' is overloaded. {e}"
+            ),
+        ) from e
     except Exception as e:
         logger.error(f"Tokenization failed: {e}")
         raise HTTPException(

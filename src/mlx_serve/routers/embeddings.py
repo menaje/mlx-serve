@@ -15,6 +15,8 @@ from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
     build_overload_detail,
+    get_model_execution_lock,
+    raise_if_server_overloaded,
 )
 from mlx_serve.core.model_manager import model_manager
 
@@ -150,8 +152,16 @@ async def _embed_texts(
 
     with _batch_processors_lock:
         processor = _batch_processors.get(processor_key)
-        if processor is None or processor.model is not model or processor.tokenizer is not tokenizer:
-            processor = EmbeddingBatchProcessor(model, tokenizer)
+        if (
+            processor is None
+            or processor.model is not model
+            or processor.tokenizer is not tokenizer
+        ):
+            processor = EmbeddingBatchProcessor(
+                model,
+                tokenizer,
+                execution_lock=get_model_execution_lock(processor_key),
+            )
             _batch_processors[processor_key] = processor
 
     return await processor.embed(texts)
@@ -179,6 +189,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         )
 
     try:
+        raise_if_server_overloaded()
         model, tokenizer = model_manager.get_embedding_model(request.model)
     except ValueError as e:
         raise HTTPException(
@@ -193,14 +204,16 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         ) from e
 
     try:
+        model_key = build_inference_key("embedding", request.model)
         # Generate embeddings with batch processing
         embeddings_list = await _embed_texts(request.model, model, tokenizer, texts)
         # Calculate token count (approximate)
         loop = asyncio.get_running_loop()
-        total_tokens = await loop.run_in_executor(
-            None,
-            lambda: sum(len(tokenizer.encode(text)) for text in texts)
-        )
+        async with get_model_execution_lock(model_key):
+            total_tokens = await loop.run_in_executor(
+                None,
+                lambda: sum(len(tokenizer.encode(text)) for text in texts)
+            )
 
         # Post-process embeddings: dimensions truncation + encoding format
         processed_embeddings: list[list[float] | str] = []
@@ -212,7 +225,11 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
                         status_code=400,
                         detail={
                             "error": {
-                                "message": f"Requested dimensions ({request.dimensions}) exceeds model embedding size ({len(emb)})",
+                                "message": (
+                                    "Requested dimensions "
+                                    f"({request.dimensions}) exceeds model "
+                                    f"embedding size ({len(emb)})"
+                                ),
                                 "type": "invalid_request_error",
                                 "code": "invalid_dimensions",
                             }

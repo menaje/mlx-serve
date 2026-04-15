@@ -9,6 +9,7 @@ from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
 )
+from mlx_serve.core.system_guard import memory_monitor
 
 
 @pytest.mark.asyncio
@@ -64,6 +65,21 @@ async def test_inference_controller_times_out_waiters():
         await controller.acquire("llm:test-model")
 
     await lease.release()
+
+
+@pytest.mark.asyncio
+async def test_inference_controller_rejects_when_memory_guard_is_active(monkeypatch):
+    """System-wide memory pressure should reject new admissions immediately."""
+    controller = InferenceAdmissionController(
+        max_concurrency=1,
+        max_queue_size=1,
+        acquire_timeout_seconds=1.0,
+    )
+
+    monkeypatch.setattr(memory_monitor, "overload_reason", lambda: "memory pressure detected")
+
+    with pytest.raises(InferenceOverloadedError, match="memory pressure detected"):
+        await controller.acquire("llm:test-model")
 
 
 @pytest.mark.asyncio

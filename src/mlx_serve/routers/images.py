@@ -131,7 +131,10 @@ def _parse_size(size: str) -> tuple[int, int]:
             raise ValueError("Dimensions cannot exceed 4096")
         return width, height
     except (ValueError, AttributeError) as e:
-        raise ValueError(f"Invalid size format '{size}'. Expected format: WIDTHxHEIGHT (e.g., 1024x1024)") from e
+        raise ValueError(
+            f"Invalid size format '{size}'. Expected format: "
+            "WIDTHxHEIGHT (e.g., 1024x1024)"
+        ) from e
 
 
 async def _generate_image(
@@ -216,20 +219,6 @@ async def create_image(request: ImageGenerationRequest, http_request: Request):
 
     Uses FLUX.1 models via mflux for high-quality image generation.
     """
-    try:
-        model = model_manager.get_image_gen_model(request.model)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": {
-                    "message": f"Image generation model '{request.model}' not found",
-                    "type": "invalid_request_error",
-                    "code": "model_not_found",
-                }
-            },
-        ) from e
-
     # Parse size
     try:
         width, height = _parse_size(request.size)
@@ -252,9 +241,7 @@ async def create_image(request: ImageGenerationRequest, http_request: Request):
     output_format = request.output_format or "png"
 
     try:
-        lease = await inference_controller.acquire(
-            build_inference_key("image_gen", request.model)
-        )
+        lease = await inference_controller.acquire(build_inference_key("image_gen", request.model))
     except InferenceOverloadedError as e:
         raise HTTPException(
             status_code=503,
@@ -264,15 +251,28 @@ async def create_image(request: ImageGenerationRequest, http_request: Request):
         ) from e
 
     try:
-        async with lease:
-            image_bytes = await _generate_image(
-                model=model,
-                prompt=request.prompt,
-                width=width,
-                height=height,
-                num_steps=num_steps,
-                output_format=output_format,
-            )
+        try:
+            model = model_manager.get_image_gen_model(request.model)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "message": f"Image generation model '{request.model}' not found",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            ) from e
+
+        image_bytes = await _generate_image(
+            model=model,
+            prompt=request.prompt,
+            width=width,
+            height=height,
+            num_steps=num_steps,
+            output_format=output_format,
+        )
 
         if request.response_format == "url":
             # Save image and return URL with secure random ID
@@ -307,6 +307,8 @@ async def create_image(request: ImageGenerationRequest, http_request: Request):
                 ],
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Image generation failed: {e}")
         raise HTTPException(
@@ -319,3 +321,5 @@ async def create_image(request: ImageGenerationRequest, http_request: Request):
                 }
             },
         ) from e
+    finally:
+        await lease.release()

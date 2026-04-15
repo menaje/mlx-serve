@@ -1,6 +1,5 @@
 """Tests for tokenize API endpoint."""
 
-import pytest
 
 
 class TestTokenizeEndpoint:

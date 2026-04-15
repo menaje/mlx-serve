@@ -1,7 +1,6 @@
 """Tests for service manager."""
 
-import platform
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import PropertyMock, patch
 
 import pytest
 

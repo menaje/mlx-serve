@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -11,6 +10,7 @@ from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
     build_overload_detail,
+    get_model_execution_lock,
     inference_controller,
 )
 from mlx_serve.core.model_manager import model_manager
@@ -81,7 +81,6 @@ def compute_rerank_score(
 ) -> float:
     """Compute relevance score between query and document using Qwen3-Reranker."""
     import mlx.core as mx
-    import mlx.nn as nn
 
     # Default instruction for retrieval tasks
     if instruction is None:
@@ -202,23 +201,8 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
         )
 
     try:
-        model, tokenizer = model_manager.get_reranker_model(request.model)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": {
-                    "message": f"Model '{request.model}' not found",
-                    "type": "invalid_request_error",
-                    "code": "model_not_found",
-                }
-            },
-        ) from e
-
-    try:
-        lease = await inference_controller.acquire(
-            build_inference_key("reranker", request.model)
-        )
+        model_key = build_inference_key("reranker", request.model)
+        lease = await inference_controller.acquire(model_key)
     except InferenceOverloadedError as e:
         raise HTTPException(
             status_code=503,
@@ -229,10 +213,25 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
 
     try:
         async with lease:
+            try:
+                model, tokenizer = model_manager.get_reranker_model(request.model)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "error": {
+                            "message": f"Model '{request.model}' not found",
+                            "type": "invalid_request_error",
+                            "code": "model_not_found",
+                        }
+                    },
+                ) from e
+
             # Compute scores for all documents using batch processing
-            scores, total_tokens = await _compute_batch_scores(
-                model, tokenizer, request.query, request.documents
-            )
+            async with get_model_execution_lock(model_key):
+                scores, total_tokens = await _compute_batch_scores(
+                    model, tokenizer, request.query, request.documents
+                )
 
             # Create scored docs list
             scored_docs = [
@@ -268,6 +267,8 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
                 ),
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Reranking failed: {e}")
         raise HTTPException(

@@ -1,10 +1,8 @@
 """Prometheus metrics for mlx-serve."""
 
 import time
-from typing import Callable
 
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
-
 
 # Request metrics
 REQUESTS_TOTAL = Counter(

@@ -2,8 +2,6 @@
 
 import time
 
-import pytest
-
 from mlx_serve.core.model_manager import TTLLRUCache
 
 

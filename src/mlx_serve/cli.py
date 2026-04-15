@@ -14,6 +14,7 @@ from mlx_serve import __version__
 from mlx_serve.config import settings
 from mlx_serve.core.model_manager import ModelType, model_manager
 from mlx_serve.core.pid_manager import PIDManager, get_all_instances
+from mlx_serve.core.service_manager import get_platform_name, get_service_manager
 
 app = typer.Typer(
     name="mlx-serve",
@@ -88,7 +89,10 @@ def start(
 
     # Check for existing server
     if pid_manager.is_process_running():
-        console.print(f"[yellow]Server already running on port {port} (PID: {pid_manager.read_pid()})[/yellow]")
+        console.print(
+            f"[yellow]Server already running on port {port} "
+            f"(PID: {pid_manager.read_pid()})[/yellow]"
+        )
         console.print("Use 'mlx-serve stop' to stop it first")
         raise typer.Exit(1)
 
@@ -195,7 +199,10 @@ def stop(
         for inst_port, inst_pid in instances:
             pid_manager = PIDManager(inst_port)
             if pid_manager.stop_server(force=force):
-                console.print(f"[green]Stopped server on port {inst_port} (PID: {inst_pid})[/green]")
+                console.print(
+                    f"[green]Stopped server on port {inst_port} "
+                    f"(PID: {inst_pid})[/green]"
+                )
             else:
                 console.print(f"[red]Failed to stop server on port {inst_port}[/red]")
         return
@@ -209,7 +216,10 @@ def stop(
 
     if not pid_manager.is_process_running(pid):
         pid_manager.remove_pid()
-        console.print(f"[yellow]Server on port {port} is not running (stale PID file cleaned)[/yellow]")
+        console.print(
+            f"[yellow]Server on port {port} is not running "
+            "(stale PID file cleaned)[/yellow]"
+        )
         return
 
     if pid_manager.stop_server(force=force):
@@ -305,8 +315,9 @@ def config(
         table.add_column("Source", style="dim")
 
         # Determine source for each setting
-        from mlx_serve.core.config_loader import get_config_values
         import os
+
+        from mlx_serve.core.config_loader import get_config_values
 
         yaml_config = get_config_values()
 
@@ -470,7 +481,6 @@ def quantize(
     """Quantize a model to reduce memory usage."""
     from mlx_serve.core.quantizer import (
         get_quantized_model_name,
-        list_quantization_options,
         quantize_model,
     )
 
@@ -494,11 +504,6 @@ def quantize(
     else:
         console.print(f"[red]{message}[/red]")
         raise typer.Exit(1)
-
-
-# Service management commands
-from mlx_serve.core.service_manager import get_platform_name, get_service_manager
-
 
 def _check_service_support() -> None:
     """Check if service management is supported on this platform."""

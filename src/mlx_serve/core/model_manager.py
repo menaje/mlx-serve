@@ -1,5 +1,6 @@
 """Model manager for loading, caching, and managing MLX models."""
 
+import gc
 import json
 import logging
 import shutil
@@ -236,6 +237,7 @@ class ModelManager:
                     expired = cache.cleanup_expired()
                     if expired:
                         logger.info(f"Cleaned up expired {cache_name} models: {expired}")
+                        gc.collect()
 
         thread = threading.Thread(target=cleanup_loop, daemon=True)
         thread.start()
@@ -548,6 +550,7 @@ class ModelManager:
         # Remove files
         if model_dir.exists():
             shutil.rmtree(model_dir)
+            gc.collect()
             return True
 
         return False

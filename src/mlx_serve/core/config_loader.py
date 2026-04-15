@@ -70,12 +70,21 @@ def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         # batch section
         ("batch", "max_batch_size"): "batch_max_size",
         ("batch", "max_wait_ms"): "batch_max_wait_ms",
+        ("batch", "max_concurrency_per_model"): "inference_max_concurrency_per_model",
+        ("batch", "max_queue_per_model"): "inference_max_queue_per_model",
+        ("batch", "queue_timeout_seconds"): "inference_queue_timeout_seconds",
+        # memory section
+        ("memory", "guard_enabled"): "memory_guard_enabled",
+        ("memory", "poll_interval_seconds"): "memory_poll_interval_seconds",
+        ("memory", "process_limit_fraction"): "memory_process_limit_fraction",
+        ("memory", "min_available_fraction"): "memory_min_available_fraction",
         # metrics section
         ("metrics", "enabled"): "metrics_enabled",
         ("metrics", "port"): "metrics_port",
         # logging section
         ("logging", "level"): "log_level",
         ("logging", "format"): "log_format",
+        ("logging", "debug_chat_request_bodies"): "debug_log_chat_request_bodies",
     }
 
     for section_name, section_value in config.items():
@@ -132,12 +141,22 @@ cache:
 batch:
   max_batch_size: 32
   max_wait_ms: 50
+  max_concurrency_per_model: 1
+  max_queue_per_model: 8
+  queue_timeout_seconds: 30
 
 metrics:
   enabled: true
   port: 9090
 
+memory:
+  guard_enabled: true
+  poll_interval_seconds: 2.0
+  process_limit_fraction: 0.75
+  min_available_fraction: 0.10
+
 logging:
   level: INFO
   format: json  # text | json
+  debug_chat_request_bodies: false
 """

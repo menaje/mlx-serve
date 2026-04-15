@@ -38,6 +38,7 @@ class BatchProcessor(Generic[T, R]):
         max_batch_size: int | None = None,
         max_wait_ms: int | None = None,
         max_queue_size: int | None = None,
+        execution_lock: asyncio.Lock | None = None,
     ):
         """
         Initialize the batch processor.
@@ -62,6 +63,7 @@ class BatchProcessor(Generic[T, R]):
         self._running = False
         self._task: asyncio.Task | None = None
         self._start_lock = asyncio.Lock()
+        self._execution_lock = execution_lock
 
     async def start(self) -> None:
         """Start the batch processing loop."""
@@ -162,6 +164,18 @@ class BatchProcessor(Generic[T, R]):
         if not batch:
             return
 
+        if self._execution_lock is not None:
+            async with self._execution_lock:
+                await self._run_batch(batch)
+            return
+
+        await self._run_batch(batch)
+
+    async def _run_batch(self, batch: list[BatchRequest[T]]) -> None:
+        """Execute a single collected batch."""
+        if not batch:
+            return
+
         inputs = [req.data for req in batch]
 
         try:
@@ -187,7 +201,12 @@ class BatchProcessor(Generic[T, R]):
 class EmbeddingBatchProcessor:
     """Batch processor specifically for embedding generation."""
 
-    def __init__(self, model: Any, tokenizer: Any):
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        execution_lock: asyncio.Lock | None = None,
+    ):
         """
         Initialize the embedding batch processor.
 
@@ -199,6 +218,7 @@ class EmbeddingBatchProcessor:
         self.tokenizer = tokenizer
         self._processor = BatchProcessor(
             process_fn=self._generate_embeddings,
+            execution_lock=execution_lock,
         )
 
     def _generate_embeddings(
@@ -292,10 +312,12 @@ class RerankBatchProcessor:
             List of relevance scores.
         """
         import mlx.core as mx
-        import mlx.nn as nn
 
         if instruction is None:
-            instruction = "Given a web search query, retrieve relevant passages that answer the query"
+            instruction = (
+                "Given a web search query, retrieve relevant passages "
+                "that answer the query"
+            )
 
         scores = []
 

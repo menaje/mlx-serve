@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 # Security constants
 MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB max image size
+MAX_IMAGE_SIZE_MB = MAX_IMAGE_SIZE_BYTES // (1024 * 1024)
+IMAGE_SIZE_LIMIT_MESSAGE = f"Image size exceeds limit of {MAX_IMAGE_SIZE_MB}MB"
 ALLOWED_IMAGE_HOSTS = None  # Set to list of allowed hosts, or None to allow all external
 BLOCKED_IP_PREFIXES = ("10.", "172.16.", "172.17.", "172.18.", "172.19.",
                        "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
@@ -378,7 +380,7 @@ def _load_image_from_url(url: str) -> "Image.Image":
 
             # Check size limit
             if len(image_data) > MAX_IMAGE_SIZE_BYTES:
-                raise ValueError(f"Image size exceeds limit of {MAX_IMAGE_SIZE_BYTES // (1024*1024)}MB")
+                raise ValueError(IMAGE_SIZE_LIMIT_MESSAGE)
 
             return Image.open(BytesIO(image_data))
         except (ValueError, base64.binascii.Error) as e:
@@ -393,12 +395,12 @@ def _load_image_from_url(url: str) -> "Image.Image":
                 # Check content-length header if available
                 content_length = response.headers.get("Content-Length")
                 if content_length and int(content_length) > MAX_IMAGE_SIZE_BYTES:
-                    raise ValueError(f"Image size exceeds limit of {MAX_IMAGE_SIZE_BYTES // (1024*1024)}MB")
+                    raise ValueError(IMAGE_SIZE_LIMIT_MESSAGE)
 
                 # Read with size limit
                 image_data = response.read(MAX_IMAGE_SIZE_BYTES + 1)
                 if len(image_data) > MAX_IMAGE_SIZE_BYTES:
-                    raise ValueError(f"Image size exceeds limit of {MAX_IMAGE_SIZE_BYTES // (1024*1024)}MB")
+                    raise ValueError(IMAGE_SIZE_LIMIT_MESSAGE)
 
                 return Image.open(BytesIO(image_data))
         except Exception as e:
@@ -519,10 +521,17 @@ def _build_response_format_instruction(response_format: ResponseFormat | None) -
         return ""
 
     if isinstance(response_format, ResponseFormatJsonObject):
-        return "\n\nIMPORTANT: You must respond with a valid JSON object. Do not include any other text."
-    elif isinstance(response_format, ResponseFormatJsonSchema):
+        return (
+            "\n\nIMPORTANT: You must respond with a valid JSON object. "
+            "Do not include any other text."
+        )
+    if isinstance(response_format, ResponseFormatJsonSchema):
         schema_json = json.dumps(response_format.json_schema.schema_, indent=2)
-        instruction = f"\n\nIMPORTANT: You must respond with a valid JSON object that matches the following schema:\n{schema_json}\n\nDo not include any other text outside the JSON."
+        instruction = (
+            "\n\nIMPORTANT: You must respond with a valid JSON object "
+            f"that matches the following schema:\n{schema_json}\n\n"
+            "Do not include any other text outside the JSON."
+        )
         return instruction
 
     return ""
@@ -911,9 +920,6 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     Supports streaming, tool/function calling, and vision (image inputs).
     """
-    # DEBUG: Log incoming request for troubleshooting
-    logger.info(f"[DEBUG] Received chat completion request: {request.model_dump()}")
-
     # Check if request contains images
     has_vision = _has_images(request.messages)
     images = []
@@ -927,7 +933,11 @@ async def create_chat_completion(request: ChatCompletionRequest):
             status_code=400,
             detail={
                 "error": {
-                    "message": f"Model '{request.model}' is type '{model_type}' which is not supported for chat completions. Use llm or vlm models.",
+                    "message": (
+                        f"Model '{request.model}' is type '{model_type}' "
+                        "which is not supported for chat completions. "
+                        "Use llm or vlm models."
+                    ),
                     "type": "invalid_request_error",
                     "code": "unsupported_model_type",
                 }
@@ -936,61 +946,73 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     is_vlm_model = model_type == "vlm"
 
-    if has_vision or is_vlm_model:
-        # Use VLM model for vision requests or VLM models
-        try:
-            model, processor = model_manager.get_vlm_model(request.model)
-            if has_vision:
-                images = _extract_images_from_messages(request.messages)
-        except ValueError as e:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "error": {
-                        "message": f"Vision model '{request.model}' not found",
-                        "type": "invalid_request_error",
-                        "code": "model_not_found",
-                    }
-                },
-            ) from e
-        tokenizer = processor  # VLM uses processor instead of tokenizer
-    else:
-        # Use LLM model for text-only requests
-        try:
-            model, tokenizer = model_manager.get_llm_model(request.model)
-        except ValueError as e:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "error": {
-                        "message": f"Model '{request.model}' not found",
-                        "type": "invalid_request_error",
-                        "code": "model_not_found",
-                    }
-                },
-            ) from e
-
-    # Format messages
-    prompt = _format_messages_for_model(request.messages, tokenizer, request.tools)
-
-    # Add response format instruction to prompt
-    response_format_instruction = _build_response_format_instruction(request.response_format)
-    if response_format_instruction:
-        prompt = prompt + response_format_instruction
-
-    # Prepare generation parameters (max_completion_tokens takes precedence)
-    max_tokens = request.max_completion_tokens or request.max_tokens or 2048
-    stop = [request.stop] if isinstance(request.stop, str) else request.stop
-
-    request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created = int(time.time())
-
-    # Generate system fingerprint based on model
-    system_fingerprint = f"fp_{uuid.uuid4().hex[:12]}"
-
     # Vision models don't support streaming yet
     inference_model_type = "vlm" if (has_vision or is_vlm_model) else "llm"
     lease = await _acquire_model_lease(inference_model_type, request.model, "Chat")
+
+    try:
+        if has_vision or is_vlm_model:
+            try:
+                model, processor = model_manager.get_vlm_model(request.model)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "error": {
+                            "message": f"Vision model '{request.model}' not found",
+                            "type": "invalid_request_error",
+                            "code": "model_not_found",
+                        }
+                    },
+                ) from e
+
+            if has_vision:
+                images = _extract_images_from_messages(request.messages)
+            tokenizer = processor  # VLM uses processor instead of tokenizer
+        else:
+            try:
+                model, tokenizer = model_manager.get_llm_model(request.model)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "error": {
+                            "message": f"Model '{request.model}' not found",
+                            "type": "invalid_request_error",
+                            "code": "model_not_found",
+                        }
+                    },
+                ) from e
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Chat completion request model=%s stream=%s messages=%s vision=%s",
+                request.model,
+                request.stream,
+                len(request.messages),
+                has_vision or is_vlm_model,
+            )
+
+        # Format messages
+        prompt = _format_messages_for_model(request.messages, tokenizer, request.tools)
+
+        # Add response format instruction to prompt
+        response_format_instruction = _build_response_format_instruction(request.response_format)
+        if response_format_instruction:
+            prompt = prompt + response_format_instruction
+
+        # Prepare generation parameters (max_completion_tokens takes precedence)
+        max_tokens = request.max_completion_tokens or request.max_tokens or 2048
+        stop = [request.stop] if isinstance(request.stop, str) else request.stop
+
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
+        # Generate system fingerprint based on model
+        system_fingerprint = f"fp_{uuid.uuid4().hex[:12]}"
+    except Exception:
+        await lease.release()
+        raise
 
     if request.stream and not has_vision and not is_vlm_model:
         # Check if usage should be included in stream
@@ -1089,6 +1111,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
             service_tier=request.service_tier or "default",
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Chat completion failed: {e}")
         raise HTTPException(
@@ -1117,7 +1141,10 @@ class CompletionRequest(BaseModel):
 
     model: str = Field(..., description="Model name to use")
     prompt: str | list[str] | None = Field(default=None, description="Prompt(s) to complete")
-    messages: list[ChatMessage] | None = Field(default=None, description="Messages (alternative to prompt)")
+    messages: list[ChatMessage] | None = Field(
+        default=None,
+        description="Messages (alternative to prompt)",
+    )
     max_tokens: int | None = Field(default=16, description="Maximum tokens to generate")
     temperature: float = Field(default=1.0, ge=0, le=2, description="Sampling temperature")
     top_p: float = Field(default=1.0, ge=0, le=1, description="Nucleus sampling parameter")
@@ -1130,10 +1157,27 @@ class CompletionRequest(BaseModel):
     # Unsupported parameters (accepted but ignored for compatibility)
     suffix: str | None = Field(default=None, description="NOT SUPPORTED: Suffix for insertions")
     logprobs: int | None = Field(default=None, description="NOT SUPPORTED: Log probabilities")
-    best_of: int | None = Field(default=None, ge=1, description="NOT SUPPORTED: Generate best_of completions")
-    logit_bias: dict[str, float] | None = Field(default=None, description="NOT SUPPORTED: Token bias")
-    presence_penalty: float = Field(default=0.0, ge=-2, le=2, description="NOT SUPPORTED: Presence penalty")
-    frequency_penalty: float = Field(default=0.0, ge=-2, le=2, description="NOT SUPPORTED: Frequency penalty")
+    best_of: int | None = Field(
+        default=None,
+        ge=1,
+        description="NOT SUPPORTED: Generate best_of completions",
+    )
+    logit_bias: dict[str, float] | None = Field(
+        default=None,
+        description="NOT SUPPORTED: Token bias",
+    )
+    presence_penalty: float = Field(
+        default=0.0,
+        ge=-2,
+        le=2,
+        description="NOT SUPPORTED: Presence penalty",
+    )
+    frequency_penalty: float = Field(
+        default=0.0,
+        ge=-2,
+        le=2,
+        description="NOT SUPPORTED: Frequency penalty",
+    )
 
 
 class CompletionChoice(BaseModel):
@@ -1332,7 +1376,9 @@ async def create_completion(request: CompletionRequest):
 
     if unsupported_params:
         logger.warning(
-            f"Unsupported parameters in /v1/completions request (ignored): {', '.join(unsupported_params)}"
+            "Unsupported parameters in /v1/completions request "
+            "(ignored): %s",
+            ", ".join(unsupported_params),
         )
 
     # Validate that either prompt or messages is provided
@@ -1348,41 +1394,46 @@ async def create_completion(request: CompletionRequest):
             },
         )
 
-    try:
-        model, tokenizer = model_manager.get_llm_model(request.model)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": {
-                    "message": f"Model '{request.model}' not found",
-                    "type": "invalid_request_error",
-                    "code": "model_not_found",
-                }
-            },
-        ) from e
-
-    # Convert messages to prompt if provided (prompt takes precedence)
-    if request.prompt is not None:
-        # Normalize prompt to string (take first if list)
-        prompt = request.prompt if isinstance(request.prompt, str) else request.prompt[0]
-    else:
-        # Convert messages to a single prompt string
-        prompt_parts = []
-        for msg in request.messages:
-            role_prefix = f"{msg.role}: " if msg.role != "user" else ""
-            content_str = msg.content if isinstance(msg.content, str) else " ".join(
-                part.text for part in msg.content if isinstance(part, ContentPartText)
-            )
-            prompt_parts.append(f"{role_prefix}{content_str}")
-        prompt = "\n".join(prompt_parts)
-
-    max_tokens = request.max_tokens or 16
-    stop = [request.stop] if isinstance(request.stop, str) else request.stop
-
-    request_id = f"cmpl-{uuid.uuid4().hex[:12]}"
-    created = int(time.time())
     lease = await _acquire_model_lease("llm", request.model, "Completion")
+
+    try:
+        try:
+            model, tokenizer = model_manager.get_llm_model(request.model)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "message": f"Model '{request.model}' not found",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            ) from e
+
+        # Convert messages to prompt if provided (prompt takes precedence)
+        if request.prompt is not None:
+            # Normalize prompt to string (take first if list)
+            prompt = request.prompt if isinstance(request.prompt, str) else request.prompt[0]
+        else:
+            # Convert messages to a single prompt string
+            prompt_parts = []
+            for msg in request.messages:
+                role_prefix = f"{msg.role}: " if msg.role != "user" else ""
+                content_str = msg.content if isinstance(msg.content, str) else " ".join(
+                    part.text for part in msg.content if isinstance(part, ContentPartText)
+                )
+                prompt_parts.append(f"{role_prefix}{content_str}")
+            prompt = "\n".join(prompt_parts)
+
+        max_tokens = request.max_tokens or 16
+        stop = [request.stop] if isinstance(request.stop, str) else request.stop
+
+        request_id = f"cmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+    except Exception:
+        await lease.release()
+        raise
 
     if request.stream:
         return StreamingResponse(
@@ -1442,6 +1493,8 @@ async def create_completion(request: CompletionRequest):
             ),
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Text completion failed: {e}")
         raise HTTPException(

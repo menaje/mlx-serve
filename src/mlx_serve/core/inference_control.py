@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -87,6 +88,7 @@ class InferenceAdmissionController:
 
     async def acquire(self, key: str) -> InferenceLease:
         """Acquire a model slot or raise when overloaded."""
+        raise_if_server_overloaded()
         state = self._get_state(key)
         token = object()
 
@@ -100,8 +102,15 @@ class InferenceAdmissionController:
 
                 state.queue.append(token)
                 try:
+                    def can_activate() -> bool:
+                        return (
+                            bool(state.queue)
+                            and state.queue[0] is token
+                            and state.active < self.max_concurrency
+                        )
+
                     waiter = state.condition.wait_for(
-                        lambda: state.queue and state.queue[0] is token and state.active < self.max_concurrency
+                        can_activate
                     )
                     if self.acquire_timeout_seconds is None:
                         await waiter
@@ -124,6 +133,7 @@ class InferenceAdmissionController:
                 if state.queue and state.queue[0] is token:
                     state.queue.pop(0)
 
+            raise_if_server_overloaded()
             state.active += 1
 
         return InferenceLease(self, key, state)
@@ -147,6 +157,35 @@ class InferenceAdmissionController:
         """Clear tracked states. Intended for tests."""
         with self._states_lock:
             self._states.clear()
+        execution_locks.reset()
+
+
+class ModelExecutionLocks:
+    """Async locks for model-bound operations that must not overlap."""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> asyncio.Lock:
+        """Get or create a per-model execution lock."""
+        with self._lock:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[key] = lock
+            return lock
+
+    @asynccontextmanager
+    async def hold(self, key: str):
+        """Hold a per-model execution lock."""
+        async with self.get(key):
+            yield
+
+    def reset(self) -> None:
+        """Clear tracked locks. Intended for tests."""
+        with self._lock:
+            self._locks.clear()
 
 
 def build_inference_key(model_type: str, model_name: str) -> str:
@@ -166,4 +205,19 @@ def build_overload_detail(message: str) -> dict:
     }
 
 
+def get_model_execution_lock(key: str) -> asyncio.Lock:
+    """Return the shared execution lock for a model key."""
+    return execution_locks.get(key)
+
+
+def raise_if_server_overloaded() -> None:
+    """Reject new work when the system-wide admission guard is active."""
+    from mlx_serve.core.system_guard import memory_monitor
+
+    reason = memory_monitor.overload_reason()
+    if reason:
+        raise InferenceOverloadedError(reason)
+
+
 inference_controller = InferenceAdmissionController()
+execution_locks = ModelExecutionLocks()
