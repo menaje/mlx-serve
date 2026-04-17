@@ -58,6 +58,7 @@ dependencies = [
     "Pillow>=11.3.0",
     "soundfile>=0.13.1",
     "python-multipart>=0.0.22",
+    "setproctitle",
 ]
 
 [project.optional-dependencies]

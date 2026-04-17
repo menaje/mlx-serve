@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from mlx_serve import __version__
 from mlx_serve.config import settings
+from mlx_serve.core.process_title import apply_process_title
 from mlx_serve.core.retrieval_workers import RetrievalWorkerSupervisor
 from mlx_serve.core.runtime_topology import (
     get_retrieval_worker_kind,
@@ -29,6 +30,7 @@ from mlx_serve.routers import (
 )
 
 logger = logging.getLogger(__name__)
+apply_process_title()
 
 # Track active requests for graceful shutdown
 _active_requests: int = 0
