@@ -90,6 +90,8 @@ class TestLaunchdManager:
         content = manager._plist_path.read_text()
         assert "com.mlx-serve.server" in content
         assert "RunAtLoad" in content
+        assert "/usr/sbin" in content
+        assert "/sbin" in content
 
     def test_install_with_run_at_load(self, manager):
         """Test install with run_at_load enabled."""

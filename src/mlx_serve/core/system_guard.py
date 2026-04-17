@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -55,9 +56,10 @@ def _format_bytes(value: int | None) -> str:
 
 def _run_command(*args: str) -> str | None:
     """Run a short system command and return stdout on success."""
+    command = _resolve_command_path(args[0])
     try:
         result = subprocess.run(
-            args,
+            (command, *args[1:]),
             capture_output=True,
             check=False,
             text=True,
@@ -71,6 +73,30 @@ def _run_command(*args: str) -> str | None:
 
     output = result.stdout.strip()
     return output or None
+
+
+def _resolve_command_path(command: str) -> str:
+    """Resolve system utilities even when launchd PATH omits sbin directories."""
+    if os.path.sep in command:
+        return command
+
+    resolved = shutil.which(command)
+    if resolved:
+        return resolved
+
+    for directory in (
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ):
+        candidate = Path(directory) / command
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    return command
 
 
 def _read_process_rss_bytes() -> int | None:
