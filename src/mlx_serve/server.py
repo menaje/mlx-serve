@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from mlx_serve import __version__
 from mlx_serve.config import settings
+from mlx_serve.core.mlx_memory import get_mlx_memory_snapshot
 from mlx_serve.core.process_title import apply_process_title
 from mlx_serve.core.retrieval_workers import RetrievalWorkerSupervisor
 from mlx_serve.core.runtime_topology import (
@@ -241,15 +242,19 @@ def create_app() -> FastAPI:
     async def health_check() -> dict:
         """Health check endpoint."""
         memory = memory_monitor.health_payload()
+        role = get_server_role()
+        worker_kind = get_retrieval_worker_kind()
         status = "degraded" if memory["overloaded"] else "healthy"
         payload = {
             "status": status,
             "version": __version__,
-            "role": get_server_role(),
-            "retrieval_worker_kind": get_retrieval_worker_kind(),
+            "role": role,
+            "retrieval_worker_kind": worker_kind,
             "shutting_down": _shutting_down,
             "memory": memory,
         }
+        if role == "worker":
+            payload["mlx_memory"] = get_mlx_memory_snapshot()
         supervisor = getattr(app.state, "retrieval_worker_supervisor", None)
         if supervisor is not None:
             payload["retrieval_workers"] = supervisor.snapshot()

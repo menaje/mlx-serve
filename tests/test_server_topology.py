@@ -40,6 +40,33 @@ def test_embedding_worker_only_exposes_embedding_routes(monkeypatch):
     assert "/v1/chat/completions" not in paths
 
 
+def test_worker_health_includes_mlx_memory_snapshot(monkeypatch):
+    """Worker health should expose MLX runtime counters for diagnostics."""
+    monkeypatch.setenv(SERVER_ROLE_ENV, "worker")
+    monkeypatch.setenv(RETRIEVAL_WORKER_KIND_ENV, "embedding")
+    monkeypatch.setattr(
+        "mlx_serve.server.get_mlx_memory_snapshot",
+        lambda: {
+            "available": True,
+            "active_bytes": 11,
+            "cache_bytes": 22,
+            "peak_bytes": 33,
+        },
+    )
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["mlx_memory"] == {
+        "available": True,
+        "active_bytes": 11,
+        "cache_bytes": 22,
+        "peak_bytes": 33,
+    }
+
+
 def test_gateway_proxies_embedding_requests(monkeypatch):
     """Gateway requests should be forwarded to the isolated embedding worker."""
     monkeypatch.setattr(settings, "retrieval_worker_isolation_enabled", True)

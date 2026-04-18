@@ -43,3 +43,26 @@ def clear_mlx_cache(
         target_logger.debug("Cleared MLX cache%s: %s bytes", suffix, cache_bytes)
 
     return True
+
+
+def get_mlx_memory_snapshot() -> dict[str, int | bool | None]:
+    """Return MLX runtime memory counters when MLX is available."""
+    try:
+        mx = _load_mx()
+    except ImportError:
+        return {"available": False}
+
+    snapshot: dict[str, int | bool | None] = {"available": True}
+    getters = {
+        "active_bytes": mx.get_active_memory,
+        "cache_bytes": mx.get_cache_memory,
+        "peak_bytes": mx.get_peak_memory,
+    }
+
+    for key, getter in getters.items():
+        try:
+            snapshot[key] = int(getter())
+        except Exception:
+            snapshot[key] = None
+
+    return snapshot
