@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -54,6 +55,8 @@ class RetrievalWorkerSupervisor:
 
     def start(self) -> dict[RetrievalWorkerKind, str]:
         """Start all retrieval workers and return their base URLs."""
+        _cleanup_orphaned_retrieval_workers()
+
         try:
             for kind in RETRIEVAL_WORKER_KINDS:
                 worker = self._start_worker(kind)
@@ -144,6 +147,81 @@ def _select_preload_models(kind: RetrievalWorkerKind) -> list[str]:
         if model_type == kind:
             selected.append(model_name)
     return selected
+
+
+def _find_orphaned_retrieval_worker_pids() -> dict[int, str]:
+    """Return orphaned retrieval worker processes from previous runs."""
+    expected_titles = {f"mlx-serve:{kind}" for kind in RETRIEVAL_WORKER_KINDS}
+
+    try:
+        output = subprocess.check_output(
+            ["ps", "-eo", "pid=,ppid=,command="],
+            text=True,
+        )
+    except Exception as exc:
+        logger.warning("Failed to inspect running retrieval workers: %s", exc)
+        return {}
+
+    stale: dict[int, str] = {}
+    for line in output.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+
+        pid_str, ppid_str, command = parts
+        title = command.strip()
+        if title not in expected_titles or ppid_str != "1":
+            continue
+
+        try:
+            stale[int(pid_str)] = title
+        except ValueError:
+            continue
+
+    return stale
+
+
+def _process_exists(pid: int) -> bool:
+    """Check whether a process still exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    else:
+        return True
+
+
+def _cleanup_orphaned_retrieval_workers() -> None:
+    """Terminate orphaned retrieval workers left behind by prior gateway runs."""
+    stale_workers = _find_orphaned_retrieval_worker_pids()
+    if not stale_workers:
+        return
+
+    stale_pids = sorted(stale_workers)
+    logger.warning(
+        "Cleaning up orphaned retrieval workers from previous runs: %s",
+        ", ".join(f"{pid}:{stale_workers[pid]}" for pid in stale_pids),
+    )
+
+    for pid in stale_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+
+    deadline = time.monotonic() + settings.retrieval_worker_shutdown_timeout_seconds
+    alive = {pid for pid in stale_pids if _process_exists(pid)}
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.1)
+        alive = {pid for pid in alive if _process_exists(pid)}
+
+    for pid in sorted(alive):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
 
 
 def _find_free_port(host: str) -> int:

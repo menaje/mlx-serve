@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from mlx_serve.config import settings
 from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
@@ -13,6 +14,7 @@ from mlx_serve.core.inference_control import (
     get_model_execution_lock,
     inference_controller,
 )
+from mlx_serve.core.mlx_memory import clear_mlx_cache
 from mlx_serve.core.model_manager import model_manager
 
 logger = logging.getLogger(__name__)
@@ -281,3 +283,6 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
                 }
             },
         ) from e
+    finally:
+        if settings.retrieval_clear_mlx_cache_after_request:
+            clear_mlx_cache(log=logger, reason="/v1/rerank")

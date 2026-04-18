@@ -64,6 +64,9 @@ def build_default_config_dict(settings_obj: Any | None = None) -> dict[str, Any]
             "worker_host": settings_obj.retrieval_worker_host,
             "worker_ready_timeout_seconds": settings_obj.retrieval_worker_ready_timeout_seconds,
             "worker_shutdown_timeout_seconds": settings_obj.retrieval_worker_shutdown_timeout_seconds,
+            "clear_mlx_cache_after_request": (
+                settings_obj.retrieval_clear_mlx_cache_after_request
+            ),
         },
         "logging": {
             "level": settings_obj.log_level,
@@ -176,6 +179,10 @@ def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
             "retrieval",
             "worker_shutdown_timeout_seconds",
         ): "retrieval_worker_shutdown_timeout_seconds",
+        (
+            "retrieval",
+            "clear_mlx_cache_after_request",
+        ): "retrieval_clear_mlx_cache_after_request",
         # metrics section
         ("metrics", "enabled"): "metrics_enabled",
         ("metrics", "port"): "metrics_port",
@@ -265,6 +272,7 @@ retrieval:
   worker_host: 127.0.0.1
   worker_ready_timeout_seconds: 30.0
   worker_shutdown_timeout_seconds: 5.0
+  clear_mlx_cache_after_request: true
 
 logging:
   level: INFO

@@ -170,6 +170,13 @@ class Settings(BaseSettings):
         description="Maximum time to wait for an internal retrieval worker to exit cleanly",
         gt=0,
     )
+    retrieval_clear_mlx_cache_after_request: bool = Field(
+        default=True,
+        description=(
+            "Clear free MLX cache after each embedding/rerank request to prevent "
+            "long-lived retrieval workers from accumulating large Metal cache allocations"
+        ),
+    )
 
     # Metrics settings
     metrics_enabled: bool = Field(

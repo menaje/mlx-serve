@@ -39,6 +39,7 @@ class TestConfigLoader:
             "batch": {"max_queue_per_model": 4, "queue_timeout_seconds": 12},
             "service": {"auto_start": False, "keep_alive": False},
             "memory": {"guard_enabled": True, "min_available_fraction": 0.05},
+            "retrieval": {"clear_mlx_cache_after_request": False},
             "logging": {"debug_chat_request_bodies": True},
         }
 
@@ -53,6 +54,7 @@ class TestConfigLoader:
         assert flat["service_keep_alive"] is False
         assert flat["memory_guard_enabled"] is True
         assert flat["memory_min_available_fraction"] == 0.05
+        assert flat["retrieval_clear_mlx_cache_after_request"] is False
         assert flat["debug_log_chat_request_bodies"] is True
 
     def test_get_example_config(self):
@@ -122,6 +124,7 @@ class TestSettings:
         assert settings.inference_max_queue_per_model == 8
         assert settings.inference_queue_timeout_seconds == 30.0
         assert settings.memory_guard_enabled is True
+        assert settings.retrieval_clear_mlx_cache_after_request is True
         assert settings.service_auto_start is True
         assert settings.service_keep_alive is True
         assert settings.debug_log_chat_request_bodies is False

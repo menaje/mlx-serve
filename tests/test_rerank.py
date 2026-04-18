@@ -1,5 +1,7 @@
 """Tests for rerank API."""
 
+from unittest.mock import MagicMock
+
 
 def test_rerank_model_not_found(client):
     """Test rerank endpoint with non-existent model."""
@@ -58,3 +60,36 @@ def test_rerank_request_schema():
     )
     assert req.top_n == 1
     assert req.return_documents is False
+
+
+def test_rerank_clear_mlx_cache_after_request(client, monkeypatch):
+    """Rerank requests should clear MLX cache when the safeguard is enabled."""
+    from mlx_serve.config import settings
+
+    clear_mock = MagicMock()
+    monkeypatch.setattr(settings, "retrieval_clear_mlx_cache_after_request", True)
+    monkeypatch.setattr("mlx_serve.routers.rerank.clear_mlx_cache", clear_mock)
+    monkeypatch.setattr(
+        "mlx_serve.core.model_manager.model_manager.get_reranker_model",
+        lambda model: (object(), MagicMock()),
+    )
+
+    async def fake_compute_batch_scores(model, tokenizer, query, documents, instruction=None):
+        return [0.9, 0.1], 8
+
+    monkeypatch.setattr(
+        "mlx_serve.routers.rerank._compute_batch_scores",
+        fake_compute_batch_scores,
+    )
+
+    response = client.post(
+        "/v1/rerank",
+        json={
+            "model": "test-model",
+            "query": "test query",
+            "documents": ["doc1", "doc2"],
+        },
+    )
+
+    assert response.status_code == 200
+    clear_mock.assert_called_once()

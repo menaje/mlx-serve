@@ -1,6 +1,7 @@
 """Tests for embeddings API."""
 
 import base64
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -245,3 +246,23 @@ def test_embeddings_dimensions_with_base64(client, mock_embedding_model):
         # Should be L2 normalized
         norm = np.linalg.norm(decoded)
         assert abs(norm - 1.0) < 0.001
+
+
+def test_embeddings_clear_mlx_cache_after_request(client, mock_embedding_model, monkeypatch):
+    """Embedding requests should clear MLX cache when the safeguard is enabled."""
+    from mlx_serve.config import settings
+
+    clear_mock = MagicMock()
+    monkeypatch.setattr(settings, "retrieval_clear_mlx_cache_after_request", True)
+    monkeypatch.setattr("mlx_serve.routers.embeddings.clear_mlx_cache", clear_mock)
+
+    response = client.post(
+        "/v1/embeddings",
+        json={
+            "model": "test-model",
+            "input": "test text",
+        },
+    )
+
+    assert response.status_code == 200
+    clear_mock.assert_called_once()

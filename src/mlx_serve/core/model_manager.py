@@ -15,6 +15,7 @@ from cachetools import LRUCache
 from huggingface_hub import snapshot_download
 
 from mlx_serve.config import settings
+from mlx_serve.core.mlx_memory import clear_mlx_cache
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +239,7 @@ class ModelManager:
                     if expired:
                         logger.info(f"Cleaned up expired {cache_name} models: {expired}")
                         gc.collect()
+                        clear_mlx_cache(log=logger, reason=f"expired {cache_name} cleanup")
 
         thread = threading.Thread(target=cleanup_loop, daemon=True)
         thread.start()
@@ -551,6 +553,7 @@ class ModelManager:
         if model_dir.exists():
             shutil.rmtree(model_dir)
             gc.collect()
+            clear_mlx_cache(log=logger, reason=f"delete model {model_name}")
             return True
 
         return False
