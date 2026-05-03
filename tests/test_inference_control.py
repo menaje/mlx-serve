@@ -45,10 +45,12 @@ async def test_inference_controller_rejects_when_queue_full():
     )
 
     lease = await controller.acquire("llm:test-model")
+    assert controller.active_keys() == {"llm:test-model"}
     with pytest.raises(InferenceOverloadedError, match="queue is full"):
         await controller.acquire("llm:test-model")
 
     await lease.release()
+    assert controller.active_keys() == set()
 
 
 @pytest.mark.asyncio

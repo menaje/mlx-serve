@@ -10,10 +10,14 @@ from fastapi.responses import JSONResponse
 
 from mlx_serve import __version__
 from mlx_serve.config import settings
+from mlx_serve.core.generation_workers import GenerationWorkerSupervisor
 from mlx_serve.core.mlx_memory import get_mlx_memory_snapshot
 from mlx_serve.core.process_title import apply_process_title
 from mlx_serve.core.retrieval_workers import RetrievalWorkerSupervisor
 from mlx_serve.core.runtime_topology import (
+    generation_worker_isolation_enabled,
+    get_generation_worker_kind,
+    get_generation_worker_model,
     get_retrieval_worker_kind,
     get_server_role,
     retrieval_worker_isolation_enabled,
@@ -23,10 +27,11 @@ from mlx_serve.routers import (
     audio_router,
     chat_router,
     embeddings_router,
+    generation_proxy_router,
     images_router,
     models_router,
-    retrieval_proxy_router,
     rerank_router,
+    retrieval_proxy_router,
     tokenize_router,
 )
 
@@ -44,6 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     import asyncio
 
     retrieval_supervisor: RetrievalWorkerSupervisor | None = None
+    generation_supervisor: GenerationWorkerSupervisor | None = None
     global _shutting_down
     _shutting_down = False
 
@@ -53,7 +59,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         retrieval_supervisor = RetrievalWorkerSupervisor()
         app.state.retrieval_worker_supervisor = retrieval_supervisor
         app.state.retrieval_worker_urls = retrieval_supervisor.start()
-    elif settings.preload_models:
+
+    if generation_worker_isolation_enabled():
+        generation_supervisor = GenerationWorkerSupervisor()
+        app.state.generation_worker_supervisor = generation_supervisor
+        app.state.generation_worker_urls = generation_supervisor.start()
+
+    if (
+        retrieval_supervisor is None
+        and generation_supervisor is None
+        and settings.preload_models
+    ):
         from mlx_serve.core.model_manager import model_manager
 
         logger.info(f"Preloading models: {settings.preload_models}")
@@ -86,6 +102,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     if retrieval_supervisor is not None:
         retrieval_supervisor.stop()
+    if generation_supervisor is not None:
+        generation_supervisor.stop()
 
     memory_monitor.stop()
     logger.info("mlx-serve server stopped")
@@ -95,6 +113,7 @@ def _include_routers(app: FastAPI) -> None:
     """Attach routers based on the current runtime topology."""
     role = get_server_role()
     worker_kind = get_retrieval_worker_kind()
+    generation_worker_kind = get_generation_worker_kind()
 
     if role == "worker":
         if worker_kind == "embedding":
@@ -103,12 +122,17 @@ def _include_routers(app: FastAPI) -> None:
         elif worker_kind == "reranker":
             app.include_router(rerank_router)
             app.include_router(tokenize_router)
+        elif generation_worker_kind in ("llm", "vlm"):
+            app.include_router(chat_router)
         else:
-            raise RuntimeError("Worker process started without a valid retrieval worker kind")
+            raise RuntimeError("Worker process started without a valid worker kind")
         return
 
     app.include_router(audio_router)
-    app.include_router(chat_router)
+    if generation_worker_isolation_enabled():
+        app.include_router(generation_proxy_router)
+    else:
+        app.include_router(chat_router)
     if retrieval_worker_isolation_enabled():
         app.include_router(retrieval_proxy_router)
     else:
@@ -129,6 +153,8 @@ def create_app() -> FastAPI:
     )
     app.state.retrieval_worker_urls = {}
     app.state.retrieval_worker_supervisor = None
+    app.state.generation_worker_urls = {}
+    app.state.generation_worker_supervisor = None
 
     _include_routers(app)
 
@@ -244,20 +270,26 @@ def create_app() -> FastAPI:
         memory = memory_monitor.health_payload()
         role = get_server_role()
         worker_kind = get_retrieval_worker_kind()
+        generation_worker_kind = get_generation_worker_kind()
+        generation_worker_model = get_generation_worker_model()
         status = "degraded" if memory["overloaded"] else "healthy"
         payload = {
             "status": status,
             "version": __version__,
             "role": role,
             "retrieval_worker_kind": worker_kind,
+            "generation_worker_kind": generation_worker_kind,
+            "generation_worker_model": generation_worker_model,
             "shutting_down": _shutting_down,
             "memory": memory,
+            "mlx_memory": get_mlx_memory_snapshot(),
         }
-        if role == "worker":
-            payload["mlx_memory"] = get_mlx_memory_snapshot()
         supervisor = getattr(app.state, "retrieval_worker_supervisor", None)
         if supervisor is not None:
             payload["retrieval_workers"] = supervisor.snapshot()
+        generation_supervisor = getattr(app.state, "generation_worker_supervisor", None)
+        if generation_supervisor is not None:
+            payload["generation_workers"] = generation_supervisor.snapshot()
         return payload
 
     if settings.metrics_enabled:

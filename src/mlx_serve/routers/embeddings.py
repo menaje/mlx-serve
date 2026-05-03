@@ -20,7 +20,8 @@ from mlx_serve.core.inference_control import (
     raise_if_server_overloaded,
 )
 from mlx_serve.core.mlx_memory import clear_mlx_cache
-from mlx_serve.core.model_manager import model_manager
+from mlx_serve.core.model_manager import model_manager, resolve_model_alias
+from mlx_serve.core.model_memory import ModelLoadMemoryError
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     """
     # Normalize input to list
     texts = request.input if isinstance(request.input, list) else [request.input]
+    canonical_model_name, _, _ = resolve_model_alias(request.model)
 
     if not texts:
         raise HTTPException(
@@ -204,11 +206,23 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
                 }
             },
         ) from e
+    except ModelLoadMemoryError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(str(e)),
+        ) from e
+    except InferenceOverloadedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(
+                f"Embedding model '{request.model}' is overloaded. {e}"
+            ),
+        ) from e
 
     try:
-        model_key = build_inference_key("embedding", request.model)
+        model_key = build_inference_key("embedding", canonical_model_name)
         # Generate embeddings with batch processing
-        embeddings_list = await _embed_texts(request.model, model, tokenizer, texts)
+        embeddings_list = await _embed_texts(canonical_model_name, model, tokenizer, texts)
         # Calculate token count (approximate)
         loop = asyncio.get_running_loop()
         async with get_model_execution_lock(model_key):

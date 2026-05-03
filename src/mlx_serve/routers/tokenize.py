@@ -14,12 +14,13 @@ from mlx_serve.core.inference_control import (
     get_model_execution_lock,
     raise_if_server_overloaded,
 )
+from mlx_serve.core.model_manager import model_manager, resolve_model_alias
+from mlx_serve.core.model_memory import ModelLoadMemoryError
 from mlx_serve.core.retrieval_model_routing import resolve_retrieval_model_type
 from mlx_serve.core.runtime_topology import (
     get_retrieval_worker_kind,
     retrieval_worker_isolation_enabled,
 )
-from mlx_serve.core.model_manager import model_manager
 from mlx_serve.routers.retrieval_proxy import forward_to_retrieval_worker
 
 logger = logging.getLogger(__name__)
@@ -128,7 +129,10 @@ async def _forward_tokenize_request_to_worker(
 
 
 @router.post("/v1/tokenize", response_model=TokenizeResponse)
-async def tokenize_text(request: TokenizeRequest, http_request: Request) -> TokenizeResponse | Response:
+async def tokenize_text(
+    request: TokenizeRequest,
+    http_request: Request,
+) -> TokenizeResponse | Response:
     """Count tokens for the given input(s).
 
     Returns the number of tokens for each input text.
@@ -182,6 +186,7 @@ async def tokenize_text(request: TokenizeRequest, http_request: Request) -> Toke
 
     worker_kind = get_retrieval_worker_kind()
     allowed_kind: Literal["embedding", "reranker"] | None = worker_kind
+    canonical_model_name, _, _ = resolve_model_alias(request.model)
 
     try:
         raise_if_server_overloaded()
@@ -194,9 +199,21 @@ async def tokenize_text(request: TokenizeRequest, http_request: Request) -> Toke
             status_code=404,
             detail=_build_model_not_found_detail(request.model),
         )
+    except ModelLoadMemoryError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(str(e)),
+        ) from e
+    except InferenceOverloadedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(
+                f"Tokenizer for model '{request.model}' is overloaded. {e}"
+            ),
+        ) from e
 
     try:
-        model_key = build_inference_key(model_type, request.model)
+        model_key = build_inference_key(model_type, canonical_model_name)
         async with get_model_execution_lock(model_key):
             data = await _tokenize_texts(tokenizer, texts, request.return_tokens)
 

@@ -39,6 +39,8 @@ class BatchProcessor(Generic[T, R]):
         max_wait_ms: int | None = None,
         max_queue_size: int | None = None,
         execution_lock: asyncio.Lock | None = None,
+        request_cost_fn: Callable[[T], int] | None = None,
+        max_batch_cost: int | None = None,
     ):
         """
         Initialize the batch processor.
@@ -64,6 +66,9 @@ class BatchProcessor(Generic[T, R]):
         self._task: asyncio.Task | None = None
         self._start_lock = asyncio.Lock()
         self._execution_lock = execution_lock
+        self._request_cost_fn = request_cost_fn or (lambda _data: 1)
+        self._max_batch_cost = max_batch_cost
+        self._carry_over: BatchRequest[T] | None = None
 
     async def start(self) -> None:
         """Start the batch processing loop."""
@@ -76,6 +81,7 @@ class BatchProcessor(Generic[T, R]):
             logger.info(
                 f"BatchProcessor started (max_batch={self.max_batch_size}, "
                 f"max_wait={self.max_wait_ms}ms, "
+                f"max_batch_cost={self._max_batch_cost}, "
                 f"max_queue={'unbounded' if self.max_queue_size is None else self.max_queue_size})"
             )
 
@@ -129,16 +135,24 @@ class BatchProcessor(Generic[T, R]):
     async def _collect_batch(self) -> list[BatchRequest[T]]:
         """Collect requests into a batch."""
         batch: list[BatchRequest[T]] = []
+        total_cost = 0
 
-        try:
-            # Wait for first request
-            first = await asyncio.wait_for(
-                self._queue.get(),
-                timeout=1.0,  # Check every second if still running
-            )
+        if self._carry_over is not None:
+            first = self._carry_over
+            self._carry_over = None
             batch.append(first)
-        except asyncio.TimeoutError:
-            return []
+        else:
+            try:
+                # Wait for first request
+                first = await asyncio.wait_for(
+                    self._queue.get(),
+                    timeout=1.0,  # Check every second if still running
+                )
+                batch.append(first)
+            except asyncio.TimeoutError:
+                return []
+
+        total_cost = self._request_cost(first.data)
 
         # Collect more requests up to max_batch_size or max_wait_ms
         deadline = time.time() + (self.max_wait_ms / 1000.0)
@@ -153,11 +167,28 @@ class BatchProcessor(Generic[T, R]):
                     self._queue.get(),
                     timeout=remaining,
                 )
+                request_cost = self._request_cost(request.data)
+                if (
+                    self._max_batch_cost is not None
+                    and batch
+                    and (total_cost + request_cost) > self._max_batch_cost
+                ):
+                    self._carry_over = request
+                    break
                 batch.append(request)
+                total_cost += request_cost
             except asyncio.TimeoutError:
                 break
 
         return batch
+
+    def _request_cost(self, data: T) -> int:
+        """Return the batching cost of one request, clamped to a sane minimum."""
+        try:
+            cost = int(self._request_cost_fn(data))
+        except Exception:
+            cost = 1
+        return max(1, cost)
 
     async def _process_batch(self, batch: list[BatchRequest[T]]) -> None:
         """Process a batch of requests."""
@@ -216,9 +247,12 @@ class EmbeddingBatchProcessor:
         """
         self.model = model
         self.tokenizer = tokenizer
+        self.max_batch_texts = settings.embedding_batch_max_texts
         self._processor = BatchProcessor(
             process_fn=self._generate_embeddings,
             execution_lock=execution_lock,
+            request_cost_fn=len,
+            max_batch_cost=self.max_batch_texts,
         )
 
     def _generate_embeddings(
@@ -267,7 +301,14 @@ class EmbeddingBatchProcessor:
         Returns:
             List of embedding vectors.
         """
-        return await self._processor.submit(texts)
+        if len(texts) <= self.max_batch_texts:
+            return await self._processor.submit(texts)
+
+        outputs: list[list[float]] = []
+        for start in range(0, len(texts), self.max_batch_texts):
+            chunk = texts[start : start + self.max_batch_texts]
+            outputs.extend(await self._processor.submit(chunk))
+        return outputs
 
     async def start(self) -> None:
         """Start the batch processor."""
@@ -281,7 +322,13 @@ class EmbeddingBatchProcessor:
 class RerankBatchProcessor:
     """Batch processor for reranking operations."""
 
-    def __init__(self, model: Any, tokenizer: Any):
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        max_batch_documents: int | None = None,
+        max_batch_tokens: int | None = None,
+    ):
         """
         Initialize the rerank batch processor.
 
@@ -291,17 +338,129 @@ class RerankBatchProcessor:
         """
         self.model = model
         self.tokenizer = tokenizer
+        self.max_batch_documents = (
+            settings.rerank_batch_max_documents
+            if max_batch_documents is None
+            else max_batch_documents
+        )
+        self.max_batch_tokens = (
+            settings.rerank_batch_max_tokens
+            if max_batch_tokens is None
+            else max_batch_tokens
+        )
+        self._default_instruction = (
+            "Given a web search query, retrieve relevant passages "
+            "that answer the query"
+        )
+        self._prefix_tokens = (
+            [self.tokenizer.bos_token_id]
+            if getattr(self.tokenizer, "bos_token_id", None) is not None
+            else []
+        )
+        self._suffix_tokens = (
+            [self.tokenizer.eos_token_id]
+            if getattr(self.tokenizer, "eos_token_id", None) is not None
+            else []
+        )
+        self._pad_token_id = self._resolve_pad_token_id()
+
+    def _resolve_pad_token_id(self) -> int:
+        """Pick a stable pad token id for right-padded micro-batches."""
+        for candidate in (
+            getattr(self.tokenizer, "pad_token_id", None),
+            getattr(self.tokenizer, "eos_token_id", None),
+            0,
+        ):
+            if candidate is not None:
+                return int(candidate)
+        return 0
+
+    def _encode_prompt(
+        self,
+        query: str,
+        document: str,
+        instruction: str,
+    ) -> list[int]:
+        """Encode one rerank prompt with explicit BOS/EOS handling."""
+        prompt = f"<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {document}"
+        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        return self._prefix_tokens + input_ids + self._suffix_tokens
+
+    def _split_micro_batches(
+        self,
+        encoded_prompts: list[list[int]],
+    ) -> list[list[list[int]]]:
+        """Split encoded prompts into bounded micro-batches."""
+        if not encoded_prompts:
+            return []
+
+        batches: list[list[list[int]]] = []
+        current_batch: list[list[int]] = []
+        current_max_len = 0
+
+        for encoded_prompt in encoded_prompts:
+            prompt_len = max(1, len(encoded_prompt))
+            next_batch_size = len(current_batch) + 1
+            next_max_len = max(current_max_len, prompt_len)
+
+            exceeds_doc_limit = next_batch_size > self.max_batch_documents
+            exceeds_token_limit = (
+                bool(current_batch)
+                and (next_batch_size * next_max_len) > self.max_batch_tokens
+            )
+
+            if exceeds_doc_limit or exceeds_token_limit:
+                batches.append(current_batch)
+                current_batch = [encoded_prompt]
+                current_max_len = prompt_len
+                continue
+
+            current_batch.append(encoded_prompt)
+            current_max_len = next_max_len
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
+
+    def _score_micro_batch(self, encoded_prompts: list[list[int]]) -> list[float]:
+        """Run one padded rerank micro-batch in a single model call."""
+        import mlx.core as mx
+
+        token_true_id = self.tokenizer.convert_tokens_to_ids("yes")
+        token_false_id = self.tokenizer.convert_tokens_to_ids("no")
+
+        lengths = [len(prompt) for prompt in encoded_prompts]
+        max_len = max(lengths)
+        padded = [
+            prompt + [self._pad_token_id] * (max_len - len(prompt))
+            for prompt in encoded_prompts
+        ]
+        tokens = mx.array(padded)
+
+        outputs = self.model(tokens)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+
+        scores: list[float] = []
+        for row_index, prompt_len in enumerate(lengths):
+            last_logits = logits[row_index, prompt_len - 1, :]
+            true_score = last_logits[token_true_id]
+            false_score = last_logits[token_false_id]
+            probs = mx.softmax(mx.stack([false_score, true_score]))
+            scores.append(float(probs[1]))
+
+        return scores
 
     def compute_scores(
         self,
         query: str,
         documents: list[str],
         instruction: str | None = None,
-    ) -> list[float]:
+    ) -> tuple[list[float], int]:
         """
         Compute relevance scores for query-document pairs.
 
-        Uses batch processing for efficiency.
+        Uses request-scoped micro-batching to bound memory usage.
 
         Args:
             query: The search query.
@@ -309,61 +468,29 @@ class RerankBatchProcessor:
             instruction: Optional instruction for the reranker.
 
         Returns:
-            List of relevance scores.
+            Tuple of relevance scores and total token count.
         """
-        import mlx.core as mx
-
         if instruction is None:
-            instruction = (
-                "Given a web search query, retrieve relevant passages "
-                "that answer the query"
-            )
+            instruction = self._default_instruction
 
-        scores = []
-
-        # Batch tokenization
-        prompts = [
-            f"<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}"
-            for doc in documents
+        encoded_prompts = [
+            self._encode_prompt(query, document, instruction)
+            for document in documents
         ]
+        total_tokens = sum(len(prompt) for prompt in encoded_prompts)
 
-        # Get token IDs for "yes" and "no"
-        token_true_id = self.tokenizer.convert_tokens_to_ids("yes")
-        token_false_id = self.tokenizer.convert_tokens_to_ids("no")
+        scores: list[float] = []
+        for micro_batch in self._split_micro_batches(encoded_prompts):
+            scores.extend(self._score_micro_batch(micro_batch))
 
-        # Process each prompt (sequential for now, can be parallelized)
-        for prompt in prompts:
-            # Tokenize
-            prefix_tokens = [self.tokenizer.bos_token_id] if self.tokenizer.bos_token_id else []
-            suffix_tokens = [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id else []
-
-            input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-            input_ids = prefix_tokens + input_ids + suffix_tokens
-
-            tokens = mx.array([input_ids])
-
-            # Get model output
-            outputs = self.model(tokens)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs
-
-            # Get last token logits
-            last_logits = logits[0, -1, :]
-
-            # Compute probability
-            true_score = last_logits[token_true_id]
-            false_score = last_logits[token_false_id]
-            probs = mx.softmax(mx.stack([false_score, true_score]))
-
-            scores.append(float(probs[1]))
-
-        return scores
+        return scores, total_tokens
 
     async def rerank(
         self,
         query: str,
         documents: list[str],
         instruction: str | None = None,
-    ) -> list[float]:
+    ) -> tuple[list[float], int]:
         """
         Rerank documents with batch optimization.
 
@@ -373,7 +500,7 @@ class RerankBatchProcessor:
             instruction: Optional instruction for the reranker.
 
         Returns:
-            List of relevance scores.
+            Tuple of relevance scores and total token count.
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(

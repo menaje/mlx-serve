@@ -6,8 +6,10 @@ import importlib
 import logging
 
 from mlx_serve.core.runtime_topology import (
+    GenerationWorkerKind,
     RetrievalWorkerKind,
     ServerRole,
+    get_generation_worker_kind,
     get_retrieval_worker_kind,
     get_server_role,
 )
@@ -17,11 +19,15 @@ logger = logging.getLogger(__name__)
 
 def build_process_title(
     server_role: ServerRole | None = None,
-    worker_kind: RetrievalWorkerKind | None = None,
+    worker_kind: RetrievalWorkerKind | GenerationWorkerKind | None = None,
 ) -> str:
     """Build the desired process title for the current runtime role."""
     role = server_role or get_server_role()
-    kind = worker_kind if worker_kind is not None else get_retrieval_worker_kind()
+    kind = (
+        worker_kind
+        if worker_kind is not None
+        else get_retrieval_worker_kind() or get_generation_worker_kind()
+    )
 
     if role == "worker" and kind:
         return f"mlx-serve:{kind}"

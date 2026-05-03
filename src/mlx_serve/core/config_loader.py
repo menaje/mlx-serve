@@ -40,6 +40,9 @@ def build_default_config_dict(settings_obj: Any | None = None) -> dict[str, Any]
         },
         "batch": {
             "max_batch_size": settings_obj.batch_max_size,
+            "max_embedding_texts": settings_obj.embedding_batch_max_texts,
+            "rerank_batch_max_documents": settings_obj.rerank_batch_max_documents,
+            "rerank_batch_max_tokens": settings_obj.rerank_batch_max_tokens,
             "max_wait_ms": settings_obj.batch_max_wait_ms,
             "max_concurrency_per_model": settings_obj.inference_max_concurrency_per_model,
             "max_queue_per_model": settings_obj.inference_max_queue_per_model,
@@ -58,15 +61,51 @@ def build_default_config_dict(settings_obj: Any | None = None) -> dict[str, Any]
             "poll_interval_seconds": settings_obj.memory_poll_interval_seconds,
             "process_limit_fraction": settings_obj.memory_process_limit_fraction,
             "min_available_fraction": settings_obj.memory_min_available_fraction,
+            "load_guard_enabled": settings_obj.memory_load_guard_enabled,
+            "load_headroom_fraction": settings_obj.memory_load_headroom_fraction,
+            "min_free_bytes": settings_obj.memory_min_free_bytes,
+            "model_size_multiplier": settings_obj.memory_model_size_multiplier,
+            "generation_guard_enabled": settings_obj.memory_generation_guard_enabled,
+            "generation_kv_bytes_per_token": (
+                settings_obj.memory_generation_kv_bytes_per_token
+            ),
+            "vlm_image_tokens_per_image": settings_obj.memory_vlm_image_tokens_per_image,
+            "remote_model_estimates_bytes": dict(
+                settings_obj.memory_remote_model_estimates_bytes
+            ),
         },
         "retrieval": {
             "worker_isolation_enabled": settings_obj.retrieval_worker_isolation_enabled,
             "worker_host": settings_obj.retrieval_worker_host,
             "worker_ready_timeout_seconds": settings_obj.retrieval_worker_ready_timeout_seconds,
-            "worker_shutdown_timeout_seconds": settings_obj.retrieval_worker_shutdown_timeout_seconds,
+            "worker_shutdown_timeout_seconds": (
+                settings_obj.retrieval_worker_shutdown_timeout_seconds
+            ),
             "clear_mlx_cache_after_request": (
                 settings_obj.retrieval_clear_mlx_cache_after_request
             ),
+        },
+        "generation": {
+            "worker_isolation_enabled": settings_obj.generation_worker_isolation_enabled,
+            "worker_mode": settings_obj.generation_worker_mode,
+            "worker_host": settings_obj.generation_worker_host,
+            "worker_ready_timeout_seconds": settings_obj.generation_worker_ready_timeout_seconds,
+            "worker_shutdown_timeout_seconds": (
+                settings_obj.generation_worker_shutdown_timeout_seconds
+            ),
+            "worker_idle_timeout_seconds": settings_obj.generation_worker_idle_timeout_seconds,
+            "clear_mlx_cache_after_request": (
+                settings_obj.generation_clear_mlx_cache_after_request
+            ),
+            "kv_bits": settings_obj.generation_kv_bits,
+            "kv_group_size": settings_obj.generation_kv_group_size,
+            "quantized_kv_start": settings_obj.generation_quantized_kv_start,
+            "prompt_cache_enabled": settings_obj.generation_prompt_cache_enabled,
+            "prompt_cache_checkpoint_enabled": (
+                settings_obj.generation_prompt_cache_checkpoint_enabled
+            ),
+            "prompt_cache_max_entries": settings_obj.generation_prompt_cache_max_entries,
+            "prompt_cache_min_tokens": settings_obj.generation_prompt_cache_min_tokens,
         },
         "logging": {
             "level": settings_obj.log_level,
@@ -162,6 +201,9 @@ def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         ("cache", "ttl_seconds"): "cache_ttl_seconds",
         # batch section
         ("batch", "max_batch_size"): "batch_max_size",
+        ("batch", "max_embedding_texts"): "embedding_batch_max_texts",
+        ("batch", "rerank_batch_max_documents"): "rerank_batch_max_documents",
+        ("batch", "rerank_batch_max_tokens"): "rerank_batch_max_tokens",
         ("batch", "max_wait_ms"): "batch_max_wait_ms",
         ("batch", "max_concurrency_per_model"): "inference_max_concurrency_per_model",
         ("batch", "max_queue_per_model"): "inference_max_queue_per_model",
@@ -171,6 +213,20 @@ def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         ("memory", "poll_interval_seconds"): "memory_poll_interval_seconds",
         ("memory", "process_limit_fraction"): "memory_process_limit_fraction",
         ("memory", "min_available_fraction"): "memory_min_available_fraction",
+        ("memory", "load_guard_enabled"): "memory_load_guard_enabled",
+        ("memory", "load_headroom_fraction"): "memory_load_headroom_fraction",
+        ("memory", "min_free_bytes"): "memory_min_free_bytes",
+        ("memory", "model_size_multiplier"): "memory_model_size_multiplier",
+        ("memory", "generation_guard_enabled"): "memory_generation_guard_enabled",
+        (
+            "memory",
+            "generation_kv_bytes_per_token",
+        ): "memory_generation_kv_bytes_per_token",
+        ("memory", "vlm_image_tokens_per_image"): "memory_vlm_image_tokens_per_image",
+        (
+            "memory",
+            "remote_model_estimates_bytes",
+        ): "memory_remote_model_estimates_bytes",
         # retrieval section
         ("retrieval", "worker_isolation_enabled"): "retrieval_worker_isolation_enabled",
         ("retrieval", "worker_host"): "retrieval_worker_host",
@@ -183,6 +239,35 @@ def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
             "retrieval",
             "clear_mlx_cache_after_request",
         ): "retrieval_clear_mlx_cache_after_request",
+        (
+            "generation",
+            "clear_mlx_cache_after_request",
+        ): "generation_clear_mlx_cache_after_request",
+        ("generation", "worker_isolation_enabled"): "generation_worker_isolation_enabled",
+        ("generation", "worker_mode"): "generation_worker_mode",
+        ("generation", "worker_host"): "generation_worker_host",
+        (
+            "generation",
+            "worker_ready_timeout_seconds",
+        ): "generation_worker_ready_timeout_seconds",
+        (
+            "generation",
+            "worker_shutdown_timeout_seconds",
+        ): "generation_worker_shutdown_timeout_seconds",
+        (
+            "generation",
+            "worker_idle_timeout_seconds",
+        ): "generation_worker_idle_timeout_seconds",
+        ("generation", "kv_bits"): "generation_kv_bits",
+        ("generation", "kv_group_size"): "generation_kv_group_size",
+        ("generation", "quantized_kv_start"): "generation_quantized_kv_start",
+        ("generation", "prompt_cache_enabled"): "generation_prompt_cache_enabled",
+        (
+            "generation",
+            "prompt_cache_checkpoint_enabled",
+        ): "generation_prompt_cache_checkpoint_enabled",
+        ("generation", "prompt_cache_max_entries"): "generation_prompt_cache_max_entries",
+        ("generation", "prompt_cache_min_tokens"): "generation_prompt_cache_min_tokens",
         # metrics section
         ("metrics", "enabled"): "metrics_enabled",
         ("metrics", "port"): "metrics_port",
@@ -248,10 +333,13 @@ cache:
 
 batch:
   max_batch_size: 32
+  max_embedding_texts: 32
+  rerank_batch_max_documents: 4
+  rerank_batch_max_tokens: 2048
   max_wait_ms: 50
   max_concurrency_per_model: 1
   max_queue_per_model: 8
-  queue_timeout_seconds: 30
+  queue_timeout_seconds: 180
 
 metrics:
   enabled: true
@@ -266,6 +354,16 @@ memory:
   poll_interval_seconds: 2.0
   process_limit_fraction: 0.75
   min_available_fraction: 0.10
+  load_guard_enabled: true
+  load_headroom_fraction: 0.10
+  min_free_bytes: null
+  model_size_multiplier: 1.20
+  generation_guard_enabled: true
+  generation_kv_bytes_per_token: 0
+  vlm_image_tokens_per_image: 576
+  remote_model_estimates_bytes:
+    black-forest-labs/FLUX.1-schnell: 25769803776
+    black-forest-labs/FLUX.1-dev: 25769803776
 
 retrieval:
   worker_isolation_enabled: true
@@ -273,6 +371,22 @@ retrieval:
   worker_ready_timeout_seconds: 30.0
   worker_shutdown_timeout_seconds: 5.0
   clear_mlx_cache_after_request: true
+
+generation:
+  worker_isolation_enabled: false
+  worker_mode: type
+  worker_host: 127.0.0.1
+  worker_ready_timeout_seconds: 45.0
+  worker_shutdown_timeout_seconds: 10.0
+  worker_idle_timeout_seconds: 1800.0
+  clear_mlx_cache_after_request: true
+  kv_bits: null
+  kv_group_size: 64
+  quantized_kv_start: 0
+  prompt_cache_enabled: true
+  prompt_cache_checkpoint_enabled: false
+  prompt_cache_max_entries: 4
+  prompt_cache_min_tokens: 32
 
 logging:
   level: INFO

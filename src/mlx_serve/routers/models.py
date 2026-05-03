@@ -3,11 +3,11 @@
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from mlx_serve.core.model_manager import ModelType, model_manager
+from mlx_serve.core.model_manager import ModelInUseError, ModelType, model_manager
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,13 @@ class ShowRequest(BaseModel):
     name: str = Field(..., description="Model name to show")
 
 
+class UnloadRequest(BaseModel):
+    """Model unload request."""
+
+    all: bool = Field(default=False, description="Unload all cached idle models")
+    type: ModelType | None = Field(default=None, description="Optional model type filter")
+
+
 class ShowResponse(BaseModel):
     """Model show response."""
 
@@ -81,6 +88,15 @@ class ShowResponse(BaseModel):
     modified_at: str
     hf_repo: str
     path: str
+
+
+class UnloadResponse(BaseModel):
+    """Model unload response."""
+
+    status: Literal["success"] = "success"
+    unloaded: list[dict[str, str]]
+    skipped_active: list[dict[str, str]] = Field(default_factory=list)
+    cache: dict | None = None
 
 
 # OpenAI-compatible endpoints
@@ -160,6 +176,63 @@ async def delete_model(request: DeleteRequest) -> dict:
 
     model_manager.delete_model(request.name)
     return {"status": "success"}
+
+
+@router.get("/v1/models/cache")
+async def get_model_cache_stats() -> dict:
+    """Return loaded model cache and memory diagnostics."""
+    return model_manager.get_cache_stats()
+
+
+@router.post("/v1/models/unload", response_model=UnloadResponse)
+async def unload_models(request: UnloadRequest) -> UnloadResponse:
+    """Unload cached idle models without deleting them from disk."""
+    if not request.all:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": "Set 'all' to true to unload all cached models",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request",
+                }
+            },
+        )
+
+    result = model_manager.unload_all(request.type)
+    return UnloadResponse(
+        unloaded=result["unloaded"],
+        skipped_active=result["skipped_active"],
+        cache=model_manager.get_cache_stats(),
+    )
+
+
+@router.post("/v1/models/{model_name}/unload", response_model=UnloadResponse)
+async def unload_model(
+    model_name: str,
+    model_type: ModelType | None = None,
+    type_: ModelType | None = Query(default=None, alias="type"),
+) -> UnloadResponse:
+    """Unload one cached model without deleting it from disk."""
+    target_type = type_ or model_type
+    try:
+        unloaded = model_manager.unload_model(model_name, target_type)
+    except ModelInUseError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "message": str(e),
+                    "type": "invalid_request_error",
+                    "code": "model_in_use",
+                }
+            },
+        ) from e
+
+    return UnloadResponse(
+        unloaded=unloaded,
+        cache=model_manager.get_cache_stats(),
+    )
 
 
 @router.post("/api/show", response_model=ShowResponse)

@@ -9,10 +9,14 @@ from mlx_serve.config import settings
 
 ServerRole = Literal["gateway", "worker"]
 RetrievalWorkerKind = Literal["embedding", "reranker"]
+GenerationWorkerKind = Literal["llm", "vlm"]
 
 SERVER_ROLE_ENV = "MLX_SERVE_SERVER_ROLE"
 RETRIEVAL_WORKER_KIND_ENV = "MLX_SERVE_RETRIEVAL_WORKER_KIND"
+GENERATION_WORKER_KIND_ENV = "MLX_SERVE_GENERATION_WORKER_KIND"
+GENERATION_WORKER_MODEL_ENV = "MLX_SERVE_GENERATION_WORKER_MODEL"
 RETRIEVAL_WORKER_KINDS: tuple[RetrievalWorkerKind, ...] = ("embedding", "reranker")
+GENERATION_WORKER_KINDS: tuple[GenerationWorkerKind, ...] = ("llm", "vlm")
 
 
 def get_server_role() -> ServerRole:
@@ -30,6 +34,27 @@ def get_retrieval_worker_kind() -> RetrievalWorkerKind | None:
     return None
 
 
+def get_generation_worker_kind() -> GenerationWorkerKind | None:
+    """Return the generation worker kind when running in worker mode."""
+    kind = os.getenv(GENERATION_WORKER_KIND_ENV)
+    if kind in GENERATION_WORKER_KINDS:
+        return kind
+    return None
+
+
+def get_generation_worker_model() -> str | None:
+    """Return the model assigned to a generation worker, when model-scoped."""
+    model_name = os.getenv(GENERATION_WORKER_MODEL_ENV)
+    if model_name:
+        return model_name
+    return None
+
+
 def retrieval_worker_isolation_enabled() -> bool:
     """Return whether the gateway should isolate retrieval endpoints in subprocesses."""
     return get_server_role() == "gateway" and settings.retrieval_worker_isolation_enabled
+
+
+def generation_worker_isolation_enabled() -> bool:
+    """Return whether the gateway should isolate LLM/VLM endpoints in subprocesses."""
+    return get_server_role() == "gateway" and settings.generation_worker_isolation_enabled

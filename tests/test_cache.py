@@ -52,6 +52,25 @@ class TestTTLLRUCache:
         assert cache.get("key1") is None
         assert cache.remove("key1") is False
 
+    def test_pop_returns_value(self):
+        """Test pop removes and returns cached value."""
+        cache = TTLLRUCache(maxsize=3, ttl=60)
+        cache.set("key1", "value1")
+        assert cache.pop("key1") == "value1"
+        assert cache.get("key1") is None
+
+    def test_items_by_last_used(self):
+        """Items should be ordered from least to most recently used."""
+        cache = TTLLRUCache(maxsize=3, ttl=60)
+        cache.set("key1", "value1")
+        time.sleep(0.01)
+        cache.set("key2", "value2")
+        time.sleep(0.01)
+        cache.get("key1")
+
+        keys = [key for key, _last_used, _value in cache.items_by_last_used()]
+        assert keys == ["key2", "key1"]
+
     def test_lru_eviction(self):
         """Test LRU eviction when cache is full."""
         cache = TTLLRUCache(maxsize=2, ttl=60)
@@ -66,6 +85,15 @@ class TestTTLLRUCache:
         assert cache.get("key3") == "value3"
         # key2 should have been evicted
         assert len(cache) == 2
+
+    def test_timestamps_are_pruned_after_lru_eviction(self):
+        """Timestamp metadata should not retain entries evicted by LRU."""
+        cache = TTLLRUCache(maxsize=1, ttl=60)
+        cache.set("key1", "value1")
+        cache.set("key2", "value2")
+
+        assert cache.last_used("key1") is None
+        assert cache.get("key2") == "value2"
 
     def test_ttl_expiration(self):
         """Test TTL expiration."""

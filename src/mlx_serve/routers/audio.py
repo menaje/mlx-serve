@@ -11,13 +11,16 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from mlx_serve.config import settings
 from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
     build_overload_detail,
     inference_controller,
 )
-from mlx_serve.core.model_manager import model_manager
+from mlx_serve.core.mlx_memory import clear_mlx_cache
+from mlx_serve.core.model_manager import model_manager, resolve_model_alias
+from mlx_serve.core.model_memory import ModelLoadMemoryError
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +127,9 @@ async def create_speech(request: SpeechRequest):
 
     Returns audio in the requested format.
     """
+    canonical_model_name, _, _ = resolve_model_alias(request.model)
     try:
-        lease = await inference_controller.acquire(build_inference_key("tts", request.model))
+        lease = await inference_controller.acquire(build_inference_key("tts", canonical_model_name))
     except InferenceOverloadedError as e:
         raise HTTPException(
             status_code=503,
@@ -148,14 +152,27 @@ async def create_speech(request: SpeechRequest):
                     }
                 },
             ) from e
+        except ModelLoadMemoryError as e:
+            raise HTTPException(
+                status_code=503,
+                detail=build_overload_detail(str(e)),
+            ) from e
 
-        audio_bytes = await _generate_speech(
-            model=model,
-            text=request.input,
-            voice=request.voice,
-            speed=request.speed,
-            response_format=request.response_format,
-        )
+        baseline = model_manager.capture_memory_calibration_baseline()
+        try:
+            audio_bytes = await _generate_speech(
+                model=model,
+                text=request.input,
+                voice=request.voice,
+                speed=request.speed,
+                response_format=request.response_format,
+            )
+        finally:
+            model_manager.calibrate_model_estimate_from_baseline(
+                "tts",
+                canonical_model_name,
+                baseline,
+            )
 
         # Determine content type
         content_types = {
@@ -191,6 +208,8 @@ async def create_speech(request: SpeechRequest):
             },
         ) from e
     finally:
+        if settings.generation_clear_mlx_cache_after_request:
+            clear_mlx_cache(log=logger, reason="/v1/audio/speech")
         await lease.release()
 
 
@@ -257,8 +276,9 @@ async def create_transcription(
 
     Supports various audio formats (mp3, wav, m4a, etc.).
     """
+    canonical_model_name, _, _ = resolve_model_alias(model)
     try:
-        lease = await inference_controller.acquire(build_inference_key("stt", model))
+        lease = await inference_controller.acquire(build_inference_key("stt", canonical_model_name))
     except InferenceOverloadedError as e:
         raise HTTPException(
             status_code=503,
@@ -281,6 +301,11 @@ async def create_transcription(
                         "code": "model_not_found",
                     }
                 },
+            ) from e
+        except ModelLoadMemoryError as e:
+            raise HTTPException(
+                status_code=503,
+                detail=build_overload_detail(str(e)),
             ) from e
 
         # Read and validate file size after admission to avoid buffering work outside the guard.
@@ -305,13 +330,21 @@ async def create_transcription(
             tmp.write(content)
             tmp_path = tmp.name
 
-        result = await _transcribe_audio(
-            model=stt_model,
-            audio_path=tmp_path,
-            language=language,
-            response_format=response_format,
-            timestamp_granularities=timestamp_granularities,
-        )
+        baseline = model_manager.capture_memory_calibration_baseline()
+        try:
+            result = await _transcribe_audio(
+                model=stt_model,
+                audio_path=tmp_path,
+                language=language,
+                response_format=response_format,
+                timestamp_granularities=timestamp_granularities,
+            )
+        finally:
+            model_manager.calibrate_model_estimate_from_baseline(
+                "stt",
+                canonical_model_name,
+                baseline,
+            )
 
         # Handle different result formats
         if isinstance(result, dict):
@@ -347,6 +380,8 @@ async def create_transcription(
             },
         ) from e
     finally:
+        if settings.generation_clear_mlx_cache_after_request:
+            clear_mlx_cache(log=logger, reason="/v1/audio/transcriptions")
         await lease.release()
         # Clean up temp file
         if tmp_path:

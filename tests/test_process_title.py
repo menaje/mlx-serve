@@ -21,6 +21,8 @@ def test_build_process_title_for_workers():
         build_process_title(server_role="worker", worker_kind="reranker")
         == "mlx-serve:reranker"
     )
+    assert build_process_title(server_role="worker", worker_kind="llm") == "mlx-serve:llm"
+    assert build_process_title(server_role="worker", worker_kind="vlm") == "mlx-serve:vlm"
 
 
 def test_apply_process_title_updates_title_when_dependency_is_available():

@@ -226,7 +226,12 @@ class TestLaunchdManager:
     def test_stop_uses_bootout_target_first(self, manager):
         """Test launchd stop uses bootout with the fully-qualified target."""
         with patch("subprocess.run") as run:
-            run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
             success, message = manager.stop()
 
         assert success is True

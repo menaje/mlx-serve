@@ -1,12 +1,12 @@
 """Reranking API router - Jina compatible extension."""
 
-import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from mlx_serve.config import settings
+from mlx_serve.core.batch_processor import RerankBatchProcessor
 from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
@@ -15,7 +15,8 @@ from mlx_serve.core.inference_control import (
     inference_controller,
 )
 from mlx_serve.core.mlx_memory import clear_mlx_cache
-from mlx_serve.core.model_manager import model_manager
+from mlx_serve.core.model_manager import model_manager, resolve_model_alias
+from mlx_serve.core.model_memory import ModelLoadMemoryError
 
 logger = logging.getLogger(__name__)
 
@@ -133,62 +134,16 @@ def compute_rerank_score(
 async def _compute_batch_scores(
     model, tokenizer, query: str, documents: list[str], instruction: str | None = None
 ) -> tuple[list[float], int]:
-    """Compute rerank scores for all documents using batch processing."""
-    loop = asyncio.get_running_loop()
-
-    def _compute():
-        import mlx.core as mx
-
-        if instruction is None:
-            inst = "Given a web search query, retrieve relevant passages that answer the query"
-        else:
-            inst = instruction
-
-        # Get token IDs for "yes" and "no"
-        token_true_id = tokenizer.convert_tokens_to_ids("yes")
-        token_false_id = tokenizer.convert_tokens_to_ids("no")
-
-        scores = []
-        total_tokens = 0
-
-        # Process all documents
-        for doc in documents:
-            prompt = f"<Instruct>: {inst}\n<Query>: {query}\n<Document>: {doc}"
-
-            # Tokenize
-            prefix_tokens = [tokenizer.bos_token_id] if tokenizer.bos_token_id else []
-            suffix_tokens = [tokenizer.eos_token_id] if tokenizer.eos_token_id else []
-
-            input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            input_ids = prefix_tokens + input_ids + suffix_tokens
-
-            tokens = mx.array([input_ids])
-            total_tokens += len(input_ids)
-
-            # Get model output
-            outputs = model(tokens)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs
-
-            # Get last token logits
-            last_logits = logits[0, -1, :]
-
-            # Compute probability
-            true_score = last_logits[token_true_id]
-            false_score = last_logits[token_false_id]
-            probs = mx.softmax(mx.stack([false_score, true_score]))
-
-            scores.append(float(probs[1]))
-
-        return scores, total_tokens
-
-    return await loop.run_in_executor(None, _compute)
+    """Compute rerank scores using bounded request-scoped micro-batches."""
+    processor = RerankBatchProcessor(model, tokenizer)
+    return await processor.rerank(query, documents, instruction)
 
 
 @router.post("/v1/rerank", response_model=RerankResponse)
 async def rerank_documents(request: RerankRequest) -> RerankResponse:
     """Rerank documents based on relevance to the query.
 
-    Uses batch processing for improved throughput.
+    Uses request-scoped micro-batching for improved throughput and bounded memory.
     """
     if not request.documents:
         raise HTTPException(
@@ -202,8 +157,9 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
             },
         )
 
+    canonical_model_name, _, _ = resolve_model_alias(request.model)
     try:
-        model_key = build_inference_key("reranker", request.model)
+        model_key = build_inference_key("reranker", canonical_model_name)
         lease = await inference_controller.acquire(model_key)
     except InferenceOverloadedError as e:
         raise HTTPException(
@@ -227,6 +183,11 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
                             "code": "model_not_found",
                         }
                     },
+                ) from e
+            except ModelLoadMemoryError as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=build_overload_detail(str(e)),
                 ) from e
 
             # Compute scores for all documents using batch processing

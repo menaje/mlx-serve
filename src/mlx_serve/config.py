@@ -106,6 +106,27 @@ class Settings(BaseSettings):
         default=32,
         description="Maximum batch size for continuous batching",
     )
+    embedding_batch_max_texts: int = Field(
+        default=32,
+        description=(
+            "Maximum total texts merged into a single embedding model call "
+            "across concurrent requests"
+        ),
+        ge=1,
+    )
+    rerank_batch_max_documents: int = Field(
+        default=4,
+        description="Maximum documents per rerank micro-batch model call",
+        ge=1,
+    )
+    rerank_batch_max_tokens: int = Field(
+        default=2048,
+        description=(
+            "Maximum padded token budget per rerank micro-batch "
+            "(batch_size * longest_sequence_length)"
+        ),
+        ge=1,
+    )
     batch_max_wait_ms: int = Field(
         default=50,
         description="Maximum wait time in milliseconds for batch collection",
@@ -121,7 +142,7 @@ class Settings(BaseSettings):
         ge=0,
     )
     inference_queue_timeout_seconds: float | None = Field(
-        default=30.0,
+        default=180.0,
         description="Maximum time to wait for a per-model inference slot (None waits indefinitely)",
         gt=0,
     )
@@ -149,6 +170,64 @@ class Settings(BaseSettings):
         gt=0,
         lt=1,
     )
+    memory_load_guard_enabled: bool = Field(
+        default=True,
+        description="Check estimated model memory before starting a model load",
+    )
+    memory_load_headroom_fraction: float | None = Field(
+        default=0.10,
+        description=(
+            "Reserve this fraction of total system memory when deciding whether "
+            "a model can be loaded or a generation request can start"
+        ),
+        ge=0,
+        lt=1,
+    )
+    memory_min_free_bytes: int | None = Field(
+        default=None,
+        description=(
+            "Minimum free bytes to reserve when deciding whether a model can be loaded "
+            "or a generation request can start"
+        ),
+        ge=0,
+    )
+    memory_model_size_multiplier: float = Field(
+        default=1.20,
+        description="Multiplier applied to model weight size estimates for load admission",
+        ge=1.0,
+    )
+    memory_generation_guard_enabled: bool = Field(
+        default=True,
+        description="Check estimated KV cache memory before starting generation",
+    )
+    memory_generation_kv_bytes_per_token: int = Field(
+        default=0,
+        description=(
+            "Fallback KV cache bytes per token when model config is unavailable "
+            "(0 disables fallback estimates)"
+        ),
+        ge=0,
+    )
+    memory_vlm_image_tokens_per_image: int = Field(
+        default=576,
+        description=(
+            "Additional context tokens to reserve per image when checking VLM "
+            "generation memory"
+        ),
+        ge=0,
+    )
+    memory_remote_model_estimates_bytes: dict[str, int] = Field(
+        default_factory=lambda: {
+            "black-forest-labs/FLUX.1-schnell": 24 * 1024**3,
+            "black-forest-labs/FLUX.1-dev": 24 * 1024**3,
+            "FLUX.1-schnell": 24 * 1024**3,
+            "FLUX.1-dev": 24 * 1024**3,
+        },
+        description=(
+            "Estimated local memory footprint for loader-managed remote models "
+            "that do not have a local model directory"
+        ),
+    )
     retrieval_worker_isolation_enabled: bool = Field(
         default=True,
         description=(
@@ -170,12 +249,91 @@ class Settings(BaseSettings):
         description="Maximum time to wait for an internal retrieval worker to exit cleanly",
         gt=0,
     )
+    generation_worker_isolation_enabled: bool = Field(
+        default=False,
+        description=(
+            "Run chat/completion endpoints in dedicated LLM and VLM subprocesses "
+            "for stronger memory reclaim boundaries"
+        ),
+    )
+    generation_worker_mode: Literal["type", "model"] = Field(
+        default="type",
+        description=(
+            "Generation worker isolation mode: 'type' starts one LLM and one VLM "
+            "worker; 'model' starts workers on demand per requested LLM/VLM model"
+        ),
+    )
+    generation_worker_host: str = Field(
+        default="127.0.0.1",
+        description="Bind host for internal LLM/VLM worker subprocesses",
+    )
+    generation_worker_ready_timeout_seconds: float = Field(
+        default=45.0,
+        description="Maximum time to wait for an internal generation worker to become healthy",
+        gt=0,
+    )
+    generation_worker_shutdown_timeout_seconds: float = Field(
+        default=10.0,
+        description="Maximum time to wait for an internal generation worker to exit cleanly",
+        gt=0,
+    )
+    generation_worker_idle_timeout_seconds: float = Field(
+        default=1800.0,
+        description=(
+            "Idle timeout for model-scoped generation workers. Set to 0 to keep "
+            "model workers alive until gateway shutdown"
+        ),
+        ge=0,
+    )
     retrieval_clear_mlx_cache_after_request: bool = Field(
         default=True,
         description=(
             "Clear free MLX cache after each embedding/rerank request to prevent "
             "long-lived retrieval workers from accumulating large Metal cache allocations"
         ),
+    )
+    generation_clear_mlx_cache_after_request: bool = Field(
+        default=True,
+        description="Clear free MLX cache after chat, completion, audio, and image requests",
+    )
+    generation_kv_bits: int | None = Field(
+        default=None,
+        description="Number of bits for mlx-lm KV cache quantization (None disables it)",
+        ge=1,
+    )
+    generation_kv_group_size: int = Field(
+        default=64,
+        description="Group size for mlx-lm KV cache quantization",
+        ge=1,
+    )
+    generation_quantized_kv_start: int = Field(
+        default=0,
+        description="Token offset to start mlx-lm KV cache quantization when enabled",
+        ge=0,
+    )
+    generation_prompt_cache_enabled: bool = Field(
+        default=True,
+        description=(
+            "Reuse exact-prefix LLM prompt KV caches across text generation requests "
+            "when it is safe to trim and store them"
+        ),
+    )
+    generation_prompt_cache_checkpoint_enabled: bool = Field(
+        default=False,
+        description=(
+            "Persist exact-prefix LLM prompt KV caches to disk so model-scoped "
+            "worker processes can reuse them across process lifetimes"
+        ),
+    )
+    generation_prompt_cache_max_entries: int = Field(
+        default=4,
+        description="Maximum prompt KV cache entries to retain per process",
+        ge=0,
+    )
+    generation_prompt_cache_min_tokens: int = Field(
+        default=32,
+        description="Minimum prompt token count before retaining a reusable KV cache",
+        ge=2,
     )
 
     # Metrics settings

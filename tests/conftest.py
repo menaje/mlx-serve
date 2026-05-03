@@ -8,7 +8,13 @@ from fastapi.testclient import TestClient
 
 from mlx_serve.config import settings
 from mlx_serve.core.inference_control import inference_controller
-from mlx_serve.core.runtime_topology import RETRIEVAL_WORKER_KIND_ENV, SERVER_ROLE_ENV
+from mlx_serve.core.prompt_cache import prompt_cache_store
+from mlx_serve.core.runtime_topology import (
+    GENERATION_WORKER_KIND_ENV,
+    GENERATION_WORKER_MODEL_ENV,
+    RETRIEVAL_WORKER_KIND_ENV,
+    SERVER_ROLE_ENV,
+)
 from mlx_serve.core.system_guard import memory_monitor
 from mlx_serve.routers import embeddings as embeddings_router
 from mlx_serve.server import create_app
@@ -25,14 +31,22 @@ def reset_runtime_state(monkeypatch):
     """Reset singleton runtime state between tests."""
     monkeypatch.setattr(settings, "memory_guard_enabled", False)
     monkeypatch.setattr(settings, "retrieval_worker_isolation_enabled", False)
+    monkeypatch.setattr(settings, "generation_worker_isolation_enabled", False)
+    monkeypatch.setattr(settings, "generation_worker_mode", "type")
+    monkeypatch.setattr(settings, "generation_worker_idle_timeout_seconds", 1800.0)
+    monkeypatch.setattr(settings, "generation_prompt_cache_checkpoint_enabled", False)
     monkeypatch.delenv(SERVER_ROLE_ENV, raising=False)
     monkeypatch.delenv(RETRIEVAL_WORKER_KIND_ENV, raising=False)
+    monkeypatch.delenv(GENERATION_WORKER_KIND_ENV, raising=False)
+    monkeypatch.delenv(GENERATION_WORKER_MODEL_ENV, raising=False)
     inference_controller.reset()
     embeddings_router._batch_processors.clear()
+    prompt_cache_store.clear()
     memory_monitor.reset()
     yield
     inference_controller.reset()
     embeddings_router._batch_processors.clear()
+    prompt_cache_store.clear()
     memory_monitor.reset()
 
 

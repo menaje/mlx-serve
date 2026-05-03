@@ -5,9 +5,9 @@ import platform
 import subprocess
 import sys
 import time
-from urllib import error, request
 from abc import ABC, abstractmethod
 from pathlib import Path
+from urllib import error, request
 
 from mlx_serve.config import settings
 
@@ -141,7 +141,11 @@ class LaunchdManager(ServiceManager):
     def service_name(self) -> str:
         return "com.mlx-serve.server"
 
-    def _run_launchctl(self, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess:
+    def _run_launchctl(
+        self,
+        *args: str,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess:
         """Run launchctl with a bounded timeout."""
         if timeout is None:
             timeout = self._LAUNCHCTL_TIMEOUT_SECONDS

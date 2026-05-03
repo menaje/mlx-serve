@@ -18,13 +18,22 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from mlx_serve.config import settings
 from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
     build_overload_detail,
     inference_controller,
 )
-from mlx_serve.core.model_manager import model_manager
+from mlx_serve.core.metrics import record_generation_memory_rejection
+from mlx_serve.core.mlx_memory import clear_mlx_cache
+from mlx_serve.core.model_manager import model_manager, resolve_model_alias
+from mlx_serve.core.model_memory import GenerationMemoryError, ModelLoadMemoryError
+from mlx_serve.core.prompt_cache import prompt_cache_store
+from mlx_serve.core.runtime_topology import (
+    get_generation_worker_kind,
+    get_generation_worker_model,
+)
 
 try:
     from PIL import Image
@@ -440,12 +449,18 @@ def _extract_text_from_content(content: str | list[ContentPart] | None) -> str:
 
 def _has_images(messages: list[ChatMessage]) -> bool:
     """Check if any message contains images."""
+    return _count_image_parts(messages) > 0
+
+
+def _count_image_parts(messages: list[ChatMessage]) -> int:
+    """Count image parts without loading image bytes."""
+    count = 0
     for msg in messages:
         if isinstance(msg.content, list):
             for part in msg.content:
                 if hasattr(part, "image_url") and part.image_url:
-                    return True
-    return False
+                    count += 1
+    return count
 
 
 def _format_messages_for_model(
@@ -646,6 +661,34 @@ def _truncate_at_stop_sequences(text: str, stop: list[str] | None) -> tuple[str,
     return text, False
 
 
+def _split_stream_text_for_stop(
+    pending_text: str,
+    stop: list[str] | None,
+) -> tuple[str, str, bool]:
+    """Return safe-to-emit text while retaining possible partial stop suffixes."""
+    if not stop:
+        return pending_text, "", False
+
+    truncated, was_truncated = _truncate_at_stop_sequences(pending_text, stop)
+    if was_truncated:
+        return truncated, "", True
+
+    keep_chars = 0
+    for sequence in stop:
+        if not sequence:
+            continue
+        max_candidate = min(len(sequence) - 1, len(pending_text))
+        for candidate_length in range(1, max_candidate + 1):
+            if pending_text.endswith(sequence[:candidate_length]):
+                keep_chars = max(keep_chars, candidate_length)
+
+    if keep_chars <= 0:
+        return pending_text, "", False
+    if len(pending_text) <= keep_chars:
+        return "", pending_text, False
+    return pending_text[:-keep_chars], pending_text[-keep_chars:], False
+
+
 async def _acquire_model_lease(
     model_type: str,
     model_name: str,
@@ -663,9 +706,163 @@ async def _acquire_model_lease(
         ) from e
 
 
+def _estimate_prompt_tokens_for_memory(tokenizer: Any, prompt: str) -> int:
+    """Estimate prompt tokens without failing the request on tokenizer quirks."""
+    try:
+        return len(tokenizer.encode(prompt))
+    except Exception:
+        return len(prompt.split()) * 2
+
+
+def _estimate_text_tokens_for_memory(text: str) -> int:
+    """Estimate tokens before a tokenizer is loaded."""
+    return len(text.split()) * 2
+
+
+def _estimate_chat_tokens_for_preload(
+    messages: list[ChatMessage],
+    response_format: ResponseFormat | None = None,
+) -> int:
+    """Estimate chat prompt tokens before loading the tokenizer."""
+    text_parts = [
+        f"{message.role}: {_extract_text_from_content(message.content)}"
+        for message in messages
+    ]
+    instruction = _build_response_format_instruction(response_format)
+    if instruction:
+        text_parts.append(instruction)
+    return _estimate_text_tokens_for_memory("\n".join(text_parts))
+
+
+def _check_load_and_generation_memory_for_request(
+    model_type: Literal["llm", "vlm"],
+    model_name: str,
+    prompt_tokens: int,
+    max_tokens: int,
+    image_count: int = 0,
+) -> None:
+    """Check estimated model weights plus request KV before model load."""
+    image_tokens = 0
+    if model_type == "vlm" and image_count > 0:
+        image_tokens = model_manager.estimate_vlm_image_tokens(model_name, image_count)
+    try:
+        model_manager.ensure_load_and_generation_memory_available(
+            model_type,
+            model_name,
+            prompt_tokens,
+            max_tokens,
+            image_tokens=image_tokens,
+        )
+    except ModelLoadMemoryError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(str(e)),
+        ) from e
+
+
+def _check_generation_memory_for_request(
+    model_type: Literal["llm", "vlm"],
+    model_name: str,
+    tokenizer: Any,
+    prompt: str,
+    max_tokens: int,
+    image_count: int = 0,
+) -> None:
+    """Map request-scoped generation memory failures to structured 503 responses."""
+    prompt_tokens = _estimate_prompt_tokens_for_memory(tokenizer, prompt)
+    image_tokens = 0
+    if model_type == "vlm" and image_count > 0:
+        image_tokens = model_manager.estimate_vlm_image_tokens(model_name, image_count)
+    try:
+        model_manager.check_generation_memory_available(
+            model_type,
+            model_name,
+            prompt_tokens,
+            max_tokens,
+            image_tokens=image_tokens,
+        )
+    except GenerationMemoryError as e:
+        record_generation_memory_rejection(model_type, e.estimate.kv_cache_bytes)
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(str(e)),
+        ) from e
+
+
+def _generation_kwargs() -> dict[str, int]:
+    """Return optional mlx-lm generation memory controls."""
+    if settings.generation_kv_bits is None:
+        return {}
+    return {
+        "kv_bits": settings.generation_kv_bits,
+        "kv_group_size": settings.generation_kv_group_size,
+        "quantized_kv_start": settings.generation_quantized_kv_start,
+    }
+
+
+def _reserve_llm_prompt_cache(
+    model: Any,
+    tokenizer: Any,
+    model_name: str,
+    prompt: str,
+):
+    """Reserve a reusable prompt KV cache and return canonical name/token IDs."""
+    canonical_model_name, _, _ = resolve_model_alias(model_name)
+    token_ids = [int(token) for token in tokenizer.encode(prompt)]
+    estimated_bytes = model_manager.estimate_prompt_cache_bytes(
+        "llm",
+        canonical_model_name,
+        len(token_ids),
+    )
+    lease = prompt_cache_store.reserve(
+        canonical_model_name,
+        model,
+        token_ids,
+        estimated_bytes=estimated_bytes,
+    )
+    return canonical_model_name, token_ids, lease
+
+
+def _ensure_generation_worker_kind(model_type: Literal["llm", "vlm"], model_name: str) -> None:
+    """Prevent isolated generation workers from loading the wrong model family."""
+    worker_kind = get_generation_worker_kind()
+    if worker_kind is None or worker_kind == model_type:
+        assigned_model = get_generation_worker_model()
+        if assigned_model is None:
+            return
+        resolved_name, _, _ = resolve_model_alias(model_name)
+        assigned_resolved_name, _, _ = resolve_model_alias(assigned_model)
+        if resolved_name == assigned_resolved_name:
+            return
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": (
+                        f"Model '{model_name}' is not assigned to this "
+                        f"{worker_kind or model_type} worker"
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            },
+        )
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "error": {
+                "message": f"Model '{model_name}' is not available on {worker_kind} worker",
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+            }
+        },
+    )
+
+
 async def _generate_completion(
     model: Any,
     tokenizer: Any,
+    model_name: str,
     prompt: str,
     max_tokens: int,
     temperature: float,
@@ -679,19 +876,80 @@ async def _generate_completion(
     loop = asyncio.get_running_loop()
 
     def _generate():
-        prompt_tokens = len(tokenizer.encode(prompt))
-        sampler = make_sampler(temp=temperature, top_p=top_p)
-        response = generate(
+        canonical_model_name, token_ids, prompt_cache_lease = _reserve_llm_prompt_cache(
             model,
             tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            sampler=sampler,
+            model_name,
+            prompt,
         )
-        # Apply stop sequence truncation
-        response, _ = _truncate_at_stop_sequences(response, stop)
-        completion_tokens = len(tokenizer.encode(response))
-        return response, prompt_tokens, completion_tokens
+        prompt_tokens = len(token_ids)
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+        baseline = model_manager.capture_memory_calibration_baseline()
+        response = ""
+        completion_tokens = 0
+        try:
+            if prompt_cache_lease is not None:
+                from mlx_lm import stream_generate
+
+                chunks = []
+                generated_tokens = 0
+                completed = False
+                try:
+                    for chunk in stream_generate(
+                        model,
+                        tokenizer,
+                        prompt=prompt_cache_lease.prompt_tokens,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        prompt_cache=prompt_cache_lease.prompt_cache,
+                        **_generation_kwargs(),
+                    ):
+                        chunks.append(chunk.text if hasattr(chunk, "text") else str(chunk))
+                        generated_tokens = getattr(
+                            chunk,
+                            "generation_tokens",
+                            generated_tokens + 1,
+                        )
+                        if stop:
+                            partial_response = "".join(chunks)
+                            response, stopped = _truncate_at_stop_sequences(
+                                partial_response,
+                                stop,
+                            )
+                            if stopped:
+                                completed = True
+                                break
+                        else:
+                            response = "".join(chunks)
+                    else:
+                        completed = True
+                finally:
+                    if completed:
+                        prompt_cache_lease.commit(generated_tokens)
+                if not response:
+                    response = "".join(chunks)
+                    response, _ = _truncate_at_stop_sequences(response, stop)
+                completion_tokens = len(tokenizer.encode(response))
+                return response, prompt_tokens, completion_tokens
+
+            response = generate(
+                model,
+                tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                **_generation_kwargs(),
+            )
+            # Apply stop sequence truncation
+            response, _ = _truncate_at_stop_sequences(response, stop)
+            completion_tokens = len(tokenizer.encode(response))
+            return response, prompt_tokens, completion_tokens
+        finally:
+            model_manager.calibrate_model_estimate_from_baseline(
+                "llm",
+                canonical_model_name,
+                baseline,
+            )
 
     return await loop.run_in_executor(None, _generate)
 
@@ -699,6 +957,7 @@ async def _generate_completion(
 async def _generate_vlm_completion(
     model: Any,
     processor: Any,
+    model_name: str,
     prompt: str,
     images: list["Image.Image"],
     max_tokens: int,
@@ -710,21 +969,31 @@ async def _generate_vlm_completion(
     loop = asyncio.get_running_loop()
 
     def _generate():
-        # VLM generate expects images and prompt
-        result = generate(
-            model,
-            processor,
-            prompt,
-            image=images[0] if images else None,  # Most VLMs handle single image
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        # Extract text from GenerationResult
-        response = result.text if hasattr(result, 'text') else str(result)
-        # Approximate token counts
-        prompt_tokens = len(prompt.split()) * 2  # Rough estimate
-        completion_tokens = len(response.split()) * 2
-        return response, prompt_tokens, completion_tokens
+        canonical_model_name, _, _ = resolve_model_alias(model_name)
+        baseline = model_manager.capture_memory_calibration_baseline()
+        try:
+            # VLM generate expects images and prompt
+            result = generate(
+                model,
+                processor,
+                prompt,
+                image=images if len(images) > 1 else (images[0] if images else None),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **_generation_kwargs(),
+            )
+            # Extract text from GenerationResult
+            response = result.text if hasattr(result, 'text') else str(result)
+            # Approximate token counts
+            prompt_tokens = len(prompt.split()) * 2  # Rough estimate
+            completion_tokens = len(response.split()) * 2
+            return response, prompt_tokens, completion_tokens
+        finally:
+            model_manager.calibrate_model_estimate_from_baseline(
+                "vlm",
+                canonical_model_name,
+                baseline,
+            )
 
     return await loop.run_in_executor(None, _generate)
 
@@ -748,8 +1017,14 @@ async def _stream_completion(
     from mlx_lm import stream_generate
     from mlx_lm.sample_utils import make_sampler
 
-    # Calculate prompt tokens
-    prompt_tokens = len(tokenizer.encode(prompt))
+    # Calculate prompt tokens and reserve reusable prompt KV when enabled.
+    _canonical_model_name, token_ids, prompt_cache_lease = _reserve_llm_prompt_cache(
+        model,
+        tokenizer,
+        model_name,
+        prompt,
+    )
+    prompt_tokens = len(token_ids)
 
     # Create sampler for temperature and top_p
     sampler = make_sampler(temp=temperature, top_p=top_p)
@@ -771,20 +1046,41 @@ async def _stream_completion(
     )
     yield f"data: {initial_chunk.model_dump_json()}\n\n"
 
-    # Stream tokens
-    def _stream():
-        for chunk in stream_generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            sampler=sampler,
-        ):
-            yield chunk
-
-    # Run stream in thread and yield results
+    # Run stream in thread and yield results.
     import queue
     import threading
+
+    cancel_generation = threading.Event()
+
+    def _stream():
+        generated_tokens = 0
+        completed = False
+        try:
+            generate_kwargs: dict[str, Any] = {
+                "prompt": prompt,
+            }
+            if prompt_cache_lease is not None:
+                generate_kwargs = {
+                    "prompt": prompt_cache_lease.prompt_tokens,
+                    "prompt_cache": prompt_cache_lease.prompt_cache,
+                }
+            for chunk in stream_generate(
+                model,
+                tokenizer,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                **generate_kwargs,
+                **_generation_kwargs(),
+            ):
+                if cancel_generation.is_set():
+                    break
+                generated_tokens = getattr(chunk, "generation_tokens", generated_tokens + 1)
+                yield chunk
+            else:
+                completed = True
+        finally:
+            if prompt_cache_lease is not None and completed:
+                prompt_cache_lease.commit(generated_tokens)
 
     q: queue.Queue = queue.Queue()
     finished = threading.Event()
@@ -796,60 +1092,64 @@ async def _stream_completion(
         finally:
             finished.set()
 
-    thread = threading.Thread(target=producer)
+    thread = threading.Thread(target=producer, daemon=True)
     thread.start()
 
-    full_response = ""
+    pending_text = ""
     completion_tokens = 0
     stop_detected = False
-    while not finished.is_set() or not q.empty():
-        if stop_detected:
-            # Drain remaining queue items without yielding
+    try:
+        while not finished.is_set() or not q.empty():
+            if stop_detected:
+                # Drain remaining queue items without yielding
+                try:
+                    while not q.empty():
+                        q.get_nowait()
+                except queue.Empty:
+                    pass
+                break
+
             try:
-                while not q.empty():
-                    q.get_nowait()
-            except queue.Empty:
-                pass
-            break
+                chunk = q.get(timeout=0.1)
+                if hasattr(chunk, "text"):
+                    text = chunk.text
+                else:
+                    text = str(chunk)
 
-        try:
-            chunk = q.get(timeout=0.1)
-            if hasattr(chunk, "text"):
-                text = chunk.text
-            else:
-                text = str(chunk)
-
-            # Check for stop sequences
-            if stop:
-                full_response += text
-                truncated, was_truncated = _truncate_at_stop_sequences(full_response, stop)
+                # Check for stop sequences
+                pending_text += text
+                text_to_yield, pending_text, was_truncated = _split_stream_text_for_stop(
+                    pending_text,
+                    stop,
+                )
                 if was_truncated:
-                    # Only yield the portion before stop sequence
-                    text_to_yield = truncated[len(full_response) - len(text):]
-                    if text_to_yield:
-                        completion_tokens += 1
-                        content_chunk = ChatCompletionChunk(
-                            id=request_id,
-                            created=created,
-                            model=model_name,
-                            choices=[
-                                StreamChoice(
-                                    index=0,
-                                    delta=DeltaMessage(content=text_to_yield),
-                                    finish_reason=None,
-                                )
-                            ],
-                            system_fingerprint=system_fingerprint,
-                            service_tier=service_tier,
-                        )
-                        yield f"data: {content_chunk.model_dump_json()}\n\n"
                     stop_detected = True
+                    cancel_generation.set()
+                if not text_to_yield:
                     continue
-            else:
-                full_response += text
 
-            completion_tokens += 1  # Count tokens as they stream
+                completion_tokens += 1  # Count tokens as they stream
 
+                content_chunk = ChatCompletionChunk(
+                    id=request_id,
+                    created=created,
+                    model=model_name,
+                    choices=[
+                        StreamChoice(
+                            index=0,
+                            delta=DeltaMessage(content=text_to_yield),
+                            finish_reason=None,
+                        )
+                    ],
+                    system_fingerprint=system_fingerprint,
+                    service_tier=service_tier,
+                )
+                yield f"data: {content_chunk.model_dump_json()}\n\n"
+            except queue.Empty:
+                continue
+
+        if pending_text and not stop_detected:
+            completion_tokens += 1
             content_chunk = ChatCompletionChunk(
                 id=request_id,
                 created=created,
@@ -857,7 +1157,7 @@ async def _stream_completion(
                 choices=[
                     StreamChoice(
                         index=0,
-                        delta=DeltaMessage(content=text),
+                        delta=DeltaMessage(content=pending_text),
                         finish_reason=None,
                     )
                 ],
@@ -865,10 +1165,10 @@ async def _stream_completion(
                 service_tier=service_tier,
             )
             yield f"data: {content_chunk.model_dump_json()}\n\n"
-        except queue.Empty:
-            continue
-
-    thread.join()
+    finally:
+        cancel_generation.set()
+        if thread.is_alive():
+            thread.join(timeout=1.0)
 
     # Send final chunk with finish_reason
     final_chunk = ChatCompletionChunk(
@@ -909,9 +1209,22 @@ async def _stream_completion(
 
 async def _stream_completion_with_lease(lease, **kwargs):
     """Hold an inference lease for the lifetime of a streaming response."""
-    async with lease:
-        async for chunk in _stream_completion(**kwargs):
-            yield chunk
+    baseline = model_manager.capture_memory_calibration_baseline()
+    try:
+        async with lease:
+            async for chunk in _stream_completion(**kwargs):
+                yield chunk
+    finally:
+        model_name = kwargs.get("model_name")
+        if model_name:
+            canonical_model_name, _, _ = resolve_model_alias(model_name)
+            model_manager.calibrate_model_estimate_from_baseline(
+                "llm",
+                canonical_model_name,
+                baseline,
+            )
+        if settings.generation_clear_mlx_cache_after_request:
+            clear_mlx_cache(log=logger, reason="/v1/chat/completions stream")
 
 
 @router.post("/v1/chat/completions")
@@ -921,11 +1234,13 @@ async def create_chat_completion(request: ChatCompletionRequest):
     Supports streaming, tool/function calling, and vision (image inputs).
     """
     # Check if request contains images
-    has_vision = _has_images(request.messages)
+    image_count = _count_image_parts(request.messages)
+    has_vision = image_count > 0
     images = []
 
     # Check model type and validate it's suitable for chat completions
     model_type = model_manager.get_model_type(request.model)
+    canonical_request_model, _, _ = resolve_model_alias(request.model)
 
     # Validate model type is suitable for chat completions
     if model_type is not None and model_type not in ("llm", "vlm"):
@@ -948,7 +1263,16 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     # Vision models don't support streaming yet
     inference_model_type = "vlm" if (has_vision or is_vlm_model) else "llm"
-    lease = await _acquire_model_lease(inference_model_type, request.model, "Chat")
+    _ensure_generation_worker_kind(inference_model_type, request.model)
+    max_tokens = request.max_completion_tokens or request.max_tokens or 2048
+    _check_load_and_generation_memory_for_request(
+        inference_model_type,
+        canonical_request_model,
+        _estimate_chat_tokens_for_preload(request.messages, request.response_format),
+        max_tokens,
+        image_count=image_count,
+    )
+    lease = await _acquire_model_lease(inference_model_type, canonical_request_model, "Chat")
 
     try:
         if has_vision or is_vlm_model:
@@ -964,6 +1288,11 @@ async def create_chat_completion(request: ChatCompletionRequest):
                             "code": "model_not_found",
                         }
                     },
+                ) from e
+            except ModelLoadMemoryError as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=build_overload_detail(str(e)),
                 ) from e
 
             if has_vision:
@@ -982,6 +1311,11 @@ async def create_chat_completion(request: ChatCompletionRequest):
                             "code": "model_not_found",
                         }
                     },
+                ) from e
+            except ModelLoadMemoryError as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=build_overload_detail(str(e)),
                 ) from e
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -1002,8 +1336,15 @@ async def create_chat_completion(request: ChatCompletionRequest):
             prompt = prompt + response_format_instruction
 
         # Prepare generation parameters (max_completion_tokens takes precedence)
-        max_tokens = request.max_completion_tokens or request.max_tokens or 2048
         stop = [request.stop] if isinstance(request.stop, str) else request.stop
+        _check_generation_memory_for_request(
+            inference_model_type,
+            canonical_request_model,
+            tokenizer,
+            prompt,
+            max_tokens,
+            image_count=image_count,
+        )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
@@ -1056,6 +1397,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 response_text, prompt_tokens, completion_tokens = await _generate_vlm_completion(
                     model=model,
                     processor=tokenizer,
+                    model_name=request.model,
                     prompt=prompt,
                     images=images,
                     max_tokens=max_tokens,
@@ -1066,6 +1408,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 response_text, prompt_tokens, completion_tokens = await _generate_completion(
                     model=model,
                     tokenizer=tokenizer,
+                    model_name=request.model,
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=request.temperature,
@@ -1125,6 +1468,9 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 }
             },
         ) from e
+    finally:
+        if settings.generation_clear_mlx_cache_after_request:
+            clear_mlx_cache(log=logger, reason="/v1/chat/completions")
 
 
 # Text Completions API (Legacy)
@@ -1246,6 +1592,12 @@ async def _stream_text_completion(
 
     # Create sampler
     sampler = make_sampler(temp=temperature, top_p=top_p)
+    _canonical_model_name, _token_ids, prompt_cache_lease = _reserve_llm_prompt_cache(
+        model,
+        tokenizer,
+        model_name,
+        prompt,
+    )
 
     # Echo the prompt if requested
     if echo:
@@ -1263,19 +1615,40 @@ async def _stream_text_completion(
         )
         yield f"data: {echo_chunk.model_dump_json()}\n\n"
 
-    # Stream tokens
     import queue
     import threading
 
+    cancel_generation = threading.Event()
+
     def _stream():
-        for chunk in stream_generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            sampler=sampler,
-        ):
-            yield chunk
+        generated_tokens = 0
+        completed = False
+        try:
+            generate_kwargs: dict[str, Any] = {
+                "prompt": prompt,
+            }
+            if prompt_cache_lease is not None:
+                generate_kwargs = {
+                    "prompt": prompt_cache_lease.prompt_tokens,
+                    "prompt_cache": prompt_cache_lease.prompt_cache,
+                }
+            for chunk in stream_generate(
+                model,
+                tokenizer,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                **generate_kwargs,
+                **_generation_kwargs(),
+            ):
+                if cancel_generation.is_set():
+                    break
+                generated_tokens = getattr(chunk, "generation_tokens", generated_tokens + 1)
+                yield chunk
+            else:
+                completed = True
+        finally:
+            if prompt_cache_lease is not None and completed:
+                prompt_cache_lease.commit(generated_tokens)
 
     q: queue.Queue = queue.Queue()
     finished = threading.Event()
@@ -1287,34 +1660,73 @@ async def _stream_text_completion(
         finally:
             finished.set()
 
-    thread = threading.Thread(target=producer)
+    thread = threading.Thread(target=producer, daemon=True)
     thread.start()
 
-    while not finished.is_set() or not q.empty():
-        try:
-            chunk = q.get(timeout=0.1)
-            if hasattr(chunk, "text"):
-                text = chunk.text
-            else:
-                text = str(chunk)
+    pending_text = ""
+    stop_detected = False
+    try:
+        while not finished.is_set() or not q.empty():
+            if stop_detected:
+                try:
+                    while not q.empty():
+                        q.get_nowait()
+                except queue.Empty:
+                    pass
+                break
 
+            try:
+                chunk = q.get(timeout=0.1)
+                if hasattr(chunk, "text"):
+                    text = chunk.text
+                else:
+                    text = str(chunk)
+
+                pending_text += text
+                text_to_yield, pending_text, was_truncated = _split_stream_text_for_stop(
+                    pending_text,
+                    stop,
+                )
+                if was_truncated:
+                    stop_detected = True
+                    cancel_generation.set()
+                if not text_to_yield:
+                    continue
+
+                content_chunk = CompletionChunk(
+                    id=request_id,
+                    created=created,
+                    model=model_name,
+                    choices=[
+                        CompletionStreamChoice(
+                            text=text_to_yield,
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield f"data: {content_chunk.model_dump_json()}\n\n"
+            except queue.Empty:
+                continue
+
+        if pending_text and not stop_detected:
             content_chunk = CompletionChunk(
                 id=request_id,
                 created=created,
                 model=model_name,
                 choices=[
                     CompletionStreamChoice(
-                        text=text,
+                        text=pending_text,
                         index=0,
                         finish_reason=None,
                     )
                 ],
             )
             yield f"data: {content_chunk.model_dump_json()}\n\n"
-        except queue.Empty:
-            continue
-
-    thread.join()
+    finally:
+        cancel_generation.set()
+        if thread.is_alive():
+            thread.join(timeout=1.0)
 
     # Send final chunk
     final_chunk = CompletionChunk(
@@ -1335,9 +1747,22 @@ async def _stream_text_completion(
 
 async def _stream_text_completion_with_lease(lease, **kwargs):
     """Hold an inference lease for the lifetime of a streaming response."""
-    async with lease:
-        async for chunk in _stream_text_completion(**kwargs):
-            yield chunk
+    baseline = model_manager.capture_memory_calibration_baseline()
+    try:
+        async with lease:
+            async for chunk in _stream_text_completion(**kwargs):
+                yield chunk
+    finally:
+        model_name = kwargs.get("model_name")
+        if model_name:
+            canonical_model_name, _, _ = resolve_model_alias(model_name)
+            model_manager.calibrate_model_estimate_from_baseline(
+                "llm",
+                canonical_model_name,
+                baseline,
+            )
+        if settings.generation_clear_mlx_cache_after_request:
+            clear_mlx_cache(log=logger, reason="/v1/completions stream")
 
 
 @router.post("/v1/completions", response_model=CompletionResponse)
@@ -1394,7 +1819,28 @@ async def create_completion(request: CompletionRequest):
             },
         )
 
-    lease = await _acquire_model_lease("llm", request.model, "Completion")
+    if request.prompt is not None:
+        prompt = request.prompt if isinstance(request.prompt, str) else request.prompt[0]
+    else:
+        prompt_parts = []
+        for msg in request.messages:
+            role_prefix = f"{msg.role}: " if msg.role != "user" else ""
+            content_str = msg.content if isinstance(msg.content, str) else " ".join(
+                part.text for part in msg.content if isinstance(part, ContentPartText)
+            )
+            prompt_parts.append(f"{role_prefix}{content_str}")
+        prompt = "\n".join(prompt_parts)
+
+    max_tokens = request.max_tokens or 16
+    canonical_request_model, _, _ = resolve_model_alias(request.model)
+    _ensure_generation_worker_kind("llm", request.model)
+    _check_load_and_generation_memory_for_request(
+        "llm",
+        canonical_request_model,
+        _estimate_text_tokens_for_memory(prompt),
+        max_tokens,
+    )
+    lease = await _acquire_model_lease("llm", canonical_request_model, "Completion")
 
     try:
         try:
@@ -1410,24 +1856,20 @@ async def create_completion(request: CompletionRequest):
                     }
                 },
             ) from e
+        except ModelLoadMemoryError as e:
+            raise HTTPException(
+                status_code=503,
+                detail=build_overload_detail(str(e)),
+            ) from e
 
-        # Convert messages to prompt if provided (prompt takes precedence)
-        if request.prompt is not None:
-            # Normalize prompt to string (take first if list)
-            prompt = request.prompt if isinstance(request.prompt, str) else request.prompt[0]
-        else:
-            # Convert messages to a single prompt string
-            prompt_parts = []
-            for msg in request.messages:
-                role_prefix = f"{msg.role}: " if msg.role != "user" else ""
-                content_str = msg.content if isinstance(msg.content, str) else " ".join(
-                    part.text for part in msg.content if isinstance(part, ContentPartText)
-                )
-                prompt_parts.append(f"{role_prefix}{content_str}")
-            prompt = "\n".join(prompt_parts)
-
-        max_tokens = request.max_tokens or 16
         stop = [request.stop] if isinstance(request.stop, str) else request.stop
+        _check_generation_memory_for_request(
+            "llm",
+            canonical_request_model,
+            tokenizer,
+            prompt,
+            max_tokens,
+        )
 
         request_id = f"cmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
@@ -1465,6 +1907,7 @@ async def create_completion(request: CompletionRequest):
             response_text, prompt_tokens, completion_tokens = await _generate_completion(
                 model=model,
                 tokenizer=tokenizer,
+                model_name=request.model,
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=request.temperature,
@@ -1507,6 +1950,9 @@ async def create_completion(request: CompletionRequest):
                 }
             },
         ) from e
+    finally:
+        if settings.generation_clear_mlx_cache_after_request:
+            clear_mlx_cache(log=logger, reason="/v1/completions")
 
 
 # OpenClaw compatibility: add /responses endpoint as alias for chat/completions

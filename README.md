@@ -316,6 +316,14 @@ cache:
   max_reranker_models: 2
   ttl_seconds: 1800
 
+batch:
+  max_batch_size: 32
+  max_embedding_texts: 32
+  rerank_batch_max_documents: 4
+  rerank_batch_max_tokens: 2048
+  max_wait_ms: 50
+  queue_timeout_seconds: 180
+
 logging:
   level: INFO
   format: json
@@ -331,6 +339,10 @@ logging:
 | `MLX_SERVE_LOG_LEVEL` | `INFO` | Log level |
 | `MLX_SERVE_PRELOAD_MODELS` | `` | Comma-separated model names to preload |
 | `MLX_SERVE_AUTO_DOWNLOAD` | `false` | Auto-download missing models |
+| `MLX_SERVE_EMBEDDING_BATCH_MAX_TEXTS` | `32` | Cap total texts merged into one embedding model call |
+| `MLX_SERVE_RERANK_BATCH_MAX_DOCUMENTS` | `4` | Cap documents per rerank micro-batch |
+| `MLX_SERVE_RERANK_BATCH_MAX_TOKENS` | `2048` | Cap padded token budget per rerank micro-batch |
+| `MLX_SERVE_INFERENCE_QUEUE_TIMEOUT_SECONDS` | `180` | Wait longer before rejecting queued model work |
 
 ## Benchmark Results
 

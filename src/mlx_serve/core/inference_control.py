@@ -153,6 +153,14 @@ class InferenceAdmissionController:
             for key, state in items
         }
 
+    def active_keys(self) -> set[str]:
+        """Return inference keys that currently have active leases."""
+        return {
+            key
+            for key, state in self.snapshot().items()
+            if state["active"] > 0
+        }
+
     def reset(self) -> None:
         """Clear tracked states. Intended for tests."""
         with self._states_lock:

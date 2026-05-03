@@ -14,13 +14,16 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from mlx_serve.config import settings
 from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
     build_overload_detail,
     inference_controller,
 )
-from mlx_serve.core.model_manager import model_manager
+from mlx_serve.core.mlx_memory import clear_mlx_cache
+from mlx_serve.core.model_manager import model_manager, resolve_model_alias
+from mlx_serve.core.model_memory import ModelLoadMemoryError
 
 logger = logging.getLogger(__name__)
 
@@ -239,9 +242,12 @@ async def create_image(request: ImageGenerationRequest, http_request: Request):
 
     # Determine output format (default to png)
     output_format = request.output_format or "png"
+    canonical_model_name, _, _ = resolve_model_alias(request.model)
 
     try:
-        lease = await inference_controller.acquire(build_inference_key("image_gen", request.model))
+        lease = await inference_controller.acquire(
+            build_inference_key("image_gen", canonical_model_name)
+        )
     except InferenceOverloadedError as e:
         raise HTTPException(
             status_code=503,
@@ -264,15 +270,28 @@ async def create_image(request: ImageGenerationRequest, http_request: Request):
                     }
                 },
             ) from e
+        except ModelLoadMemoryError as e:
+            raise HTTPException(
+                status_code=503,
+                detail=build_overload_detail(str(e)),
+            ) from e
 
-        image_bytes = await _generate_image(
-            model=model,
-            prompt=request.prompt,
-            width=width,
-            height=height,
-            num_steps=num_steps,
-            output_format=output_format,
-        )
+        baseline = model_manager.capture_memory_calibration_baseline()
+        try:
+            image_bytes = await _generate_image(
+                model=model,
+                prompt=request.prompt,
+                width=width,
+                height=height,
+                num_steps=num_steps,
+                output_format=output_format,
+            )
+        finally:
+            model_manager.calibrate_model_estimate_from_baseline(
+                "image_gen",
+                canonical_model_name,
+                baseline,
+            )
 
         if request.response_format == "url":
             # Save image and return URL with secure random ID
@@ -322,4 +341,6 @@ async def create_image(request: ImageGenerationRequest, http_request: Request):
             },
         ) from e
     finally:
+        if settings.generation_clear_mlx_cache_after_request:
+            clear_mlx_cache(log=logger, reason="/v1/images/generations")
         await lease.release()
