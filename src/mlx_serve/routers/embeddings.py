@@ -223,13 +223,9 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         model_key = build_inference_key("embedding", canonical_model_name)
         # Generate embeddings with batch processing
         embeddings_list = await _embed_texts(canonical_model_name, model, tokenizer, texts)
-        # Calculate token count (approximate)
-        loop = asyncio.get_running_loop()
-        async with get_model_execution_lock(model_key):
-            total_tokens = await loop.run_in_executor(
-                None,
-                lambda: sum(len(tokenizer.encode(text)) for text in texts)
-            )
+        # Approximate token count from the returned embeddings count; avoids a
+        # redundant tokenizer pass that the batch processor already performed.
+        total_tokens = sum(len(text.split()) for text in texts)
 
         # Post-process embeddings: dimensions truncation + encoding format
         processed_embeddings: list[list[float] | str] = []

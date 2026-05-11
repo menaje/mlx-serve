@@ -441,11 +441,17 @@ class RerankBatchProcessor:
         outputs = self.model(tokens)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
 
+        # Extract only the two scalar scores per row before releasing the full logits tensor.
+        # Slicing row-by-row keeps the full [batch, seq_len, vocab_size] logits alive
+        # until the loop ends; collecting scalar pairs first lets us drop it early.
+        row_pairs: list[tuple[mx.array, mx.array]] = [
+            (logits[i, prompt_len - 1, token_true_id], logits[i, prompt_len - 1, token_false_id])
+            for i, prompt_len in enumerate(lengths)
+        ]
+        del tokens, outputs, logits
+
         scores: list[float] = []
-        for row_index, prompt_len in enumerate(lengths):
-            last_logits = logits[row_index, prompt_len - 1, :]
-            true_score = last_logits[token_true_id]
-            false_score = last_logits[token_false_id]
+        for true_score, false_score in row_pairs:
             probs = mx.softmax(mx.stack([false_score, true_score]))
             scores.append(float(probs[1]))
 
