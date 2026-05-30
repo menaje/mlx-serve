@@ -40,12 +40,12 @@ def reset_runtime_state(monkeypatch):
     monkeypatch.delenv(GENERATION_WORKER_KIND_ENV, raising=False)
     monkeypatch.delenv(GENERATION_WORKER_MODEL_ENV, raising=False)
     inference_controller.reset()
-    embeddings_router._batch_processors.clear()
+    embeddings_router.release_embedding_batch_processors()
     prompt_cache_store.clear()
     memory_monitor.reset()
     yield
     inference_controller.reset()
-    embeddings_router._batch_processors.clear()
+    embeddings_router.release_embedding_batch_processors()
     prompt_cache_store.clear()
     memory_monitor.reset()
 

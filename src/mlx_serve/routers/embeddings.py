@@ -20,7 +20,12 @@ from mlx_serve.core.inference_control import (
     raise_if_server_overloaded,
 )
 from mlx_serve.core.mlx_memory import clear_mlx_cache
-from mlx_serve.core.model_manager import model_manager, resolve_model_alias
+from mlx_serve.core.model_manager import (
+    ModelType,
+    model_manager,
+    register_model_unload_hook,
+    resolve_model_alias,
+)
 from mlx_serve.core.model_memory import ModelLoadMemoryError
 
 logger = logging.getLogger(__name__)
@@ -30,6 +35,50 @@ router = APIRouter(tags=["embeddings"])
 # Cache for batch processors per model
 _batch_processors: dict[str, EmbeddingBatchProcessor] = {}
 _batch_processors_lock = threading.Lock()
+
+
+def release_embedding_batch_processors(model_name: str | None = None) -> int:
+    """Stop and remove embedding batch processors for one model, or all models."""
+    if model_name is None:
+        processor_keys: list[str] | None = None
+    else:
+        processor_keys = [build_inference_key("embedding", model_name)]
+
+    with _batch_processors_lock:
+        if processor_keys is None:
+            processors = list(_batch_processors.items())
+            _batch_processors.clear()
+        else:
+            processors = [
+                (key, _batch_processors.pop(key))
+                for key in processor_keys
+                if key in _batch_processors
+            ]
+
+    for _key, processor in processors:
+        close_nowait = getattr(processor, "close_nowait", None)
+        if callable(close_nowait):
+            close_nowait()
+            continue
+        stop_nowait = getattr(processor, "stop_nowait", None)
+        if callable(stop_nowait):
+            stop_nowait()
+
+    if processors:
+        logger.info("Released %s embedding batch processor(s)", len(processors))
+    return len(processors)
+
+
+def _release_processors_for_removed_model(
+    model_type: ModelType,
+    model_name: str,
+    _reason: str,
+) -> None:
+    if model_type == "embedding":
+        release_embedding_batch_processors(model_name)
+
+
+register_model_unload_hook(_release_processors_for_removed_model)
 
 
 def truncate_embedding(embedding: list[float], dimensions: int) -> list[float]:
@@ -152,6 +201,7 @@ async def _embed_texts(
 ) -> list[list[float]]:
     """Route requests through the shared embedding batch processor."""
     processor_key = build_inference_key("embedding", model_name)
+    old_processor: EmbeddingBatchProcessor | None = None
 
     with _batch_processors_lock:
         processor = _batch_processors.get(processor_key)
@@ -160,12 +210,16 @@ async def _embed_texts(
             or processor.model is not model
             or processor.tokenizer is not tokenizer
         ):
+            old_processor = processor
             processor = EmbeddingBatchProcessor(
                 model,
                 tokenizer,
                 execution_lock=get_model_execution_lock(processor_key),
             )
             _batch_processors[processor_key] = processor
+
+    if old_processor is not None:
+        old_processor.close_nowait()
 
     return await processor.embed(texts)
 
@@ -220,7 +274,6 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         ) from e
 
     try:
-        model_key = build_inference_key("embedding", canonical_model_name)
         # Generate embeddings with batch processing
         embeddings_list = await _embed_texts(canonical_model_name, model, tokenizer, texts)
         # Approximate token count from the returned embeddings count; avoids a

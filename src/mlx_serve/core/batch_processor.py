@@ -87,17 +87,48 @@ class BatchProcessor(Generic[T, R]):
 
     async def stop(self) -> None:
         """Stop the batch processing loop."""
-        if not self._running:
+        task = self._task
+        if not self._running and (task is None or task.done()):
             return
 
         self._running = False
-        if self._task:
-            self._task.cancel()
+        if task and not task.done():
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
+        self._task = None
         logger.info("BatchProcessor stopped")
+
+    def stop_nowait(self) -> None:
+        """Request loop shutdown from sync cleanup paths."""
+        task = self._task
+        if not self._running and (task is None or task.done()):
+            return
+
+        self._running = False
+        if task and not task.done():
+            loop = task.get_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(task.cancel)
+            else:
+                task.cancel()
+
+    def close_nowait(self) -> None:
+        """Stop the processor and release queued work/references best-effort."""
+        self.stop_nowait()
+        if self._carry_over is not None and not self._carry_over.future.done():
+            self._carry_over.future.cancel()
+        self._carry_over = None
+        while True:
+            try:
+                request = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not request.future.done():
+                request.future.cancel()
+        self.process_fn = lambda _inputs: []
 
     async def submit(self, data: T) -> R:
         """
@@ -117,7 +148,23 @@ class BatchProcessor(Generic[T, R]):
             self._queue.put_nowait(request)
         except asyncio.QueueFull as exc:
             raise InferenceOverloadedError("Batch queue is full") from exc
-        return await request.future
+
+        # 무한 대기 방지: 배치 추론이 메모리 압박 등으로 멈추면 future가 영영 resolve되지
+        # 않아 호출자가 hang하고 (max_concurrency_per_model 슬롯을 영구 점유해 후속 요청과
+        # /v1/models까지 막힌다). queue_timeout으로 상한을 두고, 초과 시 future를 취소하고
+        # overloaded 에러를 반환한다.
+        timeout = settings.inference_queue_timeout_seconds
+        if timeout is None:
+            return await request.future
+        try:
+            return await asyncio.wait_for(request.future, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            if not request.future.done():
+                request.future.cancel()
+            raise InferenceOverloadedError(
+                f"Batch processing timed out after {timeout:.1f}s "
+                f"(inference stalled, likely memory pressure)"
+            ) from exc
 
     async def _process_loop(self) -> None:
         """Main loop for collecting and processing batches."""
@@ -317,6 +364,16 @@ class EmbeddingBatchProcessor:
     async def stop(self) -> None:
         """Stop the batch processor."""
         await self._processor.stop()
+
+    def stop_nowait(self) -> None:
+        """Request the batch processor to stop without awaiting cancellation."""
+        self._processor.stop_nowait()
+
+    def close_nowait(self) -> None:
+        """Stop processing and break model/tokenizer references."""
+        self._processor.close_nowait()
+        self.model = None
+        self.tokenizer = None
 
 
 class RerankBatchProcessor:

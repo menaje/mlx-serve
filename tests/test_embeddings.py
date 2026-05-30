@@ -266,3 +266,116 @@ def test_embeddings_clear_mlx_cache_after_request(client, mock_embedding_model, 
 
     assert response.status_code == 200
     clear_mock.assert_called_once()
+
+
+def test_unload_embedding_model_releases_batch_processor(monkeypatch):
+    """Unloading an embedding model should stop its shared batch processor."""
+    from mlx_serve.core.inference_control import build_inference_key
+    from mlx_serve.core.model_manager import model_manager
+    from mlx_serve.routers import embeddings as embeddings_router
+
+    class FakeProcessor:
+        def __init__(self):
+            self.stopped = False
+            self.closed = False
+
+        def stop_nowait(self):
+            self.stopped = True
+
+        def close_nowait(self):
+            self.closed = True
+
+    processor = FakeProcessor()
+    processor_key = build_inference_key("embedding", "embed-loaded")
+    embeddings_router._batch_processors[processor_key] = processor
+    model_manager._embedding_cache.set("embed-loaded", object())
+    monkeypatch.setattr("mlx_serve.core.model_manager.clear_mlx_cache", lambda **kwargs: True)
+
+    unloaded = model_manager.unload_model("embed-loaded", "embedding")
+
+    assert unloaded == [{"name": "embed-loaded", "type": "embedding"}]
+    assert processor.closed is True
+    assert processor_key not in embeddings_router._batch_processors
+
+
+def test_expired_embedding_cache_access_releases_batch_processor(monkeypatch):
+    """Expired embedding cache entries should run unload hooks before reload."""
+    import time
+
+    from mlx_serve.config import settings
+    from mlx_serve.core.inference_control import build_inference_key
+    from mlx_serve.core.model_manager import model_manager
+    from mlx_serve.routers import embeddings as embeddings_router
+
+    class FakeProcessor:
+        def __init__(self):
+            self.closed = False
+
+        def close_nowait(self):
+            self.closed = True
+
+    processor = FakeProcessor()
+    processor_key = build_inference_key("embedding", "embed-expired")
+    embeddings_router._batch_processors[processor_key] = processor
+    model_manager._embedding_cache.set("embed-expired", object())
+    model_manager._embedding_cache._timestamps["embed-expired"] = (
+        time.time() - settings.cache_ttl_seconds - 1
+    )
+    monkeypatch.setattr("mlx_serve.core.model_manager.clear_mlx_cache", lambda **kwargs: True)
+
+    expired = model_manager._cleanup_expired_cache(
+        "embedding",
+        model_manager._embedding_cache,
+        "test expired embedding",
+    )
+
+    assert expired == ["embed-expired"]
+    assert processor.closed is True
+    assert processor_key not in embeddings_router._batch_processors
+
+
+@pytest.mark.asyncio
+async def test_embed_texts_stops_stale_processor(monkeypatch):
+    """Replacing a model-backed embedding processor should stop the old task."""
+    from mlx_serve.core.inference_control import build_inference_key
+    from mlx_serve.routers import embeddings as embeddings_router
+
+    old_model = object()
+    old_tokenizer = object()
+    new_model = object()
+    new_tokenizer = object()
+
+    class OldProcessor:
+        model = old_model
+        tokenizer = old_tokenizer
+
+        def __init__(self):
+            self.closed = False
+
+        def close_nowait(self):
+            self.closed = True
+
+    class NewProcessor:
+        def __init__(self, model, tokenizer, execution_lock=None):
+            self.model = model
+            self.tokenizer = tokenizer
+            self.execution_lock = execution_lock
+
+        async def embed(self, texts):
+            return [[1.0] for _ in texts]
+
+    old_processor = OldProcessor()
+    processor_key = build_inference_key("embedding", "embed-loaded")
+    embeddings_router._batch_processors[processor_key] = old_processor
+    monkeypatch.setattr(embeddings_router, "EmbeddingBatchProcessor", NewProcessor)
+
+    result = await embeddings_router._embed_texts(
+        "embed-loaded",
+        new_model,
+        new_tokenizer,
+        ["text"],
+    )
+
+    assert result == [[1.0]]
+    assert old_processor.closed is True
+    assert embeddings_router._batch_processors[processor_key].model is new_model

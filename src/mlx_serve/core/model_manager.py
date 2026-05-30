@@ -6,6 +6,7 @@ import logging
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,17 @@ from mlx_serve.core.system_guard import collect_memory_snapshot
 logger = logging.getLogger(__name__)
 
 ModelType = Literal["embedding", "reranker", "llm", "vlm", "tts", "stt", "image_gen"]
+ModelUnloadHook = Callable[[ModelType, str, str], None]
+
+_model_unload_hooks: list[ModelUnloadHook] = []
+_model_unload_hooks_lock = threading.Lock()
+
+
+def register_model_unload_hook(hook: ModelUnloadHook) -> None:
+    """Register a callback fired when a cached model is removed."""
+    with _model_unload_hooks_lock:
+        if hook not in _model_unload_hooks:
+            _model_unload_hooks.append(hook)
 
 # Model aliases for short names
 MODEL_ALIASES: dict[str, tuple[str, ModelType]] = {
@@ -128,12 +140,15 @@ class TTLLRUCache:
             self._timestamps[key] = time.time()
             return self._cache[key]
 
-    def set(self, key: str, value: Any) -> None:
-        """Set item in cache with current timestamp."""
+    def set(self, key: str, value: Any) -> list[str]:
+        """Set item in cache and return keys evicted by maxsize pressure."""
         with self._lock:
+            before_keys = list(self._cache.keys())
             self._cache[key] = value
             self._timestamps[key] = time.time()
             self._prune_timestamps()
+            after_keys = set(self._cache.keys())
+            return [evicted_key for evicted_key in before_keys if evicted_key not in after_keys]
 
     def remove(self, key: str) -> bool:
         """Remove item from cache."""
@@ -285,11 +300,11 @@ class ModelManager:
                     ("image_gen", self._image_gen_cache),
                 ]
                 for cache_name, cache in caches:
-                    expired = cache.cleanup_expired()
-                    if expired:
-                        logger.info(f"Cleaned up expired {cache_name} models: {expired}")
-                        gc.collect()
-                        clear_mlx_cache(log=logger, reason=f"expired {cache_name} cleanup")
+                    self._cleanup_expired_cache(
+                        cache_name,
+                        cache,
+                        f"expired {cache_name} cleanup",
+                    )
 
         thread = threading.Thread(target=cleanup_loop, daemon=True)
         thread.start()
@@ -362,6 +377,90 @@ class ModelManager:
         """Remove a cached model memory estimate."""
         self._model_estimated_weight_bytes.pop(self._estimate_key(model_type, model_name), None)
 
+    def _notify_cached_model_removed(
+        self,
+        model_type: ModelType,
+        model_name: str,
+        reason: str,
+        *,
+        record_eviction: bool = False,
+    ) -> None:
+        """Run cleanup side effects for a model removed from a cache."""
+        self._forget_model_estimate(model_type, model_name)
+        if record_eviction:
+            try:
+                from mlx_serve.core.metrics import record_cache_eviction
+
+                record_cache_eviction(model_type)
+            except Exception:
+                pass
+
+        with _model_unload_hooks_lock:
+            hooks = list(_model_unload_hooks)
+
+        for hook in hooks:
+            try:
+                hook(model_type, model_name, reason)
+            except Exception:
+                logger.warning(
+                    "Model unload hook failed for %s model '%s' (%s)",
+                    model_type,
+                    model_name,
+                    reason,
+                    exc_info=True,
+                )
+
+    def _cache_loaded_model(
+        self,
+        model_type: ModelType,
+        model_name: str,
+        cache: TTLLRUCache,
+        value: Any,
+    ) -> None:
+        """Store a loaded model and clean up entries evicted by LRU pressure."""
+        evicted = cache.set(model_name, value)
+        if not evicted:
+            return
+
+        for evicted_name in evicted:
+            logger.info(
+                "Evicted LRU %s model '%s' while loading '%s'",
+                model_type,
+                evicted_name,
+                model_name,
+            )
+            self._notify_cached_model_removed(
+                model_type,
+                evicted_name,
+                f"lru {model_type} cache",
+                record_eviction=True,
+            )
+        gc.collect()
+        clear_mlx_cache(log=logger, reason=f"lru {model_type} cache")
+
+    def _cleanup_expired_cache(
+        self,
+        model_type: ModelType,
+        cache: TTLLRUCache,
+        reason: str,
+    ) -> list[str]:
+        """Remove expired models with the same cleanup hooks as explicit unload."""
+        expired = cache.cleanup_expired()
+        if not expired:
+            return []
+
+        for model_name in expired:
+            self._notify_cached_model_removed(
+                model_type,
+                model_name,
+                reason,
+                record_eviction=True,
+            )
+        logger.info("Cleaned up expired %s models: %s", model_type, expired)
+        gc.collect()
+        clear_mlx_cache(log=logger, reason=reason)
+        return expired
+
     def _cached_estimated_weight_bytes(self, model_type: ModelType, model_name: str) -> int:
         """Return a stored estimate, falling back to install metadata."""
         estimate = self._model_estimated_weight_bytes.get(
@@ -399,13 +498,12 @@ class ModelManager:
         """Evict one idle model and clear runtime cache."""
         if not cache.remove(model_name):
             return False
-        self._forget_model_estimate(model_type, model_name)
-        try:
-            from mlx_serve.core.metrics import record_cache_eviction
-
-            record_cache_eviction(model_type)
-        except Exception:
-            pass
+        self._notify_cached_model_removed(
+            model_type,
+            model_name,
+            reason,
+            record_eviction=True,
+        )
         logger.info("Evicted idle %s model '%s' for %s", model_type, model_name, reason)
         gc.collect()
         clear_mlx_cache(log=logger, reason=f"evict idle {model_type} {model_name}")
@@ -963,15 +1061,15 @@ class ModelManager:
         model_dir = self._get_model_dir(model_name)
 
         # Remove from all caches
-        self._embedding_cache.remove(model_name)
-        self._reranker_cache.remove(model_name)
-        self._llm_cache.remove(model_name)
-        self._vlm_cache.remove(model_name)
-        self._tts_cache.remove(model_name)
-        self._stt_cache.remove(model_name)
-        self._image_gen_cache.remove(model_name)
-        for model_type in self._cache_map():
-            self._forget_model_estimate(model_type, model_name)
+        for model_type, cache in self._cache_map().items():
+            if cache.remove(model_name):
+                self._notify_cached_model_removed(
+                    model_type,
+                    model_name,
+                    f"delete model {model_name}",
+                )
+            else:
+                self._forget_model_estimate(model_type, model_name)
 
         # Remove from metadata
         if model_name in self._metadata:
@@ -1009,7 +1107,11 @@ class ModelManager:
                     f"Model '{resolved_name}' is active and cannot be unloaded"
                 )
             if cache.remove(resolved_name):
-                self._forget_model_estimate(target_type, resolved_name)
+                self._notify_cached_model_removed(
+                    target_type,
+                    resolved_name,
+                    f"unload model {resolved_name}",
+                )
                 unloaded.append({"name": resolved_name, "type": target_type})
 
         if unloaded:
@@ -1042,7 +1144,11 @@ class ModelManager:
                     skipped_active.append({"name": key, "type": target_type})
                     continue
                 if cache.remove(key):
-                    self._forget_model_estimate(target_type, key)
+                    self._notify_cached_model_removed(
+                        target_type,
+                        key,
+                        "unload all models",
+                    )
                     unloaded.append({"name": key, "type": target_type})
 
         if unloaded:
@@ -1066,6 +1172,11 @@ class ModelManager:
         # Resolve alias
         resolved_name, hf_repo, _ = resolve_model_alias(model_name)
 
+        self._cleanup_expired_cache(
+            "embedding",
+            self._embedding_cache,
+            "expired embedding cache access",
+        )
         cached = self._embedding_cache.get(resolved_name)
         if cached is not None:
             logger.debug(f"Embedding model cache hit: {resolved_name}")
@@ -1100,7 +1211,12 @@ class ModelManager:
             from mlx_embeddings import load
 
             model, tokenizer = load(str(model_dir))
-            self._embedding_cache.set(resolved_name, (model, tokenizer))
+            self._cache_loaded_model(
+                "embedding",
+                resolved_name,
+                self._embedding_cache,
+                (model, tokenizer),
+            )
             self._calibrate_loaded_model_estimate(
                 "embedding",
                 resolved_name,
@@ -1117,6 +1233,11 @@ class ModelManager:
         # Resolve alias
         resolved_name, hf_repo, _ = resolve_model_alias(model_name)
 
+        self._cleanup_expired_cache(
+            "reranker",
+            self._reranker_cache,
+            "expired reranker cache access",
+        )
         cached = self._reranker_cache.get(resolved_name)
         if cached is not None:
             logger.debug(f"Reranker model cache hit: {resolved_name}")
@@ -1151,7 +1272,12 @@ class ModelManager:
             from mlx_lm import load
 
             model, tokenizer = load(str(model_dir))
-            self._reranker_cache.set(resolved_name, (model, tokenizer))
+            self._cache_loaded_model(
+                "reranker",
+                resolved_name,
+                self._reranker_cache,
+                (model, tokenizer),
+            )
             self._calibrate_loaded_model_estimate(
                 "reranker",
                 resolved_name,
@@ -1167,6 +1293,7 @@ class ModelManager:
         """
         resolved_name, hf_repo, _ = resolve_model_alias(model_name)
 
+        self._cleanup_expired_cache("llm", self._llm_cache, "expired llm cache access")
         cached = self._llm_cache.get(resolved_name)
         if cached is not None:
             logger.debug(f"LLM model cache hit: {resolved_name}")
@@ -1199,7 +1326,12 @@ class ModelManager:
             from mlx_lm import load
 
             model, tokenizer = load(str(model_dir))
-            self._llm_cache.set(resolved_name, (model, tokenizer))
+            self._cache_loaded_model(
+                "llm",
+                resolved_name,
+                self._llm_cache,
+                (model, tokenizer),
+            )
             self._calibrate_loaded_model_estimate(
                 "llm",
                 resolved_name,
@@ -1215,6 +1347,7 @@ class ModelManager:
         """
         resolved_name, hf_repo, _ = resolve_model_alias(model_name)
 
+        self._cleanup_expired_cache("vlm", self._vlm_cache, "expired vlm cache access")
         cached = self._vlm_cache.get(resolved_name)
         if cached is not None:
             logger.debug(f"VLM model cache hit: {resolved_name}")
@@ -1247,7 +1380,12 @@ class ModelManager:
             from mlx_vlm import load
 
             model, processor = load(str(model_dir))
-            self._vlm_cache.set(resolved_name, (model, processor))
+            self._cache_loaded_model(
+                "vlm",
+                resolved_name,
+                self._vlm_cache,
+                (model, processor),
+            )
             self._calibrate_loaded_model_estimate(
                 "vlm",
                 resolved_name,
@@ -1263,6 +1401,7 @@ class ModelManager:
         """
         resolved_name, hf_repo, _ = resolve_model_alias(model_name)
 
+        self._cleanup_expired_cache("tts", self._tts_cache, "expired tts cache access")
         cached = self._tts_cache.get(resolved_name)
         if cached is not None:
             logger.debug(f"TTS model cache hit: {resolved_name}")
@@ -1295,7 +1434,7 @@ class ModelManager:
             from mlx_audio.tts import load
 
             model = load(str(model_dir))
-            self._tts_cache.set(resolved_name, model)
+            self._cache_loaded_model("tts", resolved_name, self._tts_cache, model)
             self._calibrate_loaded_model_estimate(
                 "tts",
                 resolved_name,
@@ -1311,6 +1450,7 @@ class ModelManager:
         """
         resolved_name, hf_repo, _ = resolve_model_alias(model_name)
 
+        self._cleanup_expired_cache("stt", self._stt_cache, "expired stt cache access")
         cached = self._stt_cache.get(resolved_name)
         if cached is not None:
             logger.debug(f"STT model cache hit: {resolved_name}")
@@ -1343,7 +1483,7 @@ class ModelManager:
             from mlx_audio.stt import load
 
             model = load(str(model_dir))
-            self._stt_cache.set(resolved_name, model)
+            self._cache_loaded_model("stt", resolved_name, self._stt_cache, model)
             self._calibrate_loaded_model_estimate(
                 "stt",
                 resolved_name,
@@ -1359,6 +1499,11 @@ class ModelManager:
         """
         resolved_name, hf_repo, _ = resolve_model_alias(model_name)
 
+        self._cleanup_expired_cache(
+            "image_gen",
+            self._image_gen_cache,
+            "expired image_gen cache access",
+        )
         cached = self._image_gen_cache.get(resolved_name)
         if cached is not None:
             logger.debug(f"Image gen model cache hit: {resolved_name}")
@@ -1394,7 +1539,12 @@ class ModelManager:
             else:
                 model = Flux1.from_alias("flux1-dev")
 
-            self._image_gen_cache.set(resolved_name, model)
+            self._cache_loaded_model(
+                "image_gen",
+                resolved_name,
+                self._image_gen_cache,
+                model,
+            )
             self._calibrate_loaded_model_estimate(
                 "image_gen",
                 resolved_name,
