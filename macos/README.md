@@ -50,9 +50,13 @@ Run `./macos/build-app.sh` on Apple Silicon with Xcode command-line tools and
 network access. It fetches a checksum-verified portable Python runtime, installs
 the versions in `requirements-runtime.txt`, packages the current source, and
 creates `macos/.build/MLX Serve.app`. The resulting bundle uses an ad-hoc
-signature and is **not notarized**. Developer ID signing, notarization, DMG
-distribution, and verification on a separate Mac without developer tools still
-require a release environment and credentials.
+signature and is **not notarized**. Developer ID signing, notarization, a
+distributable DMG, and verification on a separate Mac without developer tools
+still require a release environment and credentials.
+
+`./macos/package-dmg.sh` packages an already built app into
+`macos/.build/MLX-Serve-experimental.dmg` for local testing. This image contains
+the same ad-hoc-signed app and is not a notarized distribution.
 
 See [VALIDATION.md](VALIDATION.md) for the tested flows and known gaps.
 

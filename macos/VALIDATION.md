@@ -75,6 +75,9 @@ criteria of issue #12.
   changed targets and active preparation, and simulated move and deletion failures.
   The final bundled runtime also cleaned a disposable source directory and left
   a referenced directory intact in an isolated temporary fixture.
+- A compressed experimental DMG was created and mounted read-only on this Mac;
+  it contained the bundled runtime, an Applications link and an app whose ad-hoc
+  signature still verified. This did not test installation or Gatekeeper.
 
 ## Remaining validation and limitations
 
@@ -87,8 +90,8 @@ criteria of issue #12.
   external storage, signed installer updates, and the minimum macOS 26
   deployment target have not been tested end to end.
 - The bundle has an ad-hoc signature only. Developer ID signing, notarization,
-  DMG distribution, and installation on a separate Mac without development
-  tools remain unverified.
+  distribution of a release DMG, and installation on a separate Mac without
+  development tools remain unverified.
 - Model storage migration, general Hugging Face cache cleanup, and background
   server ownership remain unimplemented. Defaults are limited to decision,
   embedding and reranker models. See `README.md` for the supported model scope.
