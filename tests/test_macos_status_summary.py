@@ -41,8 +41,12 @@ import Foundation
         let absent = MemoryStatusSummary(server: [:])
         precondition(absent.systemText == "시스템 메모리 확인 불가")
         precondition(absent.gatewayText == "게이트웨이 프로세스 RSS 확인 불가")
-        let json = #"{"health":{"memory":{"snapshot":{"system_available_bytes":4096,"system_total_bytes":8192,"process_rss_bytes":2048}}}}"#
-        let server = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+        let input: [String: Any] = ["health": ["memory": ["snapshot": [
+            "system_available_bytes": 4096, "system_total_bytes": 8192,
+            "process_rss_bytes": 2048
+        ]]]]
+        let data = try JSONSerialization.data(withJSONObject: input)
+        let server = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         let memory = MemoryStatusSummary(server: server)
         precondition(memory.systemAvailableBytes == 4096 && memory.systemTotalBytes == 8192)
         precondition(memory.gatewayRSSBytes == 2048)
