@@ -59,18 +59,21 @@ async def _generate_speech(
     loop = asyncio.get_running_loop()
 
     def _synthesize():
-        from mlx_audio.tts import generate
+        import numpy as np
 
-        # Generate audio
-        audio = generate(
-            model,
-            text,
-            voice=voice,
-            speed=speed,
-        )
-        return audio
+        chunks = []
+        sample_rate = None
+        for result in model.generate(text=text, voice=voice, speed=speed):
+            current_rate = result.sample_rate
+            if sample_rate is not None and sample_rate != current_rate:
+                raise ValueError("Generated speech segments have different sample rates")
+            sample_rate = current_rate
+            chunks.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
+        if not chunks:
+            raise ValueError("The speech model returned no audio")
+        return np.concatenate(chunks), sample_rate
 
-    audio_array = await loop.run_in_executor(None, _synthesize)
+    audio_array, sample_rate = await loop.run_in_executor(None, _synthesize)
 
     # Convert to requested format
     def _encode():
@@ -110,10 +113,10 @@ async def _generate_speech(
         sf_format = format_map.get(response_format, "WAV")
 
         try:
-            sf.write(buffer, audio_np, samplerate=24000, format=sf_format)
+            sf.write(buffer, audio_np, samplerate=sample_rate, format=sf_format)
         except Exception:
             # Fallback to WAV
-            sf.write(buffer, audio_np, samplerate=24000, format="WAV")
+            sf.write(buffer, audio_np, samplerate=sample_rate, format="WAV")
 
         buffer.seek(0)
         return buffer.read()
@@ -241,25 +244,31 @@ async def _transcribe_audio(
     loop = asyncio.get_running_loop()
 
     def _transcribe():
-        from mlx_audio.stt import transcribe
-
         # Determine if word-level timestamps are requested
         word_timestamps = (
             timestamp_granularities is not None and "word" in timestamp_granularities
         )
 
-        result = transcribe(
-            model,
+        result = model.generate(
             audio_path,
             language=language,
             word_timestamps=word_timestamps,
         )
+        if hasattr(result, "text"):
+            return {
+                "text": result.text,
+                "segments": getattr(result, "segments", None),
+                "language": getattr(result, "language", None),
+            }
         return result
 
     return await loop.run_in_executor(None, _transcribe)
 
 
-@router.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
+@router.post(
+    "/v1/audio/transcriptions",
+    response_model=TranscriptionVerboseResponse | TranscriptionResponse,
+)
 async def create_transcription(
     file: UploadFile = File(..., description="Audio file to transcribe"),
     model: str = Form(default="whisper-large-v3-turbo", description="STT model to use"),
@@ -357,7 +366,9 @@ async def create_transcription(
         if response_format == "verbose_json":
             return TranscriptionVerboseResponse(
                 task="transcribe",
-                language=language or "unknown",
+                language=(result.get("language") if isinstance(result, dict) else None)
+                or language
+                or "unknown",
                 duration=0.0,  # TODO: calculate from audio
                 text=text,
                 segments=result.get("segments") if isinstance(result, dict) else None,

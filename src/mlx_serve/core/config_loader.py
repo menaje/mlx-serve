@@ -31,6 +31,7 @@ def build_default_config_dict(settings_obj: Any | None = None) -> dict[str, Any]
         "cache": {
             "max_embedding_models": settings_obj.cache_max_embedding_models,
             "max_reranker_models": settings_obj.cache_max_reranker_models,
+            "max_decision_models": settings_obj.cache_max_decision_models,
             "max_llm_models": settings_obj.cache_max_llm_models,
             "max_vlm_models": settings_obj.cache_max_vlm_models,
             "max_tts_models": settings_obj.cache_max_tts_models,
@@ -47,6 +48,14 @@ def build_default_config_dict(settings_obj: Any | None = None) -> dict[str, Any]
             "max_concurrency_per_model": settings_obj.inference_max_concurrency_per_model,
             "max_queue_per_model": settings_obj.inference_max_queue_per_model,
             "queue_timeout_seconds": settings_obj.inference_queue_timeout_seconds,
+        },
+        "decision": {
+            "max_input_tokens": settings_obj.decision_max_input_tokens,
+            "execution_timeout_seconds": settings_obj.decision_execution_timeout_seconds,
+            "prepare_timeout_seconds": settings_obj.decision_prepare_timeout_seconds,
+            "prepare_max_memory_bytes": settings_obj.decision_prepare_max_memory_bytes,
+            "prepare_max_disk_bytes": settings_obj.decision_prepare_max_disk_bytes,
+            "prepare_python": settings_obj.decision_prepare_python,
         },
         "metrics": {
             "enabled": settings_obj.metrics_enabled,
@@ -198,6 +207,13 @@ def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         # cache section
         ("cache", "max_embedding_models"): "cache_max_embedding_models",
         ("cache", "max_reranker_models"): "cache_max_reranker_models",
+        ("cache", "max_decision_models"): "cache_max_decision_models",
+        ("decision", "max_input_tokens"): "decision_max_input_tokens",
+        ("decision", "execution_timeout_seconds"): "decision_execution_timeout_seconds",
+        ("decision", "prepare_timeout_seconds"): "decision_prepare_timeout_seconds",
+        ("decision", "prepare_max_memory_bytes"): "decision_prepare_max_memory_bytes",
+        ("decision", "prepare_max_disk_bytes"): "decision_prepare_max_disk_bytes",
+        ("decision", "prepare_python"): "decision_prepare_python",
         ("cache", "ttl_seconds"): "cache_ttl_seconds",
         # batch section
         ("batch", "max_batch_size"): "batch_max_size",
@@ -329,7 +345,16 @@ models:
 cache:
   max_embedding_models: 3
   max_reranker_models: 2
+  max_decision_models: 1
   ttl_seconds: 1800
+
+decision:
+  max_input_tokens: 4096
+  execution_timeout_seconds: 120
+  prepare_timeout_seconds: 3600
+  prepare_max_memory_bytes: 10737418240
+  prepare_max_disk_bytes: 8589934592
+  prepare_python: null
 
 batch:
   max_batch_size: 32

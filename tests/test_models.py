@@ -369,23 +369,19 @@ def test_image_gen_remote_alias_uses_configured_memory_estimate(
     monkeypatch,
 ):
     """mflux alias loads should run load admission with configured remote estimates."""
-    import sys
-    import types
-
     from mlx_serve.config import settings
     from mlx_serve.core.model_manager import model_manager
 
     class FakeFlux:
-        @staticmethod
-        def from_alias(alias):
-            return {"alias": alias}
+        def __new__(cls, model_config, model_path):
+            return {"alias": model_config.model_name, "path": model_path}
 
     calls = []
 
     def fake_ensure(model_type, model_name, model_dir=None, estimated_weight_bytes=None):
         calls.append((model_type, model_name, model_dir, estimated_weight_bytes))
 
-    monkeypatch.setitem(sys.modules, "mflux", types.SimpleNamespace(Flux1=FakeFlux))
+    monkeypatch.setattr("mflux.models.flux.variants.txt2img.flux.Flux1", FakeFlux)
     monkeypatch.setattr(settings, "models_dir", tmp_path)
     monkeypatch.setattr(
         settings,
@@ -398,7 +394,7 @@ def test_image_gen_remote_alias_uses_configured_memory_estimate(
     model_manager.unload_all()
     model = model_manager.get_image_gen_model("flux-schnell")
 
-    assert model == {"alias": "flux1-schnell"}
+    assert model == {"alias": "black-forest-labs/FLUX.1-schnell", "path": None}
     assert calls == [("image_gen", "FLUX.1-schnell", None, 321)]
 
 
@@ -407,18 +403,15 @@ def test_image_gen_remote_alias_calibrates_estimate_from_observed_rss(
     monkeypatch,
 ):
     """Remote model estimates should be raised from observed load-time deltas."""
-    import sys
     import time
-    import types
 
     from mlx_serve.config import settings
     from mlx_serve.core.model_manager import model_manager
     from mlx_serve.core.system_guard import MemorySnapshot
 
     class FakeFlux:
-        @staticmethod
-        def from_alias(alias):
-            return {"alias": alias}
+        def __new__(cls, model_config, model_path):
+            return {"alias": model_config.model_name, "path": model_path}
 
     snapshots = iter(
         [
@@ -437,7 +430,7 @@ def test_image_gen_remote_alias_calibrates_estimate_from_observed_rss(
         ]
     )
 
-    monkeypatch.setitem(sys.modules, "mflux", types.SimpleNamespace(Flux1=FakeFlux))
+    monkeypatch.setattr("mflux.models.flux.variants.txt2img.flux.Flux1", FakeFlux)
     monkeypatch.setattr(settings, "models_dir", tmp_path)
     monkeypatch.setattr(
         settings,

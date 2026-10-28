@@ -7,6 +7,8 @@ MLX-based multimodal AI server with OpenAI-compatible API for Apple Silicon.
 - **OpenAI-compatible Chat API** (`/v1/chat/completions`) - LLM and VLM support
 - **OpenAI-compatible Embeddings API** (`/v1/embeddings`)
 - **Jina-compatible Reranking API** (`/v1/rerank`)
+- **Text decisions** (`/v1/decisions`) with d1-omni, and Ollama-compatible
+  `/v1/systemone` with d3-lite
 - **Token counting API** (`/v1/tokenize`)
 - **Ollama-compatible Model Management** (`/api/pull`, `/api/tags`, etc.)
 - **Native Metal acceleration** on Apple Silicon
@@ -24,7 +26,7 @@ MLX-based multimodal AI server with OpenAI-compatible API for Apple Silicon.
 ## Requirements
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
-- Python 3.10+
+- Python 3.11+
 
 ## Installation
 
@@ -66,7 +68,36 @@ mlx-serve pull Qwen/Qwen3-Embedding-0.6B --type embedding
 
 # Download a reranker model
 mlx-serve pull Qwen/Qwen3-Reranker-0.6B --type reranker
+
+# Import an Ollama MLX decision model already installed locally
+mlx-serve import-ollama d3-lite:0.8b-mlx-bf16
+
+# Or download the original decision checkpoint from Hugging Face
+mlx-serve pull vllm-sr/d3-lite --type decision
+
+# Download and convert the original d1 model to MLX FP16, then validate it
+mlx-serve pull LiquidAI/d1-omni-600M --type decision
+
+# Alternatively verify and install Liquid AI's already-converted FP16 model
+mlx-serve pull LiquidAI/d1-omni-600M-MLX-fp16 --type decision
+
+# Pin the source to a branch, tag, or commit
+mlx-serve pull LiquidAI/d1-omni-600M --type decision --revision <revision>
+
+# Install a separate named copy and retain the original source files
+mlx-serve pull LiquidAI/d1-omni-600M --type decision --name d1-with-source --keep-original
 ```
+
+Importing from Ollama uses hard links when the model directories are on the
+same filesystem and copies the files otherwise. The imported model remains
+available if the Ollama model is removed. The default model name is `d3-lite`;
+use `--name` to select another name.
+
+For decision models, a local name matching an alias for the same source is
+stored under its canonical name (for example, `d1-omni` becomes
+`d1-omni-600M`). An alias reserved for a different model cannot be used as a
+local name; choose a distinct name instead. The CLI and `/api/pull` report the
+canonical name on success.
 
 ### 2. Start the server
 
@@ -149,6 +180,96 @@ curl http://localhost:8000/v1/rerank \
   }'
 ```
 
+#### Text decisions
+
+The d1 profile uses the original Hugging Face model, resolves its revision to a
+commit, and prepares an FP16 MLX artifact in a separate process with the
+official `mlx-vlm` converter. It loads both the original and the converted
+model and checks their official predictions before publishing the result. The
+already-converted official FP16 repository skips conversion and is still
+checked and loaded before publication. Unsupported decision architectures and
+quantization requests fail explicitly. A validated installation is reused for
+the same repository and revision. The model's directory contains
+`mlx_serve_decision_manifest.json` with file hashes, the source revision,
+converter version and options, validation results, license, precision and
+input limit. The decision preparation path never deletes the shared Hugging
+Face cache. Pass `--keep-original` (or `keep_original: true` to `/api/pull`) on
+the first source installation to retain a separate original copy under
+`~/.mlx-serve/decision-originals`; otherwise the temporary source is removed
+after verification. To retain a source that was not originally kept, install
+under another local name using `--name`.
+
+The CLI, `POST /api/pull`, and automatic downloads share this preparation path.
+The API request accepts `name`, `type: "decision"`, an optional `revision`,
+and an optional local `model_name`;
+its newline-delimited events distinguish `resolving`, `downloading`, `checking`,
+`converting`, `validating`, `success`, and `error`. Decision preparation uses
+`mlx-vlm==0.7.10`. The default conversion process uses the server's Python;
+set `MLX_SERVE_DECISION_PREPARE_PYTHON` to a separate Python executable with a
+compatible installation to isolate its dependencies. Time, process RSS and
+temporary disk limits can be adjusted through
+`MLX_SERVE_DECISION_PREPARE_TIMEOUT_SECONDS`,
+`MLX_SERVE_DECISION_PREPARE_MAX_MEMORY_BYTES`, and
+`MLX_SERVE_DECISION_PREPARE_MAX_DISK_BYTES`. RSS is a process measurement and
+does not separately account for all system or GPU allocations.
+
+```bash
+curl http://localhost:8000/v1/decisions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "d1-omni",
+    "state": {"message": "The customer was charged twice and wants a refund."},
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {"billing": "Payments and refunds", "technical": "Software errors"}
+      },
+      "refund": {"type": "bool", "instructions": "Is a refund requested?"},
+      "urgency": {"type": "score", "instructions": "How urgent is this?",
+                  "criteria": ["routine", "soon", "urgent"]}
+    }
+  }'
+```
+
+`choice` returns the selected option ID and each option's probability. `bool`
+(also accepted as `noul`) returns a Boolean and the probability of true.
+`score` returns the probability distribution, its expected numeric level, and
+the level definitions. The response includes the installed model name, source
+revision, and input/output token usage; output tokens are zero for this
+non-generative inference. Requests accept text or JSON state, 1–64 questions,
+2–255 choices, and 2–10 score levels. Image and video inputs are not supported.
+Inputs that would be truncated by the d1 tokenizer are rejected with HTTP 422.
+The default per-question limit is 4,096 tokens, adjustable with
+`MLX_SERVE_DECISION_MAX_INPUT_TOKENS` up to the model's own limit. Requests
+that exceed `MLX_SERVE_DECISION_EXECUTION_TIMEOUT_SECONDS` return HTTP 504;
+the model stays reserved until the running operation actually finishes.
+
+The existing Ollama-compatible endpoint also remains available:
+
+```bash
+curl http://localhost:8000/v1/systemone \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "d3-lite",
+    "state": "The customer was charged twice and asks for a refund.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {"billing": "Payments and refunds", "technical": "Software errors"}
+      },
+      "refund": {"type": "noul", "instructions": "Is a refund requested?"}
+    }
+  }'
+```
+
+The endpoint supports `choice`, `noul` (a probability from 0 to 1), and
+`score` questions. Each question runs separately against the same state. It
+currently accepts text/JSON state only; image and video inputs are not yet
+supported. The default maximum input is 4,096 tokens per question and can be
+changed with `MLX_SERVE_DECISION_MAX_INPUT_TOKENS`, up to the model's own limit.
+
 ## CLI Commands
 
 ### Server Management
@@ -165,8 +286,11 @@ mlx-serve stop --all
 
 ```bash
 # Pull models from Hugging Face
-mlx-serve pull <model> --type <llm|vlm|embedding|reranker>
+mlx-serve pull <model> --type <llm|vlm|embedding|reranker|decision>
 mlx-serve pull <model> --type llm --quantize 4  # With 4-bit quantization
+
+# Import an installed Ollama MLX decision model
+mlx-serve import-ollama d3-lite:0.8b-mlx-bf16 [--name d3-lite]
 
 # List installed models
 mlx-serve list

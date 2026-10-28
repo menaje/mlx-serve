@@ -92,6 +92,7 @@ def test_supervisor_start_cleans_orphans_before_spawning(monkeypatch):
     assert worker_urls == {
         "embedding": "http://127.0.0.1:9000",
         "reranker": "http://127.0.0.1:9000",
+        "decision": "http://127.0.0.1:9000",
     }
 
 

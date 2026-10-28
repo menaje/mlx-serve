@@ -18,6 +18,7 @@ from mlx_serve.core.runtime_topology import RetrievalWorkerKind
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["retrieval"])
+_DEFAULT_TIMEOUT = object()
 
 
 @dataclass
@@ -34,8 +35,12 @@ def perform_worker_request(
     method: str,
     body: bytes,
     headers: dict[str, str],
+    *,
+    timeout: float | None | object = _DEFAULT_TIMEOUT,
 ) -> WorkerProxyResponse:
     """Perform a blocking HTTP request against an internal worker."""
+    if timeout is _DEFAULT_TIMEOUT:
+        timeout = settings.inference_queue_timeout_seconds
     request = urllib.request.Request(
         url=url,
         data=body,
@@ -46,7 +51,7 @@ def perform_worker_request(
     try:
         with urllib.request.urlopen(
             request,
-            timeout=settings.inference_queue_timeout_seconds,
+            timeout=timeout,
         ) as response:
             return WorkerProxyResponse(
                 status_code=response.status,
@@ -88,6 +93,16 @@ async def forward_to_retrieval_worker(
     if content_type:
         headers["Content-Type"] = content_type
 
+    # A decision can wait in the admission queue and then run for a separate
+    # execution deadline. Allow both phases plus transport overhead.
+    request_options = {}
+    if worker_kind == "decision":
+        queue_timeout = settings.inference_queue_timeout_seconds
+        request_options["timeout"] = (
+            None
+            if queue_timeout is None
+            else queue_timeout + settings.decision_execution_timeout_seconds + 5.0
+        )
     try:
         response = await asyncio.to_thread(
             perform_worker_request,
@@ -95,8 +110,9 @@ async def forward_to_retrieval_worker(
             request.method,
             body,
             headers,
+            **request_options,
         )
-    except (TimeoutError, urllib.error.URLError) as exc:
+    except (OSError, urllib.error.URLError) as exc:
         logger.error("Retrieval worker request failed: %s", exc)
         return JSONResponse(
             status_code=503,
@@ -121,3 +137,15 @@ async def proxy_embeddings(request: Request) -> Response:
 async def proxy_rerank(request: Request) -> Response:
     """Forward rerank requests to the isolated reranker worker."""
     return await forward_to_retrieval_worker(request, "reranker")
+
+
+@router.post("/v1/systemone")
+async def proxy_decision(request: Request) -> Response:
+    """Forward decision requests to the isolated decision worker."""
+    return await forward_to_retrieval_worker(request, "decision")
+
+
+@router.post("/v1/decisions")
+async def proxy_decisions(request: Request) -> Response:
+    """Forward typed decision requests to the isolated decision worker."""
+    return await forward_to_retrieval_worker(request, "decision")

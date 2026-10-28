@@ -15,12 +15,8 @@ from mlx_serve.routers.retrieval_proxy import WorkerProxyResponse
 from mlx_serve.server import create_app
 
 
-def _post_endpoint_module(app, path: str) -> str:
-    for route in app.routes:
-        methods = getattr(route, "methods", set())
-        if route.path == path and "POST" in methods:
-            return route.endpoint.__module__
-    raise AssertionError(f"Route not found: {path}")
+def _post_operation_id(app, path: str) -> str:
+    return app.openapi()["paths"][path]["post"]["operationId"]
 
 
 def test_gateway_uses_proxy_routes_when_retrieval_isolation_enabled(monkeypatch):
@@ -29,8 +25,9 @@ def test_gateway_uses_proxy_routes_when_retrieval_isolation_enabled(monkeypatch)
 
     app = create_app()
 
-    assert _post_endpoint_module(app, "/v1/embeddings") == "mlx_serve.routers.retrieval_proxy"
-    assert _post_endpoint_module(app, "/v1/rerank") == "mlx_serve.routers.retrieval_proxy"
+    assert _post_operation_id(app, "/v1/embeddings").startswith("proxy_embeddings_")
+    assert _post_operation_id(app, "/v1/rerank").startswith("proxy_rerank_")
+    assert _post_operation_id(app, "/v1/systemone").startswith("proxy_decision_")
 
 
 def test_gateway_uses_proxy_routes_when_generation_isolation_enabled(monkeypatch):
@@ -39,10 +36,8 @@ def test_gateway_uses_proxy_routes_when_generation_isolation_enabled(monkeypatch
 
     app = create_app()
 
-    assert _post_endpoint_module(app, "/v1/chat/completions") == (
-        "mlx_serve.routers.generation_proxy"
-    )
-    assert _post_endpoint_module(app, "/v1/completions") == "mlx_serve.routers.generation_proxy"
+    assert _post_operation_id(app, "/v1/chat/completions").startswith("proxy_chat_completions_")
+    assert _post_operation_id(app, "/v1/completions").startswith("proxy_text_completions_")
 
 
 def test_embedding_worker_only_exposes_embedding_routes(monkeypatch):
@@ -51,10 +46,21 @@ def test_embedding_worker_only_exposes_embedding_routes(monkeypatch):
     monkeypatch.setenv(RETRIEVAL_WORKER_KIND_ENV, "embedding")
 
     app = create_app()
-    paths = {route.path for route in app.routes}
+    paths = set(app.openapi()["paths"])
 
     assert "/v1/embeddings" in paths
     assert "/v1/tokenize" in paths
+    assert "/v1/rerank" not in paths
+    assert "/v1/chat/completions" not in paths
+
+
+def test_decision_worker_only_exposes_decision_routes(monkeypatch):
+    monkeypatch.setenv(SERVER_ROLE_ENV, "worker")
+    monkeypatch.setenv(RETRIEVAL_WORKER_KIND_ENV, "decision")
+
+    paths = set(create_app().openapi()["paths"])
+    assert "/v1/systemone" in paths
+    assert "/v1/embeddings" not in paths
     assert "/v1/rerank" not in paths
     assert "/v1/chat/completions" not in paths
 
@@ -65,7 +71,7 @@ def test_llm_worker_only_exposes_generation_routes(monkeypatch):
     monkeypatch.setenv(GENERATION_WORKER_KIND_ENV, "llm")
 
     app = create_app()
-    paths = {route.path for route in app.routes}
+    paths = set(app.openapi()["paths"])
 
     assert "/v1/chat/completions" in paths
     assert "/v1/completions" in paths
@@ -189,8 +195,9 @@ def test_gateway_proxies_embedding_requests(monkeypatch):
     assert health.json()["retrieval_workers"]["embedding"]["alive"] is True
 
 
-def test_gateway_returns_503_when_retrieval_worker_times_out(monkeypatch):
-    """A stalled retrieval worker should fail closed instead of returning 500."""
+@pytest.mark.parametrize("error_type", [TimeoutError, ConnectionResetError])
+def test_gateway_returns_503_when_retrieval_worker_fails(monkeypatch, error_type):
+    """A stalled or disconnected worker should return 503 rather than 500."""
     monkeypatch.setattr(settings, "retrieval_worker_isolation_enabled", True)
 
     class FakeSupervisor:
@@ -207,7 +214,7 @@ def test_gateway_returns_503_when_retrieval_worker_times_out(monkeypatch):
             return {}
 
     def fake_worker_request(url: str, method: str, body: bytes, headers: dict[str, str]):
-        raise TimeoutError("worker request timed out")
+        raise error_type("worker request failed")
 
     monkeypatch.setattr("mlx_serve.server.RetrievalWorkerSupervisor", FakeSupervisor)
     monkeypatch.setattr(
@@ -467,6 +474,9 @@ def test_gateway_streams_generation_worker_response(monkeypatch):
 def test_gateway_proxies_tokenize_requests_to_matching_worker(monkeypatch):
     """Gateway tokenize requests should route to the worker that owns the model type."""
     monkeypatch.setattr(settings, "retrieval_worker_isolation_enabled", True)
+    monkeypatch.setattr(
+        "mlx_serve.routers.tokenize.resolve_retrieval_model_type", lambda model: "reranker"
+    )
 
     calls: dict[str, object] = {}
 
