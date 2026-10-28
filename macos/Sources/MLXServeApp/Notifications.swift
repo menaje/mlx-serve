@@ -10,12 +10,20 @@ func notificationAuthorizationText(_ status: UNAuthorizationStatus) -> String {
     }
 }
 
-func deliverNotification(_ event: NotificationPolicy.Event) async {
+private enum NotificationDeliveryError: Error {
+    case notAuthorized
+}
+
+func deliverNotification(_ event: NotificationPolicy.Event) async throws {
     guard UserDefaults.standard.bool(forKey: "jobNotifications") else { return }
     let center = UNUserNotificationCenter.current()
     let settings = await center.notificationSettings()
-    guard [.authorized, .provisional].contains(settings.authorizationStatus),
-          UserDefaults.standard.bool(forKey: "jobNotifications") else { return }
+    guard UserDefaults.standard.bool(forKey: "jobNotifications") else { return }
+    // A system permission prompt can remain open while state changes arrive.
+    guard settings.authorizationStatus != .notDetermined else { return }
+    guard [.authorized, .provisional].contains(settings.authorizationStatus) else {
+        throw NotificationDeliveryError.notAuthorized
+    }
 
     let content = UNMutableNotificationContent()
     switch event {
@@ -31,5 +39,5 @@ func deliverNotification(_ event: NotificationPolicy.Event) async {
     }
     // No request text, credentials, or model input is included in notifications.
     let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-    try? await center.add(request)
+    try await center.add(request)
 }

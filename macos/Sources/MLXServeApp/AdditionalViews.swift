@@ -186,6 +186,8 @@ struct PreferencesView: View {
     @State private var logBodies = false
     @State private var loginStatus = "확인 중"
     @State private var notificationStatus = "확인 중"
+    @State private var notificationRequestError: String?
+    @State private var notificationRequestID = UUID()
     @State private var reviewingOriginals = false
     @State private var reviewingHFCache = false
     @State private var reviewingMigration = false
@@ -241,17 +243,12 @@ struct PreferencesView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("서버 중단·모델 준비 완료 및 실패 알림", isOn: Binding(
                     get: { jobNotifications },
-                    set: { enabled in
-                        jobNotifications = enabled
-                        Task {
-                            if enabled {
-                                _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert])
-                            }
-                            await updateNotificationStatus()
-                        }
-                    }
+                    set: { enabled in setJobNotifications(enabled) }
                 ))
                 LabeledContent("시스템 알림 상태", value: notificationStatus)
+                if let notificationRequestError {
+                    Text(notificationRequestError).foregroundStyle(.orange)
+                }
                 Text("알림에는 입력 내용이나 인증정보를 포함하지 않습니다. 앱이 실행 중일 때 발생한 변경을 알립니다.")
                     .font(.caption).foregroundStyle(.secondary)
                 Text("창을 닫아도 앱과 서버는 유지됩니다. 앱을 종료하면 앱이 시작한 작업과 서버를 종료합니다. 기존 외부 서버는 계속 실행됩니다.")
@@ -587,6 +584,31 @@ struct PreferencesView: View {
     func updateNotificationStatus() async {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
         notificationStatus = notificationAuthorizationText(settings.authorizationStatus)
+    }
+    func setJobNotifications(_ enabled: Bool) {
+        jobNotifications = enabled
+        notificationRequestError = nil
+        let requestID = UUID()
+        notificationRequestID = requestID
+        Task {
+            if enabled {
+                do {
+                    let granted = try await UNUserNotificationCenter.current()
+                        .requestAuthorization(options: [.alert])
+                    guard notificationRequestID == requestID else { return }
+                    if !granted {
+                        jobNotifications = false
+                        notificationRequestError = "시스템에서 알림이 허용되지 않았습니다. 시스템 알림 설정을 확인한 뒤 다시 시도하세요."
+                    }
+                } catch {
+                    guard notificationRequestID == requestID else { return }
+                    jobNotifications = false
+                    notificationRequestError = "macOS에서 알림 권한을 요청하지 못했습니다. 앱을 응용 프로그램 폴더에서 실행하고 시스템 알림 설정을 확인한 뒤 다시 시도하세요."
+                }
+            }
+            guard notificationRequestID == requestID else { return }
+            await updateNotificationStatus()
+        }
     }
     func login(register: Bool) {
         do {

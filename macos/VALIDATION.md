@@ -20,10 +20,47 @@ its current completion criteria. Other unverified flows are listed below.
 
 ## Observed flows
 
-The UI flows below were performed in earlier builds. The current version removes
-Keychain and the option to keep app-owned processes running after app exit; while
-the Mac was locked it was verified through native and backend harnesses rather
-than a new full-UI pass.
+The current public-only, quit-to-stop build was exercised through the packaged
+app UI in an isolated home after the Mac was unlocked. Earlier builds and
+additional native and backend harness checks are identified below.
+
+- In a clean test home, the model-add UI defaulted to
+  `LiquidAI/d1-omni-600M-MLX-fp16` with automatic loading enabled. A fresh
+  download of revision `05e99e49eb1799f1f9f98ec619b6fef2b0dd0960` passed
+  compatibility and inference validation, registered and loaded without local
+  conversion. Bool, choice and score tests succeeded in the app. After making
+  it the default, a separate client successfully sent a decision request with
+  no model ID. Synthetic Hugging Face credentials were present in the app's
+  environment and test token file during this public download.
+- A fresh Qwen3-Reranker download was in progress when the app was quit. The
+  app-owned server, agent and job runner exited, the job was recorded as
+  cancelled, and its staging directory was removed. After relaunch, the model
+  and job history remained available. Retrying the cancelled job from the UI
+  downloaded revision `5f324548f1d20c2b5a450f126fc6ef2fb1126524`, verified it,
+  loaded it without conversion, and ranked the matching test text higher.
+- Closing the main window left the app and its owned server running; reopening
+  it showed the same model and server state. An independently started server
+  was identified as external, could not be stopped through the app, and kept
+  responding after the app quit. Only the isolated test server was stopped at
+  the end of that check.
+- In the final packaged app, the isolated owned server was suspended for 25
+  seconds and then resumed. The UI changed from healthy to degraded while the
+  server did not respond, returned to healthy after it resumed, and retained
+  the completed and cancelled job history. Quitting stopped the test server and
+  workers. This exercises a temporary outage, not an actual system sleep/wake.
+- Queue size, request timeout, memory thresholds and server-log retention were
+  changed through the current settings UI. Saved and applied values were shown
+  separately until restart, after which the server reported the new values. An
+  invalid timeout was rejected. On restart, only the expired completed test
+  log was removed; recent, unconfirmed, unrelated and legacy logs remained.
+  The packaged app's own login-item control was registered and unregistered,
+  with the displayed status changing accordingly; it was left unregistered.
+- An ad-hoc-signed test copy launched from a temporary folder could not request
+  notification permission on this Mac. The app now leaves notifications off
+  and displays the failure and suggested next steps; this was checked in its
+  settings UI. A second test copy in the user's Applications folder did produce
+  a macOS authorization request. These observations do not establish how every
+  macOS version or installation location behaves.
 
 - A native harness compiled from the current `AppStore` started the actual
   agent and its server in an isolated home. After the harness exited normally
@@ -50,8 +87,7 @@ than a new full-UI pass.
   used for choice, Boolean and score inference without invoking a converter.
   Regression tests also check that only the original d1 checkpoint takes the
   conversion path and that older non-converted records do not report a local
-  converter. The model-add form now defaults to the official MLX checkpoint;
-  this default has not been checked through the current UI while locked.
+  converter.
 - Queue and memory limit settings were checked for optional values, valid
   boundaries, atomic saves and rejection of invalid values. A native, non-UI
   harness checked the current Swift input and display helpers. Tests also check
@@ -206,9 +242,10 @@ than a new full-UI pass.
   after a separate list-clipping issue was found. Subsequent UI sessions
   completed the flows above, but the original exception has not been reliably
   reproduced or definitively resolved.
-- Sleep/wake, the packaged app's login-item approval and login behavior,
-  physically disconnected external storage, and the minimum macOS 26 deployment
-  target have not been tested end to end.
+- Sleep/wake, login behavior after a reboot, physically disconnected external
+  storage, and the minimum macOS 26 deployment target have not been tested end
+  to end. The packaged app's login item was registered and unregistered on this
+  Mac, but an actual login after restart was not exercised.
 - The bundle has an ad-hoc signature only. Developer ID signing, notarization,
   distribution of a release DMG, and installation on a separate Mac without
   development tools and signed installer updates are outside the current issue
@@ -216,9 +253,9 @@ than a new full-UI pass.
 - General Hugging Face cache cleanup is not implemented; cleanup is restricted
   to individually reviewed detached revisions as described in `README.md`.
   Defaults are limited to decision, embedding and reranker models, and new model
-  installation is limited to the documented profiles. The new cleanup and
-  offline-removal controls, new settings, and the current public-only,
-  quit-to-stop behavior were not exercised through the full app UI while the
-  Mac was locked.
-- Notification transition filtering is tested, but the macOS permission prompt
-  and visible delivery have not been exercised end to end.
+  installation is limited to the documented profiles. The cleanup and
+  offline-removal controls have backend and earlier UI coverage as described
+  above, but were not re-exercised in the current full UI pass.
+- Notification transition filtering is tested and the macOS permission request
+  was observed for an installed test copy, but visible notification delivery
+  has not yet been verified end to end.

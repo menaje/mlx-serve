@@ -258,7 +258,16 @@ final class AppStore: ObservableObject {
             let events = notificationPolicy.observe(
                 serverState: server["state"] as? String ?? "unknown", ownership: ownership, jobs: jobs
             )
-            for event in events { Task { await deliverNotification(event) } }
+            for event in events {
+                Task {
+                    do { try await deliverNotification(event) }
+                    catch {
+                        if UserDefaults.standard.bool(forKey: "jobNotifications"), message == nil {
+                            message = "알림을 전달하지 못했습니다. macOS의 알림 설정을 확인하세요."
+                        }
+                    }
+                }
+            }
             if ["connected", "degraded"].contains(state) {
                 do {
                     modelState = try await request("/models") as? [String: Any] ?? [:]
@@ -420,7 +429,7 @@ func readableState(_ state: String) -> String {
      "interrupted": "중단됨", "loaded": "적재됨", "not_loaded": "미적재", "unknown": "확인 불가",
      "idle": "유휴", "installed": "설치됨", "downloading": "다운로드", "checking": "호환성 확인",
      "converting": "MLX 변환", "validating": "검증", "resolving": "버전 확인",
-     "registering": "모델 등록", "resources": "임시 파일 측정", "complete": "완료",
+     "registering": "모델 등록", "resources": "임시 파일 측정", "success": "준비 완료", "complete": "완료",
      "loading": "모델 로드", "load_succeeded": "자동 로드 완료", "load_failed": "자동 로드 실패"]
     return translations[state] ?? state
 }

@@ -63,6 +63,9 @@ The retry budget resets after a minute of healthy operation.
 Notifications for unexpected server exits and model preparation outcomes are
 optional and depend on the actual macOS notification permission. Notifications
 are emitted only while the app is running and do not include request contents.
+If macOS cannot request notification permission, run the app from Applications
+and check System Settings > Notifications. The app reports permission request
+and notification delivery failures.
 
 Configuration, model files, and job records are kept outside the app in
 `~/.mlx-serve`. A fresh app install creates a local-only server configuration;
