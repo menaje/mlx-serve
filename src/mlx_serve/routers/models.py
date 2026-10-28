@@ -39,7 +39,7 @@ async def _decision_worker_request(
             b"" if payload is None else json.dumps(payload).encode(),
             {"Content-Type": "application/json"},
         )
-    except (TimeoutError, urllib.error.URLError) as exc:
+    except (OSError, urllib.error.URLError) as exc:
         raise HTTPException(
             status_code=503,
             detail={

@@ -2,8 +2,10 @@
 
 import asyncio
 import errno
+import fcntl
 import hashlib
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -174,3 +176,54 @@ async def test_cancelled_d3_download_waits_for_thread_before_cleaning_stage(
         assert list(settings.models_dir.iterdir()) == []
     finally:
         release.set()
+
+
+@pytest.mark.asyncio
+async def test_import_serializes_registration_and_preserves_newer_metadata(
+    ollama_source, monkeypatch
+):
+    settings.models_dir.mkdir()
+    lock_path = settings.models_dir.parent / ".decision-metadata.lock"
+    started = threading.Event()
+    real_link = os.link
+
+    def signal_link(source, target):
+        result = real_link(source, target)
+        started.set()
+        return result
+
+    monkeypatch.setattr("mlx_serve.core.ollama_import.os.link", signal_link)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        task = asyncio.create_task(
+            asyncio.to_thread(import_ollama_decision, "d3-lite:mlx", "d3-lite", ollama_source)
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 3)
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            model_manager._metadata_path.write_text(json.dumps({"d1": {"type": "decision"}}))
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        destination = await task
+    assert destination.exists()
+    metadata = json.loads(model_manager._metadata_path.read_text())
+    assert metadata["d1"] == {"type": "decision"}
+    assert metadata["d3-lite"]["source"] == "ollama:d3-lite:mlx"
+
+
+def test_import_preserves_destination_created_during_staging(ollama_source, monkeypatch):
+    destination = settings.models_dir / "d3-lite"
+    real_link = os.link
+
+    def concurrent_install(source, target):
+        if not destination.exists():
+            destination.mkdir()
+            (destination / "weights").write_text("existing")
+        return real_link(source, target)
+
+    monkeypatch.setattr("mlx_serve.core.ollama_import.os.link", concurrent_install)
+    with pytest.raises(FileExistsError):
+        import_ollama_decision("d3-lite:mlx", "d3-lite", ollama_source)
+    assert (destination / "weights").read_text() == "existing"
+    assert [path.name for path in settings.models_dir.iterdir()] == ["d3-lite"]

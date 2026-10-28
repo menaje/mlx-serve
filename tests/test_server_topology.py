@@ -195,8 +195,9 @@ def test_gateway_proxies_embedding_requests(monkeypatch):
     assert health.json()["retrieval_workers"]["embedding"]["alive"] is True
 
 
-def test_gateway_returns_503_when_retrieval_worker_times_out(monkeypatch):
-    """A stalled retrieval worker should fail closed instead of returning 500."""
+@pytest.mark.parametrize("error_type", [TimeoutError, ConnectionResetError])
+def test_gateway_returns_503_when_retrieval_worker_fails(monkeypatch, error_type):
+    """A stalled or disconnected worker should return 503 rather than 500."""
     monkeypatch.setattr(settings, "retrieval_worker_isolation_enabled", True)
 
     class FakeSupervisor:
@@ -213,7 +214,7 @@ def test_gateway_returns_503_when_retrieval_worker_times_out(monkeypatch):
             return {}
 
     def fake_worker_request(url: str, method: str, body: bytes, headers: dict[str, str]):
-        raise TimeoutError("worker request timed out")
+        raise error_type("worker request failed")
 
     monkeypatch.setattr("mlx_serve.server.RetrievalWorkerSupervisor", FakeSupervisor)
     monkeypatch.setattr(

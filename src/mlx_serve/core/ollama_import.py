@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 import re
@@ -52,7 +53,7 @@ def import_ollama_decision(model: str, name: str, source_root: Path | None = Non
     if decision.get("format_id") != "d3-code-readout-v1":
         raise ValueError("Only D3 code-readout decision models are supported")
     destination = model_manager._get_model_dir(name)
-    if destination.exists() or name in model_manager._metadata:
+    if destination.exists():
         raise FileExistsError(f"Model '{name}' already exists in mlx-serve")
 
     def link_or_copy(source: Path, target: Path) -> None:
@@ -81,19 +82,30 @@ def import_ollama_decision(model: str, name: str, source_root: Path | None = Non
                 )
                 link_or_copy(blob(layer), target)
                 number += 1
-        staging.rename(destination)
-
-    try:
-        model_manager._metadata[name] = {
+        metadata = {
             "type": "decision",
             "hf_repo": f"vllm-sr/{model_base}",
-            "size": model_manager._get_dir_size(destination),
+            "size": model_manager._get_dir_size(staging),
             "modified_at": datetime.now().isoformat(),
             "source": f"ollama:{model}",
         }
-        model_manager._save_metadata()
-    except Exception:
-        model_manager._metadata.pop(name, None)
-        shutil.rmtree(destination)
-        raise
+        # Other processes can publish models while blobs are being linked.
+        # Lock the shared registry, reload it, and publish as one operation.
+        lock_path = settings.models_dir.parent / ".decision-metadata.lock"
+        with lock_path.open("a+") as registry_lock:
+            fcntl.flock(registry_lock.fileno(), fcntl.LOCK_EX)
+            try:
+                model_manager._load_metadata()
+                if destination.exists() or name in model_manager._metadata:
+                    raise FileExistsError(f"Model '{name}' already exists in mlx-serve")
+                staging.rename(destination)
+                try:
+                    model_manager._metadata[name] = metadata
+                    model_manager._save_metadata()
+                except BaseException:
+                    model_manager._metadata.pop(name, None)
+                    shutil.rmtree(destination, ignore_errors=True)
+                    raise
+            finally:
+                fcntl.flock(registry_lock.fileno(), fcntl.LOCK_UN)
     return destination
