@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import re
@@ -33,6 +34,47 @@ class InternalDecisionUnload(BaseModel):
     name: str | None = None
 
 
+class InternalDecisionDelete(BaseModel):
+    name: str
+
+
+async def delete_decision_model(name: str) -> bool:
+    """Delete a decision model in the process that owns its inference cache."""
+    key = build_inference_key("decision", name)
+    lock = get_model_execution_lock(key)
+    if lock.locked() or key in inference_controller.active_keys():
+        raise ModelInUseError(f"Model '{name}' is active and cannot be deleted")
+
+    def delete_from_disk() -> bool:
+        # Share the publication lock with decision model installs, and reload the
+        # registry so deleting here cannot overwrite a newer gateway registration.
+        lock_path = settings.models_dir.parent / ".decision-metadata.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as registry_lock:
+            fcntl.flock(registry_lock.fileno(), fcntl.LOCK_EX)
+            try:
+                model_manager._load_metadata()
+                if not model_manager.is_model_installed(name):
+                    return False
+                if model_manager.get_model_type(name) != "decision":
+                    return False
+                return model_manager.delete_model(name)
+            finally:
+                fcntl.flock(registry_lock.fileno(), fcntl.LOCK_UN)
+
+    async with lock:
+        operation = asyncio.create_task(asyncio.to_thread(delete_from_disk))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # Keep the execution lock until the deletion thread really stops.
+            try:
+                await operation
+            except Exception:
+                logger.exception("Decision model deletion failed after cancellation")
+            raise
+
+
 @internal_router.get("/internal/decision/cache")
 async def decision_worker_cache() -> dict[str, Any]:
     """Expose the decision worker's cache to its local gateway."""
@@ -56,6 +98,19 @@ async def decision_worker_unload(request: InternalDecisionUnload) -> dict[str, A
             detail={"error": {"message": str(exc), "code": "model_in_use"}},
         ) from exc
     return {**result, "cache": model_manager.get_cache_stats()}
+
+
+@internal_router.post("/internal/decision/delete")
+async def decision_worker_delete(request: InternalDecisionDelete) -> dict[str, bool]:
+    """Remove an idle model and its cache from the isolated worker."""
+    try:
+        deleted = await delete_decision_model(request.name)
+    except ModelInUseError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"message": str(exc), "code": "model_in_use"}},
+        ) from exc
+    return {"deleted": deleted}
 
 
 class DecisionQuestion(BaseModel):

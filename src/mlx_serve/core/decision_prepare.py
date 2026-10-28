@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, snapshot_download
 
 from mlx_serve.config import settings
 from mlx_serve.core.decision_prepare_worker import MANIFEST, MLX_REPO, SOURCE_REPO, file_hash
@@ -344,3 +344,76 @@ async def prepare_d1(
             if stage is not None:
                 shutil.rmtree(stage, ignore_errors=True)
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+async def prepare_d3(manager: Any, repo: str, name: str) -> AsyncIterator[dict[str, Any]]:
+    """Download D3 into a private staging directory before publishing it."""
+    model_dir = manager._get_model_dir(name)
+    if model_dir.exists():
+        yield {
+            "status": "error",
+            "message": f"Model '{name}' already exists; remove it before pulling again",
+        }
+        return
+
+    settings.models_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".decision-download-", dir=settings.models_dir
+        ) as temp:
+            artifact = Path(temp) / "artifact"
+            artifact.mkdir()
+            yield {"status": "downloading", "name": name, "hf_repo": repo}
+            download = asyncio.create_task(
+                asyncio.to_thread(snapshot_download, repo_id=repo, local_dir=str(artifact))
+            )
+            try:
+                await asyncio.shield(download)
+            except asyncio.CancelledError:
+                # Do not remove the staging directory while its download thread is writing.
+                with contextlib.suppress(Exception):
+                    await download
+                raise
+
+            yield {
+                "status": "converting",
+                "name": name,
+                "detail": "Decision model checkpoint ready",
+            }
+            metadata = {
+                "type": "decision",
+                "hf_repo": repo,
+                "size": manager._get_dir_size(artifact),
+                "modified_at": datetime.now().isoformat(),
+            }
+            deadline = time.monotonic() + settings.decision_prepare_timeout_seconds
+            metadata_lock = settings.models_dir.parent / ".decision-metadata.lock"
+            with metadata_lock.open("a+") as lock:
+                while True:
+                    try:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Timed out waiting to register decision model")
+                        await asyncio.sleep(0.2)
+                try:
+                    manager._load_metadata()
+                    if name in manager._metadata or model_dir.exists():
+                        raise ValueError(
+                            f"Model '{name}' already exists; remove it before pulling again"
+                        )
+                    artifact.rename(model_dir)
+                    try:
+                        manager._metadata[name] = metadata
+                        manager._save_metadata()
+                    except BaseException:
+                        manager._metadata.pop(name, None)
+                        shutil.rmtree(model_dir, ignore_errors=True)
+                        raise
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            yield {"status": "success", "name": name}
+    except Exception as exc:
+        logger.warning("Failed to prepare D3 model %s: %s", repo, exc)
+        yield {"status": "error", "message": str(exc)}

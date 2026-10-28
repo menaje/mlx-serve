@@ -1,8 +1,11 @@
 """Tests for importing an installed Ollama decision checkpoint."""
 
+import asyncio
 import errno
 import hashlib
 import json
+import threading
+from pathlib import Path
 
 import pytest
 
@@ -97,3 +100,77 @@ async def test_pull_does_not_mix_downloaded_and_imported_weights(ollama_source):
     assert results[-1]["status"] == "error"
     assert "already exists" in results[-1]["message"]
     assert (destination / "readout.safetensors").read_bytes() == b"readout"
+
+
+@pytest.mark.asyncio
+async def test_failed_d3_download_can_be_retried(ollama_source, monkeypatch):
+    attempts = 0
+
+    def download(*, repo_id, local_dir):
+        nonlocal attempts
+        attempts += 1
+        (Path(local_dir) / "weights").write_text("partial" if attempts == 1 else "complete")
+        if attempts == 1:
+            raise OSError("download interrupted")
+
+    monkeypatch.setattr("mlx_serve.core.decision_prepare.snapshot_download", download)
+    first = [event async for event in model_manager.pull_model("vllm-sr/d3-lite", "decision")]
+    assert first[-1]["status"] == "error"
+    assert not (settings.models_dir / "d3-lite").exists()
+    assert list(settings.models_dir.iterdir()) == []
+    assert "d3-lite" not in model_manager._metadata
+
+    second = [event async for event in model_manager.pull_model("vllm-sr/d3-lite", "decision")]
+    assert second[-1]["status"] == "success"
+    assert (settings.models_dir / "d3-lite" / "weights").read_text() == "complete"
+    assert model_manager._metadata["d3-lite"]["type"] == "decision"
+
+
+@pytest.mark.asyncio
+async def test_d3_registration_failure_removes_only_the_new_download(ollama_source, monkeypatch):
+    settings.models_dir.mkdir()
+    existing = settings.models_dir / "other"
+    existing.mkdir()
+    (existing / "weights").write_text("preserved")
+
+    def download(*, repo_id, local_dir):
+        (Path(local_dir) / "weights").write_text("new")
+
+    def fail_save():
+        raise OSError("cannot save registry")
+
+    monkeypatch.setattr("mlx_serve.core.decision_prepare.snapshot_download", download)
+    monkeypatch.setattr(model_manager, "_save_metadata", fail_save)
+    events = [event async for event in model_manager.pull_model("vllm-sr/d3-lite", "decision")]
+    assert events[-1]["status"] == "error"
+    assert not (settings.models_dir / "d3-lite").exists()
+    assert (existing / "weights").read_text() == "preserved"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_d3_download_waits_for_thread_before_cleaning_stage(
+    ollama_source, monkeypatch
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    def download(*, repo_id, local_dir):
+        started.set()
+        release.wait(timeout=5)
+        (Path(local_dir) / "weights").write_text("complete")
+
+    monkeypatch.setattr("mlx_serve.core.decision_prepare.snapshot_download", download)
+    events = model_manager.pull_model("vllm-sr/d3-lite", "decision")
+    assert (await anext(events))["status"] == "downloading"
+    pending = asyncio.create_task(anext(events))
+    try:
+        assert await asyncio.to_thread(started.wait, 3)
+        pending.cancel()
+        await asyncio.sleep(0.05)
+        assert not pending.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert list(settings.models_dir.iterdir()) == []
+    finally:
+        release.set()

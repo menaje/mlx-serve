@@ -212,8 +212,9 @@ async def pull_model(request: PullRequest) -> StreamingResponse:
 
 
 @router.delete("/api/delete")
-async def delete_model(request: DeleteRequest) -> dict:
+async def delete_model(request: DeleteRequest, http_request: Request) -> dict:
     """Delete a model."""
+    model_manager._load_metadata()
     if not model_manager.is_model_installed(request.name):
         raise HTTPException(
             status_code=404,
@@ -226,7 +227,48 @@ async def delete_model(request: DeleteRequest) -> dict:
             },
         )
 
-    model_manager.delete_model(request.name)
+    if model_manager.get_model_type(request.name) == "decision":
+        from mlx_serve.core.runtime_topology import retrieval_worker_isolation_enabled
+        from mlx_serve.routers.decision import delete_decision_model
+
+        worker = await _decision_worker_request(
+            http_request, "/internal/decision/delete", {"name": request.name}
+        )
+        if worker is None and retrieval_worker_isolation_enabled():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": {
+                        "message": "Decision worker is unavailable",
+                        "code": "worker_unavailable",
+                    }
+                },
+            )
+        try:
+            deleted = (
+                worker["deleted"]
+                if worker is not None
+                else await delete_decision_model(request.name)
+            )
+        except ModelInUseError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": {"message": str(exc), "code": "model_in_use"}},
+            ) from exc
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "message": f"Model '{request.name}' not found",
+                        "code": "model_not_found",
+                    }
+                },
+            )
+        if worker is not None:
+            model_manager._load_metadata()
+    else:
+        model_manager.delete_model(request.name)
     return {"status": "success"}
 
 

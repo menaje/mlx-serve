@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import shutil
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -662,3 +664,154 @@ async def test_timed_out_inference_keeps_model_reserved_until_thread_finishes(mo
             assert completed.json()["unloaded"] == [{"name": "d1-omni-600M", "type": "decision"}]
     finally:
         release.set()
+
+
+def test_worker_refreshes_reinstalled_revision_and_invalidates_external_deletion(
+    preparation, monkeypatch
+):
+    directory = settings.models_dir / "d1-omni-600M"
+    create_artifact(directory)
+    installed = {"type": "decision", "revision": REVISION, "hf_repo": SOURCE_REPO}
+    model_manager._metadata_path.write_text(json.dumps({directory.name: installed}))
+    monkeypatch.setattr(
+        model_manager,
+        "_metadata",
+        {directory.name: {**installed, "revision": "old-revision"}},
+    )
+    monkeypatch.setattr(model_manager, "_decision_cache", TTLLRUCache(maxsize=1, ttl=60))
+    monkeypatch.setattr(model_manager, "_decision_cache_identity", {})
+    monkeypatch.setattr(model_manager, "_ensure_load_memory_available", lambda *a, **k: None)
+    monkeypatch.setattr(model_manager, "_memory_calibration_baseline", lambda: (0, 0))
+    monkeypatch.setattr(model_manager, "_calibrate_loaded_model_estimate", lambda *a, **k: None)
+    monkeypatch.setattr("mlx_serve.core.model_manager.clear_mlx_cache", lambda **kwargs: True)
+    monkeypatch.setattr(settings, "auto_download", False)
+
+    class FakeDecisionModel:
+        def __init__(self, model_dir):
+            self.model_dir = model_dir
+
+    monkeypatch.setattr("mlx_serve.core.d1_decision.D1DecisionModel", FakeDecisionModel)
+    first = model_manager.get_decision_model("d1-omni")
+    assert model_manager._metadata[directory.name]["revision"] == REVISION
+    assert model_manager.get_decision_model("d1-omni") is first
+
+    # Simulate a CLI replacing the same name without an intervening worker request.
+    shutil.rmtree(directory)
+    create_artifact(directory)
+    new_revision = "fedcba9876543210fedcba9876543210fedcba98"
+    manifest = json.loads((directory / MANIFEST).read_text())
+    manifest["revision"] = new_revision
+    (directory / MANIFEST).write_text(json.dumps(manifest))
+    model_manager._metadata_path.write_text(
+        json.dumps({directory.name: {**installed, "revision": new_revision}})
+    )
+    replacement = model_manager.get_decision_model("d1-omni")
+    assert replacement is not first
+    assert model_manager._metadata[directory.name]["revision"] == new_revision
+
+    shutil.rmtree(directory)
+    model_manager._metadata_path.write_text("{}")
+    with pytest.raises(FileNotFoundError):
+        model_manager.get_decision_model("d1-omni")
+    assert model_manager._decision_cache.get(directory.name) is None
+
+
+@pytest.mark.asyncio
+async def test_worker_delete_blocks_loading_then_removes_cached_model(preparation, monkeypatch):
+    import httpx
+
+    from mlx_serve.core.runtime_topology import RETRIEVAL_WORKER_KIND_ENV, SERVER_ROLE_ENV
+    from mlx_serve.server import create_app
+
+    name = "d1-omni-600M"
+    create_artifact(settings.models_dir / name)
+    model_manager._metadata = {
+        name: {"type": "decision", "revision": REVISION, "hf_repo": SOURCE_REPO},
+        "other": {"type": "embedding"},
+    }
+    model_manager._save_metadata()
+    cache = TTLLRUCache(maxsize=1, ttl=60)
+    monkeypatch.setattr(model_manager, "_decision_cache", cache)
+    monkeypatch.setattr("mlx_serve.core.model_manager.clear_mlx_cache", lambda **kwargs: True)
+    monkeypatch.setenv(SERVER_ROLE_ENV, "worker")
+    monkeypatch.setenv(RETRIEVAL_WORKER_KIND_ENV, "decision")
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowModel:
+        def decide(self, *args):
+            return {"answers": {}, "usage": {}}
+
+    def load_model(model_name):
+        started.set()
+        release.wait(timeout=5)
+        model = SlowModel()
+        cache.set(name, model)
+        return model
+
+    monkeypatch.setattr(model_manager, "get_decision_model", load_model)
+    transport = httpx.ASGITransport(app=create_app())
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            running = asyncio.create_task(
+                client.post(
+                    "/v1/decisions",
+                    json={
+                        "model": "d1-omni",
+                        "state": "test",
+                        "questions": {"q": {"type": "bool"}},
+                    },
+                )
+            )
+            assert await asyncio.to_thread(started.wait, 3)
+            blocked = await client.post("/internal/decision/delete", json={"name": "d1-omni"})
+            assert blocked.status_code == 409
+            assert (settings.models_dir / name).exists()
+            release.set()
+            assert (await running).status_code == 200
+            deleted = await client.post("/internal/decision/delete", json={"name": "d1-omni"})
+            assert deleted.json() == {"deleted": True}
+            assert not (settings.models_dir / name).exists()
+            assert cache.get(name) is None
+            assert json.loads(model_manager._metadata_path.read_text()) == {
+                "other": {"type": "embedding"}
+            }
+    finally:
+        release.set()
+
+
+def test_gateway_deletes_in_worker_and_handles_worker_unavailable(preparation, monkeypatch, client):
+    import urllib.error
+
+    from mlx_serve.routers.retrieval_proxy import WorkerProxyResponse
+
+    name = "d1-omni-600M"
+    create_artifact(settings.models_dir / name)
+    model_manager._metadata[name] = {
+        "type": "decision",
+        "revision": REVISION,
+        "hf_repo": SOURCE_REPO,
+    }
+    model_manager._save_metadata()
+    client.app.state.retrieval_worker_urls = {"decision": "http://worker"}
+    calls = []
+
+    def unavailable(url, method, body, headers):
+        raise urllib.error.URLError("worker down")
+
+    monkeypatch.setattr("mlx_serve.routers.retrieval_proxy.perform_worker_request", unavailable)
+    response = client.request("DELETE", "/api/delete", json={"name": "d1-omni"})
+    assert response.status_code == 503
+    assert (settings.models_dir / name).exists()
+
+    def worker_request(url, method, body, headers):
+        calls.append((url, method, json.loads(body)))
+        model_manager.delete_model("d1-omni")
+        return WorkerProxyResponse(200, b'{"deleted": true}', {})
+
+    monkeypatch.setattr("mlx_serve.routers.retrieval_proxy.perform_worker_request", worker_request)
+    monkeypatch.setattr("mlx_serve.core.model_manager.clear_mlx_cache", lambda **kwargs: True)
+    response = client.request("DELETE", "/api/delete", json={"name": "d1-omni"})
+    assert response.status_code == 200
+    assert calls == [("http://worker/internal/decision/delete", "POST", {"name": "d1-omni"})]
+    assert not (settings.models_dir / name).exists()

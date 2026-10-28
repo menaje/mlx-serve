@@ -277,6 +277,7 @@ class ModelManager:
             maxsize=settings.cache_max_decision_models,
             ttl=settings.cache_ttl_seconds,
         )
+        self._decision_cache_identity: dict[str, tuple[int, int, int, str]] = {}
         self._llm_cache = TTLLRUCache(
             maxsize=settings.cache_max_llm_models,
             ttl=settings.cache_ttl_seconds,
@@ -420,6 +421,8 @@ class ModelManager:
     ) -> None:
         """Run cleanup side effects for a model removed from a cache."""
         self._forget_model_estimate(model_type, model_name)
+        if model_type == "decision":
+            self._decision_cache_identity.pop(model_name, None)
         if record_eviction:
             try:
                 from mlx_serve.core.metrics import record_cache_eviction
@@ -926,7 +929,7 @@ class ModelManager:
             return
 
         if model_type == "decision":
-            from mlx_serve.core.decision_prepare import SUPPORTED_REPOS, prepare_d1
+            from mlx_serve.core.decision_prepare import SUPPORTED_REPOS, prepare_d1, prepare_d3
 
             try:
                 model_name = resolve_decision_install_name(model_name, hf_repo)
@@ -942,6 +945,12 @@ class ModelManager:
             if hf_repo != "vllm-sr/d3-lite":
                 yield {"status": "error", "message": "Unsupported decision model architecture"}
                 return
+            if revision is not None:
+                yield {"status": "error", "message": "Revision selection is supported for d1 only"}
+                return
+            async for status in prepare_d3(self, hf_repo, model_name):
+                yield status
+            return
         if revision is not None:
             yield {"status": "error", "message": "Revision selection is supported for d1 only"}
             return
@@ -1360,24 +1369,43 @@ class ModelManager:
             )
             return model, tokenizer
 
+    def _decision_model_identity(self, model_name: str) -> tuple[int, int, int, str] | None:
+        """Identify the on-disk installation so external replacements invalidate its cache."""
+        try:
+            stat = self._get_model_dir(model_name).stat()
+        except FileNotFoundError:
+            return None
+        self._load_metadata()
+        metadata = json.dumps(self._metadata.get(model_name), sort_keys=True)
+        return (stat.st_dev, stat.st_ino, stat.st_ctime_ns, metadata)
+
     def get_decision_model(self, model_name: str) -> Any:
         """Load and cache a native MLX decision model."""
         resolved_name, hf_repo, _ = resolve_model_alias(model_name)
         self._cleanup_expired_cache("decision", self._decision_cache, "expired decision cache")
-        cached = self._decision_cache.get(resolved_name)
-        if cached is not None:
-            return cached
-
         with self._get_load_lock(f"decision:{resolved_name}"):
             cached = self._decision_cache.get(resolved_name)
             if cached is not None:
-                return cached
+                identity = self._decision_model_identity(resolved_name)
+                if identity is not None and identity == self._decision_cache_identity.get(
+                    resolved_name
+                ):
+                    return cached
+                self._decision_cache.remove(resolved_name)
+                self._notify_cached_model_removed(
+                    "decision", resolved_name, f"replace model {resolved_name}"
+                )
+                del cached
+                gc.collect()
+                clear_mlx_cache(log=logger, reason=f"replace model {resolved_name}")
             model_dir = self._get_model_dir(resolved_name)
             if not model_dir.exists():
                 if not settings.auto_download or not self._auto_download_model(
                     hf_repo, "decision", resolved_name
                 ):
                     raise FileNotFoundError(f"Decision model '{model_name}' is not installed")
+            # Installations can be replaced by the gateway or CLI while this worker runs.
+            self._load_metadata()
             installed_type = self.get_model_type(resolved_name)
             if installed_type is not None and installed_type != "decision":
                 raise ValueError(f"Model '{model_name}' is type '{installed_type}', not decision")
@@ -1390,10 +1418,6 @@ class ModelManager:
                     from mlx_serve.core.d1_decision import D1DecisionModel
                     from mlx_serve.core.decision_prepare import read_verified_manifest
 
-                    if installed_type is None:
-                        # The CLI or a separate worker may have installed it since startup.
-                        self._load_metadata()
-                        installed_type = self.get_model_type(resolved_name)
                     if installed_type != "decision":
                         raise ValueError("Decision model has not been registered")
                     manifest = read_verified_manifest(model_dir)
@@ -1412,6 +1436,9 @@ class ModelManager:
                 self._forget_model_estimate("decision", resolved_name)
                 raise
             self._cache_loaded_model("decision", resolved_name, self._decision_cache, model)
+            identity = self._decision_model_identity(resolved_name)
+            if identity is not None:
+                self._decision_cache_identity[resolved_name] = identity
             self._calibrate_loaded_model_estimate("decision", resolved_name, before_rss, before_mlx)
             return model
 
