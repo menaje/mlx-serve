@@ -1,10 +1,11 @@
 """Configuration management for mlx-serve."""
 
+import json
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from mlx_serve.core.config_loader import get_config_values
 
@@ -116,7 +117,7 @@ class Settings(BaseSettings):
     )
 
     # Preload settings
-    preload_models: list[str] = Field(
+    preload_models: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
         description="List of model names to preload at startup",
     )
@@ -391,6 +392,8 @@ class Settings(BaseSettings):
     def parse_preload_models(cls, v):
         """Parse preload_models from comma-separated string or list."""
         if isinstance(v, str):
+            if v.lstrip().startswith("["):
+                return json.loads(v)
             return [m.strip() for m in v.split(",") if m.strip()]
         return v
 

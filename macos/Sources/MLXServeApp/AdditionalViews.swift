@@ -175,6 +175,10 @@ struct PreferencesView: View {
     @State private var loginStatus = "확인 중"
     @State private var notificationStatus = "확인 중"
     @State private var reviewingOriginals = false
+    @State private var reviewingMigration = false
+    @State private var previewingMigration = false
+    @State private var migrationPreview: [String: Any] = [:]
+    @State private var changingBackground = false
     @AppStorage("automaticStartServer") private var automaticStartServer = false
     @AppStorage("automaticRecoverServer") private var automaticRecoverServer = false
     @AppStorage("jobNotifications") private var jobNotifications = false
@@ -194,6 +198,9 @@ struct PreferencesView: View {
             await updateNotificationStatus()
         }
         .sheet(isPresented: $reviewingOriginals) { OriginalCleanupView().environmentObject(store) }
+        .sheet(isPresented: $reviewingMigration) {
+            StorageMigrationPreviewView(preview: migrationPreview).environmentObject(store)
+        }
         .alert("알림", isPresented: Binding(
             get: { store.message != nil }, set: { if !$0 { store.message = nil } }
         )) { Button("확인") { store.message = nil } } message: { Text(store.message ?? "") }
@@ -212,6 +219,18 @@ struct PreferencesView: View {
                 Toggle("앱이 시작한 서버 종료 시 자동 복구", isOn: $automaticRecoverServer)
                 Text("자동 시작은 서버가 중지된 경우에만 실행합니다. 자동 복구는 앱 실행 중 최대 세 번 시도하며, 직접 중지한 서버나 기존 서버에는 적용하지 않습니다.")
                     .font(.caption).foregroundStyle(.secondary)
+                Toggle("앱 종료 후에도 서버와 작업 유지", isOn: Binding(
+                    get: { store.backgroundEnabled },
+                    set: { enabled in
+                        changingBackground = true
+                        Task {
+                            await store.setBackground(enabled)
+                            changingBackground = false
+                        }
+                    }
+                )).disabled(!store.agentReady || changingBackground || store.busy)
+                Text("앱이 시작한 서버와 작업만 유지합니다. 앱을 다시 열면 안전하게 연결합니다. Mac을 로그아웃하거나 재시동한 뒤 자동 실행하려면 로그인 항목과 자동 시작 설정을 사용하세요.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("서버 중단·모델 준비 완료 및 실패 알림", isOn: Binding(
                     get: { jobNotifications },
                     set: { enabled in
@@ -227,7 +246,9 @@ struct PreferencesView: View {
                 LabeledContent("시스템 알림 상태", value: notificationStatus)
                 Text("알림에는 입력 내용이나 인증정보를 포함하지 않습니다. 앱이 실행 중일 때 발생한 변경을 알립니다.")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("창을 닫아도 앱과 서버는 유지됩니다. 앱을 종료하면 앱이 시작한 작업과 서버를 정리합니다.")
+                Text(store.backgroundEnabled
+                    ? "창을 닫거나 앱을 종료해도 앱이 시작한 서버와 작업이 유지됩니다."
+                    : "창을 닫아도 앱과 서버는 유지됩니다. 앱을 종료하면 앱이 시작한 작업과 서버를 정리합니다.")
                     .foregroundStyle(.secondary)
             }
         }.formStyle(.grouped)
@@ -268,6 +289,7 @@ struct PreferencesView: View {
         Form {
             Section("저장소") {
                 TextField("새 모델 저장 위치", text: $modelsDir)
+                    .disabled(store.migratingStorage)
                 fieldState("models_dir")
                 if let disk = store.modelState["disk"] as? [String: Any],
                    let available = disk["free_bytes"] as? Int64,
@@ -276,12 +298,37 @@ struct PreferencesView: View {
                 } else {
                     LabeledContent("현재 저장 장치", value: "서버 연결 후 확인")
                 }
-                Text("경로 변경 전 서버를 중지하세요. 기존 모델이나 작업이 있으면 변경할 수 없으며, 모델 이동 기능은 준비 중입니다.")
+                Text("서버와 다른 CLI 서비스를 중지한 뒤 변경하세요. 기존 모델이 없다면 새 위치를 저장하고, 기존 모델이 있다면 복사 및 전환을 선택하세요.")
                     .foregroundStyle(.secondary)
-                Button("저장 위치 저장") { Task { await store.saveSettings(["models_dir": modelsDir]) } }
-                    .disabled(store.ownership == "external")
+                HStack {
+                    Button("새 모델 위치 저장") { Task { await store.saveSettings(["models_dir": modelsDir]) } }
+                    Button(previewingMigration ? "확인 중…" : "기존 모델 복사 및 전환…") {
+                        previewingMigration = true
+                        Task {
+                            defer { previewingMigration = false }
+                            do {
+                                migrationPreview = try await store.previewStorageMigration(modelsDir)
+                                reviewingMigration = true
+                            } catch { store.message = error.localizedDescription }
+                        }
+                    }
+                }.disabled(store.ownership == "external" || store.migratingStorage || previewingMigration)
+                Text("복사할 때는 아직 없는 새 상위 폴더 안의 경로를 지정하세요. 예: /Volumes/외장디스크/MLXServe/models")
+                    .font(.caption).foregroundStyle(.secondary)
+                if store.migratingStorage {
+                    let copied = (store.storageMigration["copied_bytes"] as? NSNumber)?.doubleValue ?? 0
+                    let total = (store.storageMigration["size_bytes"] as? NSNumber)?.doubleValue ?? 0
+                    let phase = store.storageMigration["phase"] as? String ?? "checking"
+                    if total > 0 && phase == "copying" {
+                        ProgressView("모델 파일 복사 중", value: min(copied, total), total: total)
+                    } else {
+                        ProgressView(phase == "applying" ? "저장 위치 적용 중" : "파일 확인 중")
+                    }
+                    Text("복사와 검증이 끝날 때까지 앱을 열어 두세요. 기존 파일은 삭제되지 않습니다.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Button("참조되지 않는 원본 정리…") { reviewingOriginals = true }
-                    .disabled(!store.modelStateAvailable || store.activeJobs > 0)
+                    .disabled(!store.modelStateAvailable || store.activeJobs > 0 || store.migratingStorage)
                 Text("다른 모델이 참조하는 원본과 변환된 모델은 정리하지 않습니다.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -470,6 +517,41 @@ struct PreferencesView: View {
             else { try SMAppService.mainApp.unregister() }
             updateLoginStatus()
         } catch { store.message = error.localizedDescription; updateLoginStatus() }
+    }
+}
+
+struct StorageMigrationPreviewView: View {
+    @EnvironmentObject var store: AppStore
+    @Environment(\.dismiss) private var dismiss
+    let preview: [String: Any]
+
+    private var size: Int64 { (preview["size_bytes"] as? NSNumber)?.int64Value ?? 0 }
+    private var free: Int64 { (preview["free_bytes"] as? NSNumber)?.int64Value ?? 0 }
+    private var enoughSpace: Bool { free >= size + max(16 * 1024 * 1024, size / 100) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("기존 모델 복사 및 전환").font(.title2.bold())
+            LabeledContent("현재 위치", value: preview["source"] as? String ?? "")
+            LabeledContent("새 위치", value: preview["destination"] as? String ?? "")
+            LabeledContent("복사할 파일", value: ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
+            LabeledContent("대상 디스크 여유", value: ByteCountFormatter.string(fromByteCount: free, countStyle: .file))
+            Text("모델 파일, 등록 정보, 기본 모델 선택 및 보관된 원본을 복사하고 검증한 뒤 저장 위치를 전환합니다. 기존 파일은 삭제하지 않습니다.")
+            Text("다른 CLI나 서비스가 기존 저장소를 수정하지 않도록 모두 중지하세요. 복사가 실패하거나 앱을 종료하면 기존 설정과 파일을 유지하며, 불완전한 복사 대상 폴더가 남을 수 있습니다.")
+                .foregroundStyle(.secondary)
+            if !enoughSpace {
+                Text("복사와 검증에 필요한 여유 공간이 부족합니다.").foregroundStyle(.orange)
+            }
+            HStack {
+                Spacer()
+                Button("취소") { dismiss() }
+                Button("복사 시작") {
+                    let destination = preview["destination"] as? String ?? ""
+                    dismiss()
+                    Task { await store.startStorageMigration(destination) }
+                }.disabled(!enoughSpace || preview["destination"] as? String == nil)
+            }
+        }.padding(24).frame(width: 600)
     }
 }
 

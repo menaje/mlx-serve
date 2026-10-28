@@ -154,6 +154,30 @@ struct OverviewView: View {
                         }
                     }.padding(8)
                 }
+                if let installation = store.server["installation"] as? [String: Any],
+                   let launchd = installation["launchd"] as? [String: Any] {
+                    GroupBox("기존 설치 확인") {
+                        VStack(alignment: .leading, spacing: 5) {
+                            if let cli = installation["homebrew_cli"] as? String
+                                ?? installation["cli_in_path"] as? String {
+                                Text("기존 CLI: \(cli)").textSelection(.enabled)
+                            } else {
+                                Text("검사한 경로에서 기존 CLI를 찾지 못했습니다.")
+                            }
+                            Text("사용자 launchd 서비스: \(launchdState(launchd["user_state"] as? String))")
+                            if let files = launchd["files"] as? [String], !files.isEmpty {
+                                ForEach(files, id: \.self) { file in
+                                    Text("서비스 설정: \(file)").textSelection(.enabled)
+                                }
+                            }
+                            if let config = installation["config_path"] as? String {
+                                Text("설정 경로: \(config)").textSelection(.enabled)
+                            }
+                            Text("서비스 확인은 읽기 전용이며 실행 중인 서버와의 연결 여부는 위에 별도로 표시합니다.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                    }
+                }
                 HStack(alignment: .top, spacing: 14) {
                     GroupBox("모델") {
                         VStack(alignment: .leading, spacing: 5) {
@@ -170,7 +194,8 @@ struct OverviewView: View {
                     GroupBox("작업") {
                         VStack(alignment: .leading, spacing: 5) {
                             Text("\(store.activeJobs)개 진행 중").font(.title2.bold())
-                            Text("앱을 종료하면 앱이 시작한 작업을 정리합니다.").foregroundStyle(.secondary)
+                            Text(store.backgroundEnabled ? "앱 종료 후에도 작업을 유지합니다." : "앱을 종료하면 앱이 시작한 작업을 정리합니다.")
+                                .foregroundStyle(.secondary)
                         }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
                     }
                 }
@@ -200,6 +225,14 @@ struct OverviewView: View {
         case "external": return "기존 서버에 연결했습니다. 이 앱은 해당 서버를 중지하지 않습니다."
         default:
             return store.state == "stopped" ? "서버가 중지되어 있습니다." : "서버 실행 상태를 확인하고 있습니다."
+        }
+    }
+    private func launchdState(_ state: String?) -> String {
+        switch state {
+        case "running": return "실행 중"
+        case "loaded": return "등록됨"
+        case "not_loaded": return "등록되지 않음"
+        default: return "확인 불가"
         }
     }
 }

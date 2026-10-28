@@ -11,7 +11,13 @@ from dataclasses import dataclass
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
+from mlx_serve.core.generation_workers import (
+    GenerationWorkerLease,
+    acquire_generation_worker,
+    await_worker_operation,
+)
 from mlx_serve.core.inference_control import build_overload_detail
 from mlx_serve.core.local_access import open_local_http
 from mlx_serve.core.model_manager import model_manager, resolve_model_alias
@@ -98,7 +104,17 @@ def open_worker_stream(
     )
 
 
-def _iter_worker_response(response: object):
+def _close_worker_response(response: object, lease: GenerationWorkerLease | None) -> None:
+    try:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+def _iter_worker_response(response: object, lease: GenerationWorkerLease | None):
     try:
         while True:
             chunk = response.read(8192)
@@ -106,9 +122,7 @@ def _iter_worker_response(response: object):
                 break
             yield chunk
     finally:
-        close = getattr(response, "close", None)
-        if callable(close):
-            close()
+        _close_worker_response(response, lease)
 
 
 async def forward_to_generation_worker(
@@ -119,11 +133,24 @@ async def forward_to_generation_worker(
     stream: bool = False,
 ) -> Response:
     """Forward a request payload to the selected generation worker."""
+    if body is None:
+        body = await request.body()
     worker_urls = getattr(request.app.state, "generation_worker_urls", {})
     base_url = worker_urls.get(worker_kind)
     supervisor = getattr(request.app.state, "generation_worker_supervisor", None)
-    if supervisor is not None and hasattr(supervisor, "ensure_worker"):
-        base_url = supervisor.ensure_worker(worker_kind, model_name)
+    lease = None
+    try:
+        if supervisor is not None and hasattr(supervisor, "acquire_worker"):
+            lease = await acquire_generation_worker(supervisor, worker_kind, model_name)
+            base_url = lease.url if lease is not None else None
+        elif supervisor is not None and hasattr(supervisor, "ensure_worker"):
+            base_url = await asyncio.to_thread(supervisor.ensure_worker, worker_kind, model_name)
+    except (OSError, RuntimeError) as exc:
+        logger.error("Could not start generation worker: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=build_overload_detail(f"{worker_kind} generation worker is unavailable"),
+        ) from exc
     if base_url is None:
         raise HTTPException(
             status_code=503,
@@ -136,8 +163,6 @@ async def forward_to_generation_worker(
     if query:
         url = f"{url}?{query}"
 
-    if body is None:
-        body = await request.body()
     headers: dict[str, str] = {}
     content_type = request.headers.get("content-type")
     if content_type:
@@ -145,12 +170,11 @@ async def forward_to_generation_worker(
 
     if stream:
         try:
-            opened_response = await asyncio.to_thread(
-                open_worker_stream,
-                url,
-                request.method,
-                body,
-                headers,
+            opened_response = await await_worker_operation(
+                asyncio.to_thread(open_worker_stream, url, request.method, body, headers),
+                lease, keep_on_success=True,
+                discard=lambda opened: _close_worker_response(opened.response, lease)
+                if isinstance(opened, WorkerStreamingResponse) else None,
             )
         except urllib.error.URLError as exc:
             logger.error("Generation worker stream failed: %s", exc)
@@ -159,21 +183,21 @@ async def forward_to_generation_worker(
                 content=build_overload_detail(f"{worker_kind} generation worker is unavailable"),
             )
         if isinstance(opened_response, Response):
+            if lease is not None:
+                lease.release()
             return opened_response
         media_type = opened_response.headers.get("Content-Type", "text/event-stream")
         return StreamingResponse(
-            _iter_worker_response(opened_response.response),
+            _iter_worker_response(opened_response.response, lease),
             status_code=opened_response.status_code,
             media_type=media_type,
+            background=BackgroundTask(_close_worker_response, opened_response.response, lease),
         )
 
     try:
-        response = await asyncio.to_thread(
-            perform_worker_request,
-            url,
-            request.method,
-            body,
-            headers,
+        response = await await_worker_operation(
+            asyncio.to_thread(perform_worker_request, url, request.method, body, headers),
+            lease,
         )
     except urllib.error.URLError as exc:
         logger.error("Generation worker request failed: %s", exc)

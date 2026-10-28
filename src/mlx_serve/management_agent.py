@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +22,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -28,6 +30,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from mlx_serve.config import Settings
+from mlx_serve.core.background_agent import BackgroundControl, SecureAgentChannel, key_identifier
 from mlx_serve.core.local_access import is_local_management_request, open_local_http
 from mlx_serve.core.managed_config import (
     initialize_app_config,
@@ -36,6 +39,7 @@ from mlx_serve.core.managed_config import (
 )
 from mlx_serve.core.managed_jobs import ACTIVE_STATES, JobManager
 from mlx_serve.core.storage_access import model_storage_available, model_volume_mounted
+from mlx_serve.core.storage_migration import migrate_storage, preview_storage_migration
 
 DATA_DIR = Path.home() / ".mlx-serve"
 
@@ -98,6 +102,40 @@ def _port_is_busy(port: int, host: str = "127.0.0.1") -> bool:
             except OSError:
                 return True
     return False
+
+
+def _installation_snapshot() -> dict[str, Any]:
+    """Inspect known CLI and launchd locations without changing a service."""
+    home = Path.home()
+    service_paths = [
+        home / "Library/LaunchAgents/com.mlx-serve.server.plist",
+        Path("/Library/LaunchAgents/com.mlx-serve.server.plist"),
+        Path("/Library/LaunchDaemons/com.mlx-serve.server.plist"),
+    ]
+    launchd_state = "unknown"
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["/bin/launchctl", "print", f"gui/{os.getuid()}/com.mlx-serve.server"],
+                capture_output=True, text=True, timeout=2, check=False,
+            )
+            if result.returncode == 0:
+                launchd_state = "running" if "state = running" in result.stdout else "loaded"
+            elif result.returncode == 113 and "Could not find service" in result.stderr:
+                launchd_state = "not_loaded"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return {
+        "config_path": str(home / ".mlx-serve" / "config.yaml"),
+        "homebrew_cli": next((p for p in (
+            "/opt/homebrew/bin/mlx-serve", "/usr/local/bin/mlx-serve"
+        ) if Path(p).exists()), None),
+        "cli_in_path": shutil.which("mlx-serve"),
+        "launchd": {
+            "files": [str(path) for path in service_paths if path.exists()],
+            "user_state": launchd_state,
+        },
+    }
 
 
 def _check_storage_change(current: Path, requested: str, active_jobs: bool) -> None:
@@ -236,6 +274,22 @@ class SettingsChanges(BaseModel):
     values: dict[str, Any]
 
 
+class StorageMigrationRequest(BaseModel):
+    destination: str = Field(min_length=1, max_length=4096)
+
+
+class BackgroundRequest(BaseModel):
+    enabled: bool
+
+
+class BackgroundAttachRequest(BaseModel):
+    pid: int = Field(gt=1)
+
+
+class SecureRequest(BaseModel):
+    payload: str = Field(max_length=2 * 1024 * 1024)
+
+
 class JobRequest(BaseModel):
     repo: str
     name: str | None = None
@@ -256,7 +310,72 @@ class TestRequest(BaseModel):
 
 def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
     controller = ServerController(data_dir)
+    secure_channel = SecureAgentChannel(token)
     jobs: JobManager | None = None
+    storage_guard = asyncio.Lock()
+    background_guard = asyncio.Lock()
+    migration_lock = threading.Lock()
+    migration_cancel = threading.Event()
+    migration_task: asyncio.Task | None = None
+    migration_state: dict[str, Any] = {"status": "idle"}
+    installation_guard = asyncio.Lock()
+    installation: dict[str, Any] | None = None
+    installation_checked_at = 0.0
+
+    async def existing_installation() -> dict[str, Any]:
+        nonlocal installation, installation_checked_at
+        async with installation_guard:
+            now = time.monotonic()
+            if installation is None or now - installation_checked_at >= 30:
+                installation = await asyncio.to_thread(_installation_snapshot)
+                installation_checked_at = now
+            return installation
+
+    def migration_snapshot() -> dict[str, Any]:
+        with migration_lock:
+            return dict(migration_state)
+
+    def update_migration(**changes: Any) -> None:
+        with migration_lock:
+            migration_state.update(changes)
+
+    def check_not_migrating() -> None:
+        if migration_snapshot()["status"] == "running":
+            raise HTTPException(status_code=409, detail="Model storage migration is in progress")
+
+    async def check_migration_ready() -> Path:
+        assert jobs is not None
+        state = await controller.status()
+        if state["ownership"] == "external":
+            raise HTTPException(status_code=409, detail="External server settings are read-only")
+        if state["state"] not in ("stopped", "failed"):
+            raise HTTPException(
+                status_code=409, detail="Stop the server before changing model storage"
+            )
+        if any(job["status"] in ACTIVE_STATES for job in jobs.list()):
+            raise HTTPException(
+                status_code=409, detail="Finish or cancel model preparation before changing storage"
+            )
+        field = settings_snapshot()["fields"]["models_dir"]
+        if field["source"] in ("environment", "dotenv"):
+            raise HTTPException(
+                status_code=409, detail="Model storage is overridden by the environment"
+            )
+        return Settings().models_dir
+
+    async def run_migration(source: Path, destination: Path) -> None:
+        def progress(phase: str, copied: int, total: int) -> None:
+            update_migration(phase=phase, copied_bytes=copied, size_bytes=total)
+
+        try:
+            result = await asyncio.to_thread(
+                migrate_storage, source, destination, cancelled=migration_cancel, update=progress,
+            )
+            update_migration(status="succeeded", phase="complete", **result)
+        except (OSError, ValueError) as exc:
+            update_migration(status="failed", error=str(exc))
+        except Exception:
+            update_migration(status="failed", error="Model storage copy failed")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -265,6 +384,9 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
         jobs = JobManager(data_dir / "jobs")
         await jobs.recover()
         yield
+        if migration_task is not None and not migration_task.done():
+            migration_cancel.set()
+            await migration_task
         await jobs.close()
         if controller.process is not None and controller.process.poll() is None:
             await controller.stop()
@@ -281,11 +403,47 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
     @app.middleware("http")
     async def authorize(request: Request, call_next):
         bearer = request.headers.get("authorization", "")
-        if not is_local_management_request(request) or not secrets.compare_digest(
-            bearer, f"Bearer {token}"
-        ):
+        if not is_local_management_request(request):
             return JSONResponse(status_code=403, content={"detail": "Local authorization required"})
+        if request.url.path == "/secure":
+            return await call_next(request)
+        if not secrets.compare_digest(bearer, f"Bearer {token}"):
+            return JSONResponse(status_code=403, content={"detail": "Local authorization required"})
+        control = getattr(app.state, "background_control", None)
+        if control is not None:
+            control.touch()
         return await call_next(request)
+
+    @app.post("/secure")
+    async def secure_request(payload: SecureRequest) -> dict[str, str]:
+        try:
+            nonce, envelope = secure_channel.open(payload.payload)
+            method, path = envelope["method"], envelope["path"]
+            body = envelope.get("body")
+            if (
+                method not in ("GET", "POST", "PUT") or not isinstance(path, str)
+                or not path.startswith("/") or path.startswith("//") or path == "/secure"
+                or "?" in path or "#" in path or "\\" in path
+                or (body is not None and not isinstance(body, dict))
+                or (method == "GET" and body is not None)
+            ):
+                raise ValueError
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(
+                status_code=403, detail="Secure management request is invalid"
+            ) from exc
+        transport = httpx.ASGITransport(
+            app=app, client=("127.0.0.1", 1), raise_app_exceptions=False
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            response = await client.request(
+                method, path, json=body, headers={"Authorization": f"Bearer {token}"},
+            )
+        try:
+            result = response.json()
+        except ValueError:
+            result = {"detail": "Management request failed"}
+        return {"payload": secure_channel.seal(nonce, response.status_code, result)}
 
     async def live_port() -> int:
         state = await controller.status()
@@ -296,19 +454,44 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
     @app.get("/status")
     async def status() -> dict[str, Any]:
         state = await controller.status()
+        control = getattr(app.state, "background_control", None)
+        state["background_enabled"] = control.enabled if control is not None else False
         state["next_bind_host"] = Settings().host
-        state["installation"] = {
-            "config_path": str(Path.home() / ".mlx-serve" / "config.yaml"),
-            "homebrew_cli": next((p for p in (
-                "/opt/homebrew/bin/mlx-serve", "/usr/local/bin/mlx-serve"
-            ) if Path(p).exists()), None),
-            "cli_in_path": shutil.which("mlx-serve"),
-        }
+        state["installation"] = await existing_installation()
         return state
+
+    @app.post("/background")
+    async def set_background(payload: BackgroundRequest) -> dict[str, bool]:
+        async with background_guard:
+            control = getattr(app.state, "background_control", None)
+            if control is None:
+                raise HTTPException(status_code=503, detail="Background agent is unavailable")
+            try:
+                if payload.enabled:
+                    await asyncio.to_thread(control.enable)
+                else:
+                    await asyncio.to_thread(control.disable)
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"enabled": control.enabled}
+
+    @app.post("/background/attach")
+    async def attach_background(payload: BackgroundAttachRequest) -> dict[str, bool]:
+        async with background_guard:
+            control = getattr(app.state, "background_control", None)
+            if control is None or not control.enabled:
+                raise HTTPException(status_code=409, detail="Background agent is unavailable")
+            try:
+                await asyncio.to_thread(control.attach, payload.pid)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"enabled": True}
 
     @app.post("/server/start")
     async def start_server() -> dict[str, Any]:
-        return await controller.start()
+        async with storage_guard:
+            check_not_migrating()
+            return await controller.start()
 
     @app.post("/server/stop")
     async def stop_server() -> dict[str, str]:
@@ -345,27 +528,63 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
 
     @app.put("/settings")
     async def put_settings(payload: SettingsChanges) -> dict[str, Any]:
-        state = await controller.status()
-        if state["ownership"] == "external":
-            raise HTTPException(status_code=409, detail="External server settings are read-only")
-        try:
-            if "models_dir" in payload.values:
-                assert jobs is not None
-                current = Settings().models_dir
-                requested = str(payload.values["models_dir"])
-                if (
-                    current.resolve() != Path(requested).expanduser().resolve()
-                    and state["state"] not in ("stopped", "failed")
-                ):
-                    raise ValueError("Stop the server before changing model storage")
-                _check_storage_change(
-                    current, requested,
-                    any(job["status"] in ACTIVE_STATES for job in jobs.list()),
+        async with storage_guard:
+            check_not_migrating()
+            state = await controller.status()
+            if state["ownership"] == "external":
+                raise HTTPException(
+                    status_code=409, detail="External server settings are read-only"
                 )
-            save_settings(payload.values)
-            return await get_settings()
-        except (ValueError, OSError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            try:
+                if "models_dir" in payload.values:
+                    assert jobs is not None
+                    current = Settings().models_dir
+                    requested = str(payload.values["models_dir"])
+                    if (
+                        current.resolve() != Path(requested).expanduser().resolve()
+                        and state["state"] not in ("stopped", "failed")
+                    ):
+                        raise ValueError("Stop the server before changing model storage")
+                    _check_storage_change(
+                        current, requested,
+                        any(job["status"] in ACTIVE_STATES for job in jobs.list()),
+                    )
+                save_settings(payload.values)
+                return await get_settings()
+            except (ValueError, OSError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/storage/migration")
+    async def storage_migration_status() -> dict[str, Any]:
+        return migration_snapshot()
+
+    @app.post("/storage/migration/preview")
+    async def storage_migration_preview(payload: StorageMigrationRequest) -> dict[str, object]:
+        async with storage_guard:
+            check_not_migrating()
+            source = await check_migration_ready()
+            try:
+                return await asyncio.to_thread(
+                    preview_storage_migration, source, Path(payload.destination),
+                )
+            except (ValueError, OSError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/storage/migration")
+    async def start_storage_migration(payload: StorageMigrationRequest) -> dict[str, Any]:
+        nonlocal migration_task
+        async with storage_guard:
+            check_not_migrating()
+            source = await check_migration_ready()
+            migration_cancel.clear()
+            with migration_lock:
+                migration_state.clear()
+                migration_state.update({
+                    "status": "running", "phase": "checking", "source": str(source),
+                    "destination": payload.destination, "copied_bytes": 0, "size_bytes": 0,
+                })
+            migration_task = asyncio.create_task(run_migration(source, Path(payload.destination)))
+            return migration_snapshot()
 
     @app.get("/models")
     async def models() -> dict[str, Any]:
@@ -424,21 +643,23 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
 
     @app.post("/jobs")
     async def start_job(payload: JobRequest) -> dict[str, Any]:
-        assert jobs is not None
-        port = await live_port()
-        server_settings = await asyncio.to_thread(
-            _request_json, port, "/management/settings",
-            authorization=controller.authorization(port), host=controller.address(port),
-        )
-        models_dir = server_settings["fields"]["models_dir"]["applied"]
-        if not model_storage_available(Path(models_dir)):
-            raise HTTPException(status_code=503, detail="Model storage is unavailable")
-        try:
-            params = payload.model_dump(exclude={"token"})
-            params["models_dir"] = models_dir
-            return jobs.start(params, token=payload.token)
-        except (ValueError, OSError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        async with storage_guard:
+            check_not_migrating()
+            assert jobs is not None
+            port = await live_port()
+            server_settings = await asyncio.to_thread(
+                _request_json, port, "/management/settings",
+                authorization=controller.authorization(port), host=controller.address(port),
+            )
+            models_dir = server_settings["fields"]["models_dir"]["applied"]
+            if not model_storage_available(Path(models_dir)):
+                raise HTTPException(status_code=503, detail="Model storage is unavailable")
+            try:
+                params = payload.model_dump(exclude={"token"})
+                params["models_dir"] = models_dir
+                return jobs.start(params, token=payload.token)
+            except (ValueError, OSError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/jobs/{job_id}/cancel")
     async def cancel_job(job_id: str) -> dict[str, Any]:
@@ -478,13 +699,16 @@ async def _serve(token: str, parent_pid: int) -> None:
     listener.bind(("127.0.0.1", 0))
     listener.listen(128)
     listener.set_inheritable(False)
+    key_id = key_identifier(token)
+    control = BackgroundControl(DATA_DIR, listener.getsockname()[1], parent_pid, key_id)
+    app.state.background_control = control
     config = uvicorn.Config(app, log_level="warning", access_log=False, proxy_headers=False)
     server = uvicorn.Server(config)
 
     async def monitor_parent() -> None:
         while not server.should_exit:
             await asyncio.sleep(1)
-            if os.getppid() != parent_pid:
+            if await asyncio.to_thread(control.should_exit):
                 server.should_exit = True
 
     watcher = asyncio.create_task(monitor_parent())
@@ -495,6 +719,7 @@ async def _serve(token: str, parent_pid: int) -> None:
         watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watcher
+        await asyncio.to_thread(control.disable)
         listener.close()
 
 

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -91,6 +92,56 @@ def test_new_app_config_is_local_and_existing_cli_assets_are_preserved(tmp_path,
     (old.parent / "metadata.json").write_text("{}")
     assert not initialize_app_config(old)
     assert not old.exists()
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "expected"),
+    [
+        (0, "state = running", "", "running"),
+        (0, "state = waiting", "", "loaded"),
+        (113, "", "Could not find service", "not_loaded"),
+        (1, "", "permission denied", "unknown"),
+    ],
+)
+def test_existing_launchd_service_is_only_inspected(
+    tmp_path, monkeypatch, returncode, stdout, stderr, expected,
+):
+    from mlx_serve import management_agent
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(management_agent.sys, "platform", "darwin")
+    monkeypatch.setattr(management_agent.shutil, "which", lambda _: "/example/mlx-serve")
+    plist = tmp_path / "Library/LaunchAgents/com.mlx-serve.server.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_text("existing service")
+    commands = []
+
+    def inspect(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+    monkeypatch.setattr(management_agent.subprocess, "run", inspect)
+    snapshot = management_agent._installation_snapshot()
+    assert commands == [[
+        "/bin/launchctl", "print", f"gui/{os.getuid()}/com.mlx-serve.server",
+    ]]
+    assert snapshot["launchd"]["user_state"] == expected
+    assert str(plist) in snapshot["launchd"]["files"]
+    assert snapshot["cli_in_path"] == "/example/mlx-serve"
+    assert plist.read_text() == "existing service"
+
+
+def test_launchd_inspection_timeout_reports_unknown(tmp_path, monkeypatch):
+    from mlx_serve import management_agent
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(management_agent.sys, "platform", "darwin")
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, 2)
+
+    monkeypatch.setattr(management_agent.subprocess, "run", timeout)
+    assert management_agent._installation_snapshot()["launchd"]["user_state"] == "unknown"
 
 
 def test_lan_and_browser_cannot_use_management_but_can_use_inference_metadata():

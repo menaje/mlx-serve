@@ -139,7 +139,10 @@ def _atomic_write(path: Path, raw: dict[str, Any]) -> None:
             os.unlink(temp_name)
 
 
-def save_settings(changes: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> None:
+def save_settings(
+    changes: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH, *,
+    expected_models_dir: Path | None = None,
+) -> None:
     """Validate the complete candidate before replacing the original file."""
     unknown = changes.keys() - EDITABLE_FIELDS.keys()
     if unknown:
@@ -149,6 +152,13 @@ def save_settings(changes: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> 
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             raw = _read_config(path)
+            if expected_models_dir is not None:
+                environment, dotenv = _source_values()
+                if "models_dir" in environment or "models_dir" in dotenv:
+                    raise ValueError("Model storage is overridden by the environment")
+                current = _settings(flatten_config(raw)).models_dir
+                if current.resolve() != expected_models_dir.resolve():
+                    raise ValueError("Model storage settings changed during migration")
             for name, value in changes.items():
                 section, key = EDITABLE_FIELDS[name]
                 existing = raw.setdefault(section, {})

@@ -211,6 +211,14 @@ class TestSettings:
         settings = Settings(preload_models="model1, model2, model3")
         assert settings.preload_models == ["model1", "model2", "model3"]
 
+    def test_preload_models_environment_supports_cli_and_json_forms(self, monkeypatch):
+        from mlx_serve.config import Settings
+
+        monkeypatch.setenv("MLX_SERVE_PRELOAD_MODELS", "model1, model2")
+        assert Settings().preload_models == ["model1", "model2"]
+        monkeypatch.setenv("MLX_SERVE_PRELOAD_MODELS", '["model1", "model2"]')
+        assert Settings().preload_models == ["model1", "model2"]
+
     def test_models_dir_expansion(self):
         """Test ~ expansion in models_dir."""
         from mlx_serve.config import Settings

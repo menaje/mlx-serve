@@ -17,6 +17,7 @@ from mlx_serve.core.default_models import (
     default_model,
     set_default_model,
 )
+from mlx_serve.core.generation_workers import acquire_generation_worker, await_worker_operation
 from mlx_serve.core.inference_control import (
     build_inference_key,
     get_model_execution_lock,
@@ -29,9 +30,15 @@ from mlx_serve.core.managed_originals import (
     list_unreferenced_originals,
 )
 from mlx_serve.core.mlx_memory import get_mlx_memory_snapshot
-from mlx_serve.core.model_manager import ModelInUseError, ModelType, model_manager
+from mlx_serve.core.model_manager import (
+    ModelInUseError,
+    ModelType,
+    model_manager,
+    resolve_model_alias,
+)
 from mlx_serve.core.runtime_topology import (
     get_generation_worker_kind,
+    get_generation_worker_model,
     get_retrieval_worker_kind,
 )
 from mlx_serve.core.storage_access import model_storage_available
@@ -75,6 +82,9 @@ async def _local_operation(operation: str, payload: ModelOperation) -> dict[str,
     worker_kind = get_retrieval_worker_kind() or get_generation_worker_kind()
     if worker_kind and payload.type != worker_kind:
         raise HTTPException(status_code=400, detail="Model type does not belong to this worker")
+    assigned = get_generation_worker_model()
+    if assigned and resolve_model_alias(assigned)[0] != resolve_model_alias(payload.name)[0]:
+        raise HTTPException(status_code=404, detail="Model is not assigned to this worker")
     model_manager._load_metadata()
     if not model_manager.is_model_installed(payload.name):
         raise HTTPException(status_code=404, detail="Model is not installed")
@@ -167,7 +177,13 @@ async def management_state(request: Request) -> dict[str, Any]:
                 workers[kind] = {"available": False}
     generation = getattr(request.app.state, "generation_worker_supervisor", None)
     if settings.generation_worker_isolation_enabled:
-        snapshots = generation.snapshot() if generation is not None else {}
+        snapshots = await asyncio.to_thread(generation.snapshot) if generation is not None else {}
+        if generation is None:
+            workers["generation:supervisor"] = {"available": False}
+        elif settings.generation_worker_mode == "type":
+            for kind in ("llm", "vlm"):
+                if kind not in snapshots:
+                    workers[f"generation:{kind}"] = {"available": False}
         for key, worker in snapshots.items():
             try:
                 if not worker.get("alive"):
@@ -188,18 +204,27 @@ async def management_state(request: Request) -> dict[str, Any]:
             workers.get(model.model_type) if settings.retrieval_worker_isolation_enabled else None
         )
         if settings.generation_worker_isolation_enabled and model.model_type in ("llm", "vlm"):
-            # A generation worker can be model-scoped; absence is not evidence of a load.
-            candidates = [value for key, value in workers.items() if key.startswith("generation:")]
-            known = [value for value in candidates if value.get("available")]
-            loaded = any(
-                model.name in value["cache"][f"{model.model_type}_models"]["models"]
-                for value in known
+            resolved_name = resolve_model_alias(model.name)[0]
+            worker_key = (
+                f"{model.model_type}:{resolved_name}"
+                if settings.generation_worker_mode == "model" else model.model_type
             )
-            load_state = (
-                "loaded" if loaded else
-                ("not_loaded" if len(known) == len(candidates) else "unknown")
-            )
-            request_state = "unknown"
+            owner = workers.get(f"generation:{worker_key}")
+            if (
+                owner is None and generation is not None
+                and settings.generation_worker_mode == "model"
+            ):
+                load_state, request_state = "not_loaded", "idle"
+            elif owner is None or not owner.get("available"):
+                load_state, request_state = "unknown", "unknown"
+            else:
+                cache = owner["cache"].get(f"{model.model_type}_models", {})
+                load_state = "loaded" if resolved_name in cache.get("models", []) else "not_loaded"
+                key = build_inference_key(model.model_type, model.name)
+                active = owner["requests"].get(key, {})
+                request_state = "running" if active.get("active") else (
+                    "queued" if active.get("queued") else "idle"
+                )
         else:
             source = owner if owner is not None else local
             if owner is not None and not owner.get("available"):
@@ -275,5 +300,26 @@ async def manage_model(operation: str, payload: ModelOperation, request: Request
             raise HTTPException(status_code=503, detail="Worker is unavailable")
         return await _worker_request(url, f"/internal/management/{operation}", payload.model_dump())
     if payload.type in ("llm", "vlm") and settings.generation_worker_isolation_enabled:
-        raise HTTPException(status_code=501, detail="Generation worker management is not available")
+        model_manager._load_metadata()
+        if not model_manager.is_model_installed(payload.name):
+            raise HTTPException(status_code=404, detail="Model is not installed")
+        if model_manager.get_model_type(payload.name) != payload.type:
+            raise HTTPException(status_code=400, detail="Model type does not match the registry")
+        supervisor = getattr(request.app.state, "generation_worker_supervisor", None)
+        if supervisor is None:
+            raise HTTPException(status_code=503, detail="Generation worker is unavailable")
+        try:
+            lease = await acquire_generation_worker(
+                supervisor, payload.type, payload.name, start=operation == "load"
+            )
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail="Generation worker is unavailable") from exc
+        if lease is None:
+            if settings.generation_worker_mode == "model":
+                return {"unloaded": []}
+            raise HTTPException(status_code=503, detail="Generation worker is unavailable")
+        return await await_worker_operation(
+            _worker_request(lease.url, f"/internal/management/{operation}", payload.model_dump()),
+            lease,
+        )
     return await _local_operation(operation, payload)

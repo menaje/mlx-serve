@@ -10,7 +10,7 @@ criteria of issue #12.
   huggingface-hub 1.33.0, transformers 5.21.0.
 - Bundled environment: Python 3.14.10 with the same package versions above;
   the complete pinned dependency list is in `requirements-runtime.txt`.
-- The Python test suite passed 309 tests. One d3 integration test was skipped
+- The Python test suite passed 338 tests. One d3 integration test was skipped
   because a local d3-lite checkpoint was not supplied.
 
 ## Observed flows
@@ -78,6 +78,28 @@ criteria of issue #12.
 - A compressed experimental DMG was created and mounted read-only on this Mac;
   it contained the bundled runtime, an Applications link and an app whose ad-hoc
   signature still verified. This did not test installation or Gatekeeper.
+- With the development runtime, a real SmolLM2 135M MLX model was loaded,
+  queried and unloaded through both generation-worker isolation modes. Tests
+  also covered worker startup races, active streams and unavailable workers.
+- On the same Mac, an isolated storage migration copied that model, verified
+  the files and saved settings, then loaded it and served an inference from the
+  new location. The source remained intact. The packaged app also previewed
+  and copied a disposable synthetic model through its settings UI. Automated
+  tests cover interrupted copies, changed files, concurrent configuration,
+  links, insufficient space and failed saves.
+- In an isolated home, the development agent and app-owned server continued
+  after their parent process exited while a real preparation job was running.
+  An authenticated encrypted client reattached, cancelled the job, and stopped
+  and restarted the owned server. After disabling the option and ending the
+  attached parent, the agent and server exited. The protocol tests cover replay,
+  incorrect keys, remote and browser-origin requests, and discovery records.
+- Existing CLI and launchd detection is read-only; tests cover running, loaded,
+  absent and uninspectable user services. System service files are identified,
+  but their running state is not determined.
+- After the encrypted management channel and launchd detection were added, the
+  rebuilt packaged app was launched in a separate test home. Its UI displayed
+  the test port and service state, started and stopped its own server, and showed
+  the background option disabled. Its ad-hoc signature was checked after use.
 
 ## Remaining validation and limitations
 
@@ -92,8 +114,9 @@ criteria of issue #12.
 - The bundle has an ad-hoc signature only. Developer ID signing, notarization,
   distribution of a release DMG, and installation on a separate Mac without
   development tools remain unverified.
-- Model storage migration, general Hugging Face cache cleanup, and background
-  server ownership remain unimplemented. Defaults are limited to decision,
-  embedding and reranker models. See `README.md` for the supported model scope.
+- General Hugging Face cache cleanup remains unimplemented. Defaults are limited
+  to decision, embedding and reranker models. See `README.md` for the supported
+  model scope. The optional background mode's actual Keychain and app relaunch
+  flow has not been exercised end to end.
 - Notification transition filtering is tested, but the macOS permission prompt
   and visible delivery have not been exercised end to end.

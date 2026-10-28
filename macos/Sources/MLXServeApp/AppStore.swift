@@ -1,4 +1,6 @@
 import AppKit
+import CryptoKit
+import Darwin
 import Foundation
 import Security
 
@@ -10,12 +12,14 @@ final class AppStore: ObservableObject {
     @Published var jobDetail: [String: Any] = [:]
     @Published var settings: [String: Any] = [:]
     @Published var runtime: [String: Any] = [:]
+    @Published var storageMigration: [String: Any] = [:]
     @Published var selectedJob: String?
     @Published var message: String?
     @Published var agentReady = false
     @Published var modelError: String?
     @Published var busy = false
     @Published var automaticStartNote: String?
+    @Published var backgroundEnabled = false
 
     private var agent: Process?
     private var agentPort: Int?
@@ -34,6 +38,7 @@ final class AppStore: ObservableObject {
     var baseURL: String { server["url"] as? String ?? "http://127.0.0.1:8000" }
     var models: [[String: Any]] { modelState["models"] as? [[String: Any]] ?? [] }
     var modelStateAvailable: Bool { modelState["models"] is [[String: Any]] }
+    var migratingStorage: Bool { storageMigration["status"] as? String == "running" }
     var activeJobs: Int {
         jobs.filter { ["queued", "running", "cancelling", "recovery_pending"].contains($0["status"] as? String ?? "") }.count
     }
@@ -41,6 +46,15 @@ final class AppStore: ObservableObject {
     init() { Task { await launchAgent() } }
 
     private func launchAgent() async {
+        do {
+            if try await reconnectBackgroundAgent() {
+                startPolling(nil)
+                return
+            }
+        } catch {
+            message = error.localizedDescription
+            return
+        }
         let bundled = Bundle.main.resourceURL?.appendingPathComponent("runtime/bin/python3").path
         let development = ProcessInfo.processInfo.environment["MLX_SERVE_PYTHON"]
         guard let executable = [bundled, development].compactMap({ $0 }).first(where: {
@@ -94,17 +108,94 @@ final class AppStore: ObservableObject {
                 throw AppError("로컬 관리 구성요소를 시작하지 못했습니다.")
             }
             agentPort = port
-            agentReady = true
-            Task {
-                while !Task.isCancelled && process.isRunning {
-                    await refresh()
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+            var confirmed = false
+            for _ in 0..<12 where process.isRunning {
+                if (try? await request("/status")) != nil {
+                    confirmed = true
+                    break
                 }
-                agentReady = false
-                message = "로컬 관리 구성요소가 종료됐습니다. 앱을 다시 실행하세요."
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            guard confirmed else {
+                throw AppError("로컬 관리 구성요소를 확인하지 못했습니다. 기존 관리 프로세스와 작업을 확인하세요.")
+            }
+            agentReady = true
+            startPolling(process)
+            if UserDefaults.standard.bool(forKey: "backgroundServer") {
+                await setBackground(true)
             }
         } catch {
             message = error.localizedDescription
+        }
+    }
+
+    private struct AgentRecord: Decodable {
+        let version: Int
+        let pid: Int32
+        let port: Int
+        let session: String
+        let keyID: String
+
+        enum CodingKeys: String, CodingKey {
+            case version, pid, port, session
+            case keyID = "key_id"
+        }
+    }
+
+    private var agentKeyID: String {
+        let input = Data("mlx-serve-agent-key-id-v1:".utf8) + Data(secret.utf8)
+        return SHA256.hash(data: input).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func reconnectBackgroundAgent() async throws -> Bool {
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let file = URL(fileURLWithPath: home).appendingPathComponent(".mlx-serve/app-agent.json")
+        guard FileManager.default.fileExists(atPath: file.path) else { return false }
+        let values = try file.resourceValues(forKeys: [.isSymbolicLinkKey, .fileSizeKey])
+        guard values.isSymbolicLink != true, (values.fileSize ?? 4097) <= 4096,
+              let record = try? JSONDecoder().decode(AgentRecord.self, from: Data(contentsOf: file)),
+              record.version == 1, record.pid > 1, (1...65535).contains(record.port),
+              !record.session.isEmpty, record.keyID.count == 64,
+              record.keyID.allSatisfy({ $0.isHexDigit }) else {
+            throw AppError("백그라운드 연결 정보를 확인할 수 없습니다. 저장소와 실행 중인 서비스를 확인하세요.")
+        }
+        errno = 0
+        if kill(record.pid, 0) != 0 && errno == ESRCH { return false }
+        guard let saved = try AgentKeychain.read(record.keyID) else {
+            throw AppError("백그라운드 서버의 Keychain 연결 정보를 찾을 수 없습니다.")
+        }
+        secret = saved
+        guard agentKeyID == record.keyID else {
+            secret = ""
+            throw AppError("백그라운드 서버의 Keychain 연결 정보를 확인하지 못했습니다.")
+        }
+        agentPort = record.port
+        do {
+            _ = try await request("/background/attach", method: "POST", body: [
+                "pid": Int(ProcessInfo.processInfo.processIdentifier)
+            ])
+        } catch {
+            agentPort = nil
+            secret = ""
+            throw AppError("실행 중인 백그라운드 서버를 안전하게 확인하지 못했습니다. 기존 서비스와 Keychain 상태를 확인하세요.")
+        }
+        backgroundEnabled = true
+        agentReady = true
+        UserDefaults.standard.set(true, forKey: "backgroundServer")
+        return true
+    }
+
+    private func startPolling(_ process: Process?) {
+        Task {
+            while !Task.isCancelled {
+                if let process, !process.isRunning { break }
+                await refresh()
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+            if process != nil {
+                agentReady = false
+                message = "로컬 관리 구성요소가 종료됐습니다. 앱을 다시 실행하세요."
+            }
         }
     }
 
@@ -115,21 +206,39 @@ final class AppStore: ObservableObject {
     }
 
     func request(_ path: String, method: String = "GET", body: [String: Any]? = nil) async throws -> Any {
-        guard let port = agentPort, let url = URL(string: "http://127.0.0.1:\(port)\(path)") else {
+        guard let port = agentPort, let url = URL(string: "http://127.0.0.1:\(port)/secure") else {
             throw AppError("관리 구성요소에 연결하고 있습니다.")
         }
         let timeout: TimeInterval = path == "/status" ? 6 :
             (method == "GET" && (path == "/models" || path.hasPrefix("/jobs")) ? 20 : 220)
         var request = URLRequest(url: url, timeoutInterval: timeout)
-        request.httpMethod = method
-        request.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
-        if let body {
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        }
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var envelope: [String: Any] = [
+            "method": method, "path": path, "timestamp": Date().timeIntervalSince1970
+        ]
+        if let body { envelope["body"] = body }
+        let material = Data("mlx-serve-agent-aes-key-v1:".utf8) + Data(secret.utf8)
+        let key = SymmetricKey(data: Data(SHA256.hash(data: material)))
+        let additionalData = Data("mlx-serve-agent-v1".utf8)
+        let plaintext = try JSONSerialization.data(withJSONObject: envelope)
+        let box = try AES.GCM.seal(plaintext, using: key, authenticating: additionalData)
+        guard let combined = box.combined else { throw AppError("관리 연결을 암호화하지 못했습니다.") }
+        let nonce = Data(combined.prefix(12))
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["payload": combined.base64EncodedString()])
         let (data, response) = try await localSession.data(for: request)
-        let json = (try? JSONSerialization.jsonObject(with: data)) ?? [:]
-        guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else {
+        guard let response = response as? HTTPURLResponse, response.statusCode == 200,
+              let outer = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let encoded = outer["payload"] as? String, let sealed = Data(base64Encoded: encoded),
+              let responseBox = try? AES.GCM.SealedBox(combined: sealed),
+              let decrypted = try? AES.GCM.open(responseBox, using: key, authenticating: additionalData),
+              let result = try? JSONSerialization.jsonObject(with: decrypted) as? [String: Any],
+              let requestNonce = result["request_nonce"] as? String,
+              Data(base64Encoded: requestNonce) == nonce, let status = result["status"] as? Int else {
+            throw AppError("관리 구성요소의 보안 연결을 확인하지 못했습니다. 앱을 다시 실행하세요.")
+        }
+        let json = result["body"] ?? [:]
+        guard (200..<300).contains(status) else {
             let detail = (json as? [String: Any])?["detail"]
             let message = detail.map { String(describing: $0) } ?? "관리 요청에 실패했습니다."
             throw AppError(localizedMessage(message))
@@ -143,8 +252,8 @@ final class AppStore: ObservableObject {
                 message.replacingOccurrences(of: "Cleanup was incomplete; inspect ", with: "")
         }
         let translations = [
-            "Existing model files must be migrated before changing storage": "기존 모델 파일이 있어 저장 위치를 바꿀 수 없습니다. 모델 이동 기능이 준비될 때까지 현재 위치를 유지하세요.",
-            "Existing registered models must be migrated before changing storage": "등록된 모델이 있어 저장 위치를 바꿀 수 없습니다. 모델 이동 기능이 준비될 때까지 현재 위치를 유지하세요.",
+            "Existing model files must be migrated before changing storage": "기존 모델이 있습니다. ‘기존 모델 복사 및 전환’을 이용하세요.",
+            "Existing registered models must be migrated before changing storage": "등록된 모델이 있습니다. ‘기존 모델 복사 및 전환’을 이용하세요.",
             "The current model storage is unavailable; reconnect it first": "현재 모델 저장소에 접근할 수 없습니다. 저장 장치를 다시 연결한 뒤 시도하세요.",
             "Model storage volume is unavailable; reconnect it first": "모델 저장 장치가 연결되지 않았습니다. 장치를 다시 연결한 뒤 서버를 시작하세요.",
             "Model storage is unavailable": "모델 저장소에 접근할 수 없습니다. 장치 연결과 권한을 확인하세요.",
@@ -159,6 +268,30 @@ final class AppStore: ObservableObject {
             "The existing model registry could not be checked": "기존 모델 목록을 확인할 수 없습니다. 저장 장치와 파일 권한을 확인하세요.",
             "Finish or cancel model preparation before changing storage": "진행 중인 모델 준비를 마치거나 취소한 뒤 저장 위치를 바꾸세요.",
             "Stop the server before changing model storage": "저장 위치를 바꾸기 전에 서버를 중지하세요.",
+            "Model storage migration is in progress": "모델 저장소를 복사하는 중입니다. 완료될 때까지 기다리세요.",
+            "Model storage is overridden by the environment": "환경 변수 또는 .env 파일이 저장 위치를 지정하고 있습니다. 해당 설정을 제거한 뒤 다시 시도하세요.",
+            "Model storage settings changed during migration": "복사하는 동안 저장 위치 설정이 변경되어 전환을 중지했습니다. 기존 파일과 복사본은 보존됩니다.",
+            "Model storage changed during migration": "복사하는 동안 기존 저장소가 변경되어 전환을 중지했습니다. 기존 파일과 복사본을 확인하세요.",
+            "Model storage is being modified by another process": "다른 프로세스가 모델 저장소를 사용 중입니다. 다른 서버와 모델 작업을 종료하세요.",
+            "The destination parent directory already exists": "새 저장 위치의 상위 폴더가 이미 있습니다. 아직 없는 새 폴더 안의 경로를 지정하세요.",
+            "The destination parent must be a new folder inside a writable folder": "쓰기 가능한 기존 폴더 안에 새 폴더를 지정하세요.",
+            "Choose a destination outside the existing model storage": "기존 저장소 바깥에 새 위치를 지정하세요.",
+            "Choose a separate model directory": "모델 파일을 저장할 별도 폴더 이름을 지정하세요.",
+            "Model directory must be an absolute path": "모델 저장 위치를 절대 경로로 입력하세요.",
+            "Model storage contains a link or another mounted volume": "저장소에 심볼릭 링크 또는 중첩된 저장 장치가 있어 자동 복사할 수 없습니다.",
+            "Model storage contains an unsupported file": "저장소에 자동 복사를 지원하지 않는 파일이 있습니다.",
+            "An unfinished preparation directory needs review": "완료되지 않은 준비 작업 폴더가 있습니다. 작업 이력과 저장소를 확인하세요.",
+            "Not enough free disk space for the model copy": "새 저장소의 여유 공간이 부족합니다. 공간을 확보한 뒤 다시 시도하세요.",
+            "Copied model files failed verification": "복사본 검증에 실패해 저장 위치를 바꾸지 않았습니다. 기존 파일과 복사본을 확인하세요.",
+            "Copied model files changed during migration": "검증 중 복사본이 변경되어 저장 위치를 바꾸지 않았습니다. 기존 파일과 복사본을 확인하세요.",
+            "Model storage copy was interrupted": "모델 복사가 중단되어 기존 저장 위치를 유지했습니다. 복사 대상 폴더를 확인하세요.",
+            "Model storage copy failed": "모델 복사에 실패했습니다. 기존 파일과 복사 대상 폴더를 확인하세요.",
+            "Background agent is unavailable": "백그라운드 관리 구성요소를 사용할 수 없습니다. 앱을 다시 실행하세요.",
+            "Another background agent is already running": "다른 백그라운드 관리 구성요소가 실행 중입니다. 기존 앱을 확인하세요.",
+            "Another background agent may still be running": "기존 백그라운드 관리 구성요소가 남아 있을 수 있습니다. 실행 중인 서비스를 확인하세요.",
+            "Background agent record is invalid": "백그라운드 연결 정보가 올바르지 않습니다. 저장소와 실행 중인 서비스를 확인하세요.",
+            "Background agent lock is invalid": "백그라운드 연결 잠금 파일을 확인할 수 없습니다. 저장소 권한을 확인하세요.",
+            "The application process could not be verified": "앱 프로세스를 확인하지 못해 백그라운드 연결을 중지했습니다.",
             "External server settings are read-only": "기존 서버의 설정은 이 앱에서 변경할 수 없습니다.",
             "The configured port is already in use": "설정된 포트를 다른 서비스가 사용 중입니다. 포트나 해당 서비스를 확인하세요.",
             "The app does not own a running server": "이 앱이 시작한 서버가 아닙니다. 기존 서비스에서 서버를 관리하세요.",
@@ -175,7 +308,18 @@ final class AppStore: ObservableObject {
     func refresh() async {
         do {
             server = try await request("/status") as? [String: Any] ?? [:]
+            backgroundEnabled = server["background_enabled"] as? Bool ?? false
             jobs = try await request("/jobs") as? [[String: Any]] ?? []
+            let previousMigration = storageMigration["status"] as? String
+            storageMigration = try await request("/storage/migration") as? [String: Any] ?? [:]
+            let migrationStatus = storageMigration["status"] as? String
+            if previousMigration == "running" && migrationStatus == "succeeded" {
+                await reloadSettings()
+                message = "모델 복사와 저장 위치 전환을 완료했습니다. 기존 파일은 이전 위치에 그대로 남아 있습니다."
+            } else if previousMigration == "running" && migrationStatus == "failed" {
+                let reason = storageMigration["error"] as? String ?? "Model storage copy failed"
+                message = localizedMessage(reason) + " 기존 파일은 보존되며, 복사 대상 폴더가 남을 수 있습니다."
+            }
             let events = notificationPolicy.observe(
                 serverState: server["state"] as? String ?? "unknown", ownership: ownership, jobs: jobs
             )
@@ -216,7 +360,7 @@ final class AppStore: ObservableObject {
     }
 
     private func evaluateAutomaticStart() async {
-        guard !busy else { return }
+        guard !busy && !migratingStorage else { return }
         let autoStart = UserDefaults.standard.bool(forKey: "automaticStartServer")
         let autoRecover = UserDefaults.standard.bool(forKey: "automaticRecoverServer")
         let decision = serverStartPolicy.evaluate(
@@ -249,6 +393,20 @@ final class AppStore: ObservableObject {
         await action { _ = try await self.request("/server/stop", method: "POST") }
         // A concurrent refresh while stop was in progress must not re-arm it.
         if state == "stopped" { serverStartPolicy.manualStopRequested() }
+    }
+
+    func setBackground(_ enabled: Bool) async {
+        guard agentReady, !busy else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            if enabled { try AgentKeychain.save(secret, keyID: agentKeyID) }
+            _ = try await request("/background", method: "POST", body: ["enabled": enabled])
+            backgroundEnabled = enabled
+            UserDefaults.standard.set(enabled, forKey: "backgroundServer")
+            if !enabled { try AgentKeychain.remove(agentKeyID) }
+            await refresh()
+        } catch { message = error.localizedDescription }
     }
 
     func modelCommand(_ operation: String, name: String, type: String) async {
@@ -285,6 +443,19 @@ final class AppStore: ObservableObject {
     func saveSettings(_ values: [String: Any]) async {
         await action {
             self.settings = try await self.request("/settings", method: "PUT", body: ["values": values]) as? [String: Any] ?? [:]
+        }
+    }
+
+    func previewStorageMigration(_ destination: String) async throws -> [String: Any] {
+        try await request("/storage/migration/preview", method: "POST", body: ["destination": destination])
+            as? [String: Any] ?? [:]
+    }
+
+    func startStorageMigration(_ destination: String) async {
+        await action {
+            self.storageMigration = try await self.request(
+                "/storage/migration", method: "POST", body: ["destination": destination]
+            ) as? [String: Any] ?? [:]
         }
     }
 
