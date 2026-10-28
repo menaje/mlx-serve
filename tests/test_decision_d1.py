@@ -14,17 +14,18 @@ from mlx_serve.core.d1_decision import D1DecisionModel, DecisionInputError
 from mlx_serve.core.decision_prepare import prepare_d1, read_verified_manifest
 from mlx_serve.core.decision_prepare_worker import (
     MANIFEST,
+    MLX_REPO,
     SOURCE_REPO,
     compare_predictions,
     file_hash,
     validate_checkpoint,
 )
-from mlx_serve.core.model_manager import model_manager
+from mlx_serve.core.model_manager import TTLLRUCache, model_manager
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
-def create_artifact(path: Path):
+def create_artifact(path: Path, repo: str = SOURCE_REPO):
     path.mkdir(parents=True)
     for name, data in {
         "config.json": b'{"model_type":"d1_omni"}',
@@ -36,7 +37,7 @@ def create_artifact(path: Path):
     files = {p.name: file_hash(p) for p in path.iterdir()}
     manifest = {
         "schema_version": 1,
-        "source_repo": SOURCE_REPO,
+        "source_repo": repo,
         "revision": REVISION,
         "architecture": "d1_omni",
         "precision": "float16",
@@ -190,6 +191,133 @@ def preparation(tmp_path, monkeypatch):
         lambda *a, **k: SimpleNamespace(sha=REVISION, siblings=[]),
     )
     return tmp_path
+
+
+@pytest.mark.parametrize("alias", ["d1-omni", "D1-OMNI", "d1-omni-600m", "d1-omni-600M"])
+def test_api_pull_alias_registers_a_callable_canonical_model(
+    preparation, monkeypatch, client, alias
+):
+    async def fake_spawn(*args, **kwargs):
+        create_artifact(Path(args[-1]))
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+        return SimpleNamespace(
+            stdout=reader, pid=os.getpid(), returncode=0, wait=lambda: asyncio.sleep(0, result=0)
+        )
+
+    class FakeDecisionModel:
+        def __init__(self, model_dir):
+            assert model_dir == settings.models_dir / "d1-omni-600M"
+
+        def decide(self, state, questions):
+            return {
+                "answers": {"q": {"type": "bool", "value": True, "probability": 0.9}},
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            }
+
+    monkeypatch.setattr(
+        "mlx_serve.core.decision_prepare.asyncio.create_subprocess_exec", fake_spawn
+    )
+    monkeypatch.setattr("mlx_serve.core.d1_decision.D1DecisionModel", FakeDecisionModel)
+    monkeypatch.setattr(model_manager, "_decision_cache", TTLLRUCache(maxsize=1, ttl=60))
+    monkeypatch.setattr(model_manager, "_ensure_load_memory_available", lambda *a, **k: None)
+    monkeypatch.setattr(model_manager, "_memory_calibration_baseline", lambda: (0, 0))
+    monkeypatch.setattr(model_manager, "_calibrate_loaded_model_estimate", lambda *a, **k: None)
+
+    response = client.post(
+        "/api/pull",
+        json={"name": SOURCE_REPO, "type": "decision", "model_name": alias, "revision": REVISION},
+    )
+    assert response.status_code == 200
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert events[-1]["status"] == "success"
+    assert events[-1]["name"] == "d1-omni-600M"
+    assert model_manager.is_model_installed(alias)
+    assert model_manager.get_model_info(alias).name == "d1-omni-600M"
+    assert set(model_manager._metadata) == {"d1-omni-600M"}
+
+    decision = client.post(
+        "/v1/decisions",
+        json={"model": alias, "state": "test", "questions": {"q": {"type": "bool"}}},
+    )
+    assert decision.status_code == 200
+    assert decision.json()["model"] == "d1-omni-600M"
+    assert decision.json()["answers"]["q"]["value"] is True
+
+
+@pytest.mark.parametrize(
+    ("repo", "alias", "canonical"),
+    [
+        (SOURCE_REPO, "d1-omni", "d1-omni-600M"),
+        (MLX_REPO, "D1-OMNI-600M-MLX-FP16", "d1-omni-600M-MLX-fp16"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_direct_preparation_normalizes_aliases(
+    preparation, monkeypatch, repo, alias, canonical
+):
+    async def fake_spawn(*args, **kwargs):
+        create_artifact(Path(args[-1]), repo)
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+        return SimpleNamespace(
+            stdout=reader, pid=os.getpid(), returncode=0, wait=lambda: asyncio.sleep(0, result=0)
+        )
+
+    monkeypatch.setattr(
+        "mlx_serve.core.decision_prepare.asyncio.create_subprocess_exec", fake_spawn
+    )
+    events = [event async for event in prepare_d1(model_manager, repo, alias, REVISION)]
+    assert events[-1]["status"] == "success"
+    assert events[-1]["name"] == canonical
+    assert model_manager.is_model_installed(alias)
+    assert (settings.models_dir / canonical).is_dir()
+
+
+@pytest.mark.parametrize(
+    ("repo", "name"),
+    [
+        (SOURCE_REPO, "d3-lite"),
+        (SOURCE_REPO, "qwen-embedding"),
+        (SOURCE_REPO, "d1-omni-600m-mlx-fp16"),
+        (MLX_REPO, "d1-omni"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_preparation_rejects_aliases_reserved_for_other_sources(preparation, repo, name):
+    direct = [event async for event in prepare_d1(model_manager, repo, name, REVISION)]
+    through_manager = [
+        event async for event in model_manager.pull_model(repo, "decision", name, revision=REVISION)
+    ]
+    for events in (direct, through_manager):
+        assert events[-1]["status"] == "error"
+        assert "reserved for" in events[-1]["message"]
+    assert not list(settings.models_dir.iterdir())
+    assert not model_manager._metadata
+
+
+@pytest.mark.asyncio
+async def test_alias_does_not_replace_a_conflicting_canonical_installation(preparation):
+    destination = settings.models_dir / "d1-omni-600M"
+    create_artifact(destination)
+    model_manager._metadata["d1-omni-600M"] = {
+        "type": "decision",
+        "hf_repo": SOURCE_REPO,
+        "revision": "another-revision",
+    }
+    model_manager._save_metadata()
+    previous_metadata = model_manager._metadata_path.read_bytes()
+    results = [
+        event
+        async for event in model_manager.pull_model(
+            SOURCE_REPO, "decision", "d1-omni", revision=REVISION
+        )
+    ]
+    assert results[-1]["status"] == "error"
+    assert "does not match" in results[-1]["message"]
+    assert model_manager._metadata_path.read_bytes() == previous_metadata
+    assert (destination / "model.safetensors").read_bytes() == b"weights"
+    assert not (settings.models_dir / "d1-omni").exists()
 
 
 @pytest.mark.asyncio

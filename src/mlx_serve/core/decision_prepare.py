@@ -103,6 +103,13 @@ async def prepare_d1(
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
         yield {"status": "error", "message": "Invalid decision model name"}
         return
+    from mlx_serve.core.model_manager import resolve_decision_install_name
+
+    try:
+        name = resolve_decision_install_name(name, repo)
+    except ValueError as exc:
+        yield {"status": "error", "message": str(exc)}
+        return
     model_dir = manager._get_model_dir(name)
     lock_dir = settings.models_dir / ".decision-locks"
     lock_dir.mkdir(parents=True, exist_ok=True)

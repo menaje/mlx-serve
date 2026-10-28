@@ -81,6 +81,15 @@ def test_imported_model_can_be_deleted_by_ollama_alias(ollama_source):
     assert any((ollama_source / "blobs").iterdir())
 
 
+def test_import_normalizes_same_model_alias_and_rejects_other_aliases(ollama_source):
+    with pytest.raises(ValueError, match="reserved for"):
+        import_ollama_decision("d3-lite:mlx", "d1-omni", ollama_source)
+    destination = import_ollama_decision("d3-lite:mlx", "D3-LITE", ollama_source)
+    assert destination.name == "d3-lite"
+    assert model_manager.is_model_installed("D3-LITE")
+    assert set(model_manager._metadata) == {"d3-lite"}
+
+
 @pytest.mark.asyncio
 async def test_pull_does_not_mix_downloaded_and_imported_weights(ollama_source):
     destination = import_ollama_decision("d3-lite:mlx", "d3-lite", ollama_source)

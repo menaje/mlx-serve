@@ -473,7 +473,7 @@ def import_ollama(
     except (ValueError, OSError) as exc:
         console.print(f"[red]Import failed: {exc}[/red]")
         raise typer.Exit(1) from exc
-    console.print(f"[green]Imported {name}: {path}[/green]")
+    console.print(f"[green]Imported {path.name}: {path}[/green]")
 
 
 @app.command("list")

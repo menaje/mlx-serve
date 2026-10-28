@@ -93,6 +93,12 @@ same filesystem and copies the files otherwise. The imported model remains
 available if the Ollama model is removed. The default model name is `d3-lite`;
 use `--name` to select another name.
 
+For decision models, a local name matching an alias for the same source is
+stored under its canonical name (for example, `d1-omni` becomes
+`d1-omni-600M`). An alias reserved for a different model cannot be used as a
+local name; choose a distinct name instead. The CLI and `/api/pull` report the
+canonical name on success.
+
 ### 2. Start the server
 
 ```bash

@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from mlx_serve.config import settings
-from mlx_serve.core.model_manager import model_manager
+from mlx_serve.core.model_manager import model_manager, resolve_decision_install_name
 
 _REQUIRED_JSON = {"config.json", "decision_config.json", "tokenizer.json", "tokenizer_config.json"}
 _EXTRA_FILES = {"vocab.json", "merges.txt", "special_tokens_map.json", "chat_template.jinja"}
@@ -25,6 +25,7 @@ def import_ollama_decision(model: str, name: str, source_root: Path | None = Non
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name in (".", ".."):
         raise ValueError("Invalid destination model name")
     model_base, tag = model.split(":", 1)
+    name = resolve_decision_install_name(name, f"vllm-sr/{model_base}")
     source_root = Path(source_root or os.getenv("OLLAMA_MODELS", Path.home() / ".ollama/models"))
     manifest_path = source_root / "manifests-v2" / "ollama.com" / "library" / model_base / tag
     if not manifest_path.is_file():

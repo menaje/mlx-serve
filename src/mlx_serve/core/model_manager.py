@@ -53,6 +53,7 @@ MODEL_ALIASES: dict[str, tuple[str, ModelType]] = {
     "d1-omni": ("LiquidAI/d1-omni-600M", "decision"),
     "d1-omni-600m": ("LiquidAI/d1-omni-600M", "decision"),
     "liquidai/d1-omni-600m": ("LiquidAI/d1-omni-600M", "decision"),
+    "d1-omni-600m-mlx-fp16": ("LiquidAI/d1-omni-600M-MLX-fp16", "decision"),
     "liquidai/d1-omni-600m-mlx-fp16": ("LiquidAI/d1-omni-600M-MLX-fp16", "decision"),
     "d3-lite": ("vllm-sr/d3-lite", "decision"),
     "d3-lite:0.8b-mlx-bf16": ("vllm-sr/d3-lite", "decision"),
@@ -107,6 +108,16 @@ def resolve_model_alias(model_name: str) -> tuple[str, str, ModelType | None]:
         resolved_name = hf_repo.split("/")[-1]
         return resolved_name, hf_repo, model_type
     return model_name, model_name, None
+
+
+def resolve_decision_install_name(model_name: str, hf_repo: str) -> str:
+    """Keep local decision names consistent with aliases used at inference time."""
+    resolved_name, alias_repo, alias_type = resolve_model_alias(model_name)
+    if alias_type is not None and (
+        alias_type != "decision" or alias_repo.lower() != hf_repo.lower()
+    ):
+        raise ValueError(f"Model name '{model_name}' is reserved for '{alias_repo}'")
+    return resolved_name
 
 
 @dataclass
@@ -917,6 +928,11 @@ class ModelManager:
         if model_type == "decision":
             from mlx_serve.core.decision_prepare import SUPPORTED_REPOS, prepare_d1
 
+            try:
+                model_name = resolve_decision_install_name(model_name, hf_repo)
+            except ValueError as exc:
+                yield {"status": "error", "message": str(exc)}
+                return
             if hf_repo in SUPPORTED_REPOS:
                 async for status in prepare_d1(
                     self, hf_repo, model_name, revision, keep_original=keep_original
