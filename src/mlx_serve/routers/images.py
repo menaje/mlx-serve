@@ -40,6 +40,10 @@ _IMAGE_TTL_SECONDS = 3600
 def _cleanup_old_images() -> None:
     """Remove images older than TTL."""
     try:
+        # `/tmp` can be cleared while this long-running service is alive.
+        # Recreate the directory before every cleanup pass so a missing
+        # runtime directory does not turn into an unbounded warning loop.
+        _TEMP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
         now = time.time()
         for img_path in _TEMP_IMAGE_DIR.iterdir():
             if img_path.is_file():

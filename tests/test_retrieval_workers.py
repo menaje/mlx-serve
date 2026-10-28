@@ -93,3 +93,45 @@ def test_supervisor_start_cleans_orphans_before_spawning(monkeypatch):
         "embedding": "http://127.0.0.1:9000",
         "reranker": "http://127.0.0.1:9000",
     }
+
+
+def test_wait_for_worker_ready_retries_socket_timeout(monkeypatch):
+    """A slow health response should be retried until the worker is ready."""
+    from mlx_serve.core import retrieval_workers
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    attempts = 0
+
+    def fake_urlopen(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("worker is still starting")
+        return FakeResponse()
+
+    process = type(
+        "Process",
+        (),
+        {"pid": 100, "poll": lambda self: None},
+    )()
+    worker = RetrievalWorkerProcess(
+        kind="embedding",
+        host="127.0.0.1",
+        port=9000,
+        process=process,
+    )
+
+    monkeypatch.setattr(retrieval_workers.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(retrieval_workers.time, "sleep", lambda _: None)
+
+    retrieval_workers._wait_for_worker_ready(worker)
+
+    assert attempts == 2

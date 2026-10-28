@@ -189,6 +189,43 @@ def test_gateway_proxies_embedding_requests(monkeypatch):
     assert health.json()["retrieval_workers"]["embedding"]["alive"] is True
 
 
+def test_gateway_returns_503_when_retrieval_worker_times_out(monkeypatch):
+    """A stalled retrieval worker should fail closed instead of returning 500."""
+    monkeypatch.setattr(settings, "retrieval_worker_isolation_enabled", True)
+
+    class FakeSupervisor:
+        def start(self):
+            return {
+                "embedding": "http://127.0.0.1:19080",
+                "reranker": "http://127.0.0.1:19081",
+            }
+
+        def stop(self):
+            return None
+
+        def snapshot(self):
+            return {}
+
+    def fake_worker_request(url: str, method: str, body: bytes, headers: dict[str, str]):
+        raise TimeoutError("worker request timed out")
+
+    monkeypatch.setattr("mlx_serve.server.RetrievalWorkerSupervisor", FakeSupervisor)
+    monkeypatch.setattr(
+        "mlx_serve.routers.retrieval_proxy.perform_worker_request",
+        fake_worker_request,
+    )
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/embeddings",
+            json={"model": "Qwen3-Embedding-0.6B", "input": "hello"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "server_overloaded"
+
+
 def test_gateway_proxies_chat_requests_to_generation_worker(monkeypatch):
     """Gateway chat requests should route to the LLM or VLM worker."""
     monkeypatch.setattr(settings, "generation_worker_isolation_enabled", True)

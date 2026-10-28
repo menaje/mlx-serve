@@ -1,5 +1,6 @@
 """Reranking API router - Jina compatible extension."""
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -172,7 +173,10 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
     try:
         async with lease:
             try:
-                model, tokenizer = model_manager.get_reranker_model(request.model)
+                model, tokenizer = await asyncio.to_thread(
+                    model_manager.get_reranker_model,
+                    request.model,
+                )
             except ValueError as e:
                 raise HTTPException(
                     status_code=404,

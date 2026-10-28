@@ -248,7 +248,7 @@ def _wait_for_worker_ready(worker: RetrievalWorkerProcess) -> None:
             with urllib.request.urlopen(health_url, timeout=1.0) as response:
                 if response.status == 200:
                     return
-        except urllib.error.URLError:
+        except (TimeoutError, urllib.error.URLError):
             time.sleep(0.1)
 
     worker.process.terminate()

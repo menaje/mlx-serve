@@ -93,3 +93,41 @@ def test_rerank_clear_mlx_cache_after_request(client, monkeypatch):
 
     assert response.status_code == 200
     clear_mock.assert_called_once()
+
+
+def test_rerank_loads_model_off_event_loop(client, monkeypatch):
+    """Cold reranker loading should not block the worker event loop."""
+    from mlx_serve.routers import rerank as rerank_router
+
+    calls: list[tuple[object, tuple[object, ...]]] = []
+
+    async def fake_to_thread(func, *args):
+        calls.append((func, args))
+        return func(*args)
+
+    monkeypatch.setattr(rerank_router.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(
+        "mlx_serve.core.model_manager.model_manager.get_reranker_model",
+        lambda model: (object(), MagicMock()),
+    )
+
+    async def fake_compute_batch_scores(model, tokenizer, query, documents, instruction=None):
+        return [0.9, 0.1], 8
+
+    monkeypatch.setattr(
+        "mlx_serve.routers.rerank._compute_batch_scores",
+        fake_compute_batch_scores,
+    )
+
+    response = client.post(
+        "/v1/rerank",
+        json={
+            "model": "test-model",
+            "query": "test query",
+            "documents": ["doc1", "doc2"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][1] == ("test-model",)

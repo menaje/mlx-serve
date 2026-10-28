@@ -248,7 +248,10 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
     try:
         raise_if_server_overloaded()
-        model, tokenizer = model_manager.get_embedding_model(request.model)
+        model, tokenizer = await asyncio.to_thread(
+            model_manager.get_embedding_model,
+            request.model,
+        )
     except ValueError as e:
         raise HTTPException(
             status_code=404,

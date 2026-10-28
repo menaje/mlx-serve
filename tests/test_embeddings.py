@@ -173,6 +173,28 @@ def test_embeddings_encoding_format_float_default(client, mock_embedding_model):
         assert all(isinstance(x, float) for x in embedding)
 
 
+def test_embeddings_loads_model_off_event_loop(client, mock_embedding_model, monkeypatch):
+    """Cold model loading should not block the worker event loop."""
+    from mlx_serve.routers import embeddings as embeddings_router
+
+    calls: list[tuple[object, tuple[object, ...]]] = []
+
+    async def fake_to_thread(func, *args):
+        calls.append((func, args))
+        return func(*args)
+
+    monkeypatch.setattr(embeddings_router.asyncio, "to_thread", fake_to_thread)
+
+    response = client.post(
+        "/v1/embeddings",
+        json={"model": "test-model", "input": "test text"},
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][1] == ("test-model",)
+
+
 def test_embeddings_encoding_format_base64(client, mock_embedding_model):
     """Test base64 encoding format."""
     response = client.post(

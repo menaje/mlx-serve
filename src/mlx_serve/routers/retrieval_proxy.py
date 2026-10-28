@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from mlx_serve.config import settings
 from mlx_serve.core.inference_control import build_overload_detail
 from mlx_serve.core.runtime_topology import RetrievalWorkerKind
 
@@ -43,7 +44,10 @@ def perform_worker_request(
     )
 
     try:
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=settings.inference_queue_timeout_seconds,
+        ) as response:
             return WorkerProxyResponse(
                 status_code=response.status,
                 body=response.read(),
@@ -92,7 +96,7 @@ async def forward_to_retrieval_worker(
             body,
             headers,
         )
-    except urllib.error.URLError as exc:
+    except (TimeoutError, urllib.error.URLError) as exc:
         logger.error("Retrieval worker request failed: %s", exc)
         return JSONResponse(
             status_code=503,
