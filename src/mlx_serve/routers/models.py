@@ -108,7 +108,7 @@ class PullRequest(BaseModel):
         default=None, description="Quantization bits (4 or 8). None for no quantization."
     )
     keep_original: bool = Field(
-        default=False, description="Keep original model in HuggingFace cache after conversion"
+        default=False, description="Keep a separate d1 source after successful verification"
     )
 
 

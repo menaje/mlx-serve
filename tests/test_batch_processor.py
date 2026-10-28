@@ -139,6 +139,29 @@ async def test_embedding_batch_processor_chunks_large_single_request(monkeypatch
         await processor.stop()
 
 
+def test_rerank_prompt_includes_system_and_assistant_turns():
+    """Scores must be taken at the model's answer position, after the chat suffix."""
+    class RecordingTokenizer:
+        pad_token_id = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def encode(self, text, add_special_tokens=False):
+            self.calls.append((text, add_special_tokens))
+            return [len(self.calls)]
+
+    tokenizer = RecordingTokenizer()
+    processor = RerankBatchProcessor(model=None, tokenizer=tokenizer)
+    encoded = processor._encode_prompt("search query", "candidate document", "task")
+    assert encoded == [1, 3, 2]
+    assert tokenizer.calls[0][0].startswith("<|im_start|>system\n")
+    assert tokenizer.calls[1][0].startswith("<|im_end|>\n<|im_start|>assistant\n")
+    assert "<Query>: search query" in tokenizer.calls[2][0]
+    assert "<Document>: candidate document" in tokenizer.calls[2][0]
+    assert all(not special for _, special in tokenizer.calls)
+
+
 def test_rerank_batch_processor_respects_document_limit(monkeypatch):
     """Rerank micro-batches should split once the document cap is reached."""
     from mlx_serve.config import settings
@@ -150,6 +173,7 @@ def test_rerank_batch_processor_respects_document_limit(monkeypatch):
     fake_mlx_core = ModuleType("mlx.core")
     fake_mlx_core.array = lambda value: np.array(value)
     fake_mlx_core.stack = np.stack
+    fake_mlx_core.float32 = np.float32
     fake_mlx_core.softmax = lambda value: np.exp(value) / np.exp(value).sum()
     fake_mlx.core = fake_mlx_core
 
@@ -164,6 +188,8 @@ def test_rerank_batch_processor_respects_document_limit(monkeypatch):
         eos_token_id = None
 
         def encode(self, prompt, add_special_tokens=False):
+            if "len=" not in prompt:
+                return []
             length = int(prompt.rsplit("len=", 1)[1])
             return list(range(1, length + 1))
 
@@ -203,6 +229,7 @@ def test_rerank_batch_processor_respects_token_budget(monkeypatch):
     fake_mlx_core = ModuleType("mlx.core")
     fake_mlx_core.array = lambda value: np.array(value)
     fake_mlx_core.stack = np.stack
+    fake_mlx_core.float32 = np.float32
     fake_mlx_core.softmax = lambda value: np.exp(value) / np.exp(value).sum()
     fake_mlx.core = fake_mlx_core
 
@@ -217,6 +244,8 @@ def test_rerank_batch_processor_respects_token_budget(monkeypatch):
         eos_token_id = None
 
         def encode(self, prompt, add_special_tokens=False):
+            if "len=" not in prompt:
+                return []
             length = int(prompt.rsplit("len=", 1)[1])
             return list(range(1, length + 1))
 

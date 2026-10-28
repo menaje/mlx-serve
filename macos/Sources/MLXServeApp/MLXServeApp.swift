@@ -283,7 +283,12 @@ struct AddModelView: View {
     @State private var revision = ""
     @State private var keepOriginal = false
     @State private var loadAfter = true
-    private let supported = ["LiquidAI/d1-omni-600M", "LiquidAI/d1-omni-600M-MLX-fp16"]
+    private let supported = [
+        "LiquidAI/d1-omni-600M", "LiquidAI/d1-omni-600M-MLX-fp16", "vllm-sr/d3-lite"
+    ]
+    private var submittedRepo: String { repo.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var isD3: Bool { submittedRepo == "vllm-sr/d3-lite" }
+    private var canKeepOriginal: Bool { submittedRepo == "LiquidAI/d1-omni-600M" }
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             PageHeader(title: "모델 추가", subtitle: "서버의 검증된 결정 모델 준비 경로를 사용합니다.")
@@ -291,23 +296,25 @@ struct AddModelView: View {
                 TextField("Hugging Face ID", text: $repo)
                 TextField("로컬 이름 (선택)", text: $name)
                 TextField("Revision (선택)", text: $revision)
-                LabeledContent("유형 / 정밀도", value: "결정 모델 / FP16")
-                Toggle("원본 보존", isOn: $keepOriginal)
+                LabeledContent("유형 / 정밀도", value: isD3 ? "결정 모델 / BF16" : "결정 모델 / FP16")
+                Toggle("원본 보존", isOn: $keepOriginal).disabled(!canKeepOriginal)
                 Toggle("준비 후 메모리에 로드", isOn: $loadAfter)
             }
-            Text("현재 d1 원본과 공식 MLX FP16 모델을 지원합니다. 모델 구조와 파일을 검증하며 이미 호환되는 모델은 다시 변환하지 않습니다.")
+            Text(isD3
+                 ? "d3 원본 파일의 무결성과 MLX 추론을 검증합니다. 원본 파일을 직접 사용하므로 별도의 원본 사본을 만들지 않습니다."
+                 : "d1 원본, 공식 d1 MLX FP16, d3-lite를 지원합니다. 모델 구조와 파일을 검증하며 이미 호환되는 모델은 다시 변환하지 않습니다.")
                 .font(.callout).foregroundStyle(.secondary)
-            if !supported.contains(repo) { Text("이 모델은 아직 지원하지 않습니다.").foregroundStyle(.orange) }
+            if !supported.contains(submittedRepo) { Text("이 모델은 아직 지원하지 않습니다.").foregroundStyle(.orange) }
             HStack {
                 Spacer()
                 Button("취소") { dismiss() }
                 Button("준비 시작") {
-                    let submitted = repo.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let submitted = submittedRepo
                     Task {
-                        await store.startJob(repo: submitted, name: name, revision: revision, keepOriginal: keepOriginal, loadAfter: loadAfter)
+                        await store.startJob(repo: submitted, name: name, revision: revision, keepOriginal: canKeepOriginal && keepOriginal, loadAfter: loadAfter)
                         dismiss()
                     }
-                }.keyboardShortcut(.defaultAction).disabled(!supported.contains(repo) || store.busy)
+                }.keyboardShortcut(.defaultAction).disabled(!supported.contains(submittedRepo) || store.busy)
             }
         }.padding(24).frame(width: 570)
     }
@@ -377,6 +384,27 @@ struct ModelDetailView: View {
                 Divider()
                 Text("설치 정보").font(.headline)
                 Text(pretty(model["metadata"] ?? [:])).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                if kind == "decision", let record = model["preparation"] as? [String: Any] {
+                    Text("모델 준비 기록").font(.headline)
+                    if record["state"] as? String == "recorded" {
+                        LabeledContent("라이선스", value: record["license"] as? String ?? "정보 없음")
+                        LabeledContent("변환", value: record["converted"] as? Bool == true ? "수행함" : "수행하지 않음")
+                        if let converter = record["converter"] as? String {
+                            let version = record["converter_version"] as? String ?? ""
+                            LabeledContent("변환 도구", value: "\(converter) \(version)".trimmingCharacters(in: .whitespaces))
+                        }
+                        if let options = record["converter_options"] as? [String: Any], !options.isEmpty {
+                            LabeledContent("준비 옵션", value: pretty(options))
+                        }
+                        if let validation = record["validation"] as? [String: Any] {
+                            LabeledContent("실행·검증 기록", value: pretty(validation))
+                        }
+                        Text("설치할 때 기록된 정보입니다. 모델을 새로 로드할 때 파일 무결성을 다시 검사합니다.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("사용할 수 있는 모델 준비 기록이 없습니다.").foregroundStyle(.secondary)
+                    }
+                }
                 Text("API 주소: \(store.baseURL) · 모델 ID: \(name)").font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Button("API 주소와 모델 ID 복사") { copyText("\(store.baseURL)\n\(name)") }

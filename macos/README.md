@@ -16,17 +16,22 @@ from successful preparation so the user can load the model manually.
 The app also inspects known CLI paths and the user's launchd service without
 changing those services.
 
-The first supported install flow is LiquidAI's original d1 checkpoint or its
-official MLX FP16 checkpoint. Preparation is the same verified backend path as
-the CLI. Other model types may be tested if already installed, but adding other
-repositories is intentionally disabled until their conversion and validation
-paths meet the same guarantees. Decision models can be removed without deleting
+Supported installs are LiquidAI's original d1 checkpoint, its official MLX
+FP16 checkpoint, and `vllm-sr/d3-lite`. The d3 model's BF16 weights and FP32
+readout are used directly after file-hash and inference checks. Preparation is
+the same verified backend path as the CLI. Other model types may be tested if
+already installed, but adding other repositories is intentionally disabled
+until their conversion and validation paths meet the same guarantees. Decision
+models can be removed without deleting
 shared source caches; deletion of other types is disabled. Generation-worker
 load and unload commands are routed to the appropriate model- or type-scoped
-worker. General Hugging Face cache cleanup is not implemented. The app can
-preview and remove unreferenced retained d1 originals; it rechecks the registry,
-files and preparation lock before deletion, and leaves referenced originals in
-place.
+worker. General Hugging Face cache cleanup is not implemented; a read-only
+inventory shows Hub cache repositories and reported sizes, including when the
+engine is stopped. It does not estimate reclaimable space or include the Xet
+cache. The app can preview and remove unreferenced retained d1 originals; it
+rechecks the registry, files and preparation lock before deletion, and leaves
+referenced originals in place. Shared Hugging Face caches are not deleted
+automatically by any conversion path.
 
 An installed decision, embedding, or reranker model can be selected as the
 default for its type. Requests that omit the model use that selection; an

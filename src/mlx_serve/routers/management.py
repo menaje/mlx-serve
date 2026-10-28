@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from mlx_serve.config import settings
+from mlx_serve.core.decision_prepare import read_verified_manifest
 from mlx_serve.core.default_models import (
     DEFAULT_TYPES,
     DefaultSelectionChanged,
@@ -71,6 +73,37 @@ def _local_snapshot() -> dict[str, Any]:
         "memory": memory_monitor.health_payload(),
         "mlx_memory": get_mlx_memory_snapshot(),
     }
+
+
+def _preparation_record(path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Report recorded preparation details without rehashing weights on every refresh."""
+    try:
+        manifest = read_verified_manifest(path, verify_hashes=False)
+        if (
+            not metadata.get("revision")
+            or manifest["revision"] != metadata["revision"]
+            or manifest["source_repo"] != metadata.get("hf_repo")
+        ):
+            raise ValueError("Decision metadata does not match its preparation record")
+        result = {
+            field: manifest.get(field)
+            for field in (
+                "license", "converted", "converter", "converter_version", "converter_options",
+                "prepared_at",
+            )
+        }
+        validation = manifest["validation"]
+        result["validation"] = {
+            field: validation[field]
+            for field in (
+                "official_predict", "mlx_predict", "published_file_hashes",
+                "max_probability_difference", "tolerance",
+            )
+            if field in validation
+        }
+        return {"state": "recorded", **result}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {"state": "unavailable"}
 
 
 @internal_router.get("/internal/management/state")
@@ -237,11 +270,16 @@ async def management_state(request: Request) -> dict[str, Any]:
                 request_state = "running" if active.get("active") else (
                     "queued" if active.get("queued") else "idle"
                 )
+        preparation = (
+            await asyncio.to_thread(_preparation_record, model.path, metadata)
+            if model.model_type == "decision" else None
+        )
         models.append({
             "name": model.name, "type": model.model_type, "source": model.hf_repo,
             "size_bytes": model.size, "path": str(model.path), "metadata": metadata,
             "file_state": "installed", "load_state": load_state, "request_state": request_state,
             "is_default": defaults.get(model.model_type) == model.name,
+            "preparation": preparation,
         })
     disk = None
     if storage_available:
@@ -287,7 +325,9 @@ async def manage_model(operation: str, payload: ModelOperation, request: Request
         # preparation registry. Other model types do not have that guarantee yet.
         model_manager._load_metadata()
         if payload.type != "decision" or model_manager.get_model_type(payload.name) != "decision":
-            raise HTTPException(status_code=501, detail="Safe deletion is supported for d1 only")
+            raise HTTPException(
+                status_code=501, detail="Safe deletion is supported for decision models only"
+            )
         from mlx_serve.routers.models import DeleteRequest, delete_model
 
         return await delete_model(DeleteRequest(name=payload.name), request)

@@ -10,8 +10,11 @@ criteria of issue #12.
   huggingface-hub 1.33.0, transformers 5.21.0.
 - Bundled environment: Python 3.14.10 with the same package versions above;
   the complete pinned dependency list is in `requirements-runtime.txt`.
-- The Python test suite passed 344 tests. One d3 integration test was skipped
-  because a local d3-lite checkpoint was not supplied.
+- The Python test suite passed 362 tests with real d3-lite and Qwen3-Reranker
+  checkpoints supplied; no tests were skipped. The run emitted one third-party
+  Starlette deprecation warning. Set `MLX_SERVE_D3_TEST_MODEL_DIR` and
+  `MLX_SERVE_RERANK_TEST_MODEL_DIR` to local checkpoint directories to include
+  those optional real-model tests in a future run.
 
 ## Observed flows
 
@@ -22,6 +25,47 @@ criteria of issue #12.
   The worker was unloaded and the app-owned server was stopped. This was a
   real download and conversion, but it was driven through the management API,
   not through the packaged app UI.
+- In another isolated home, a real `vllm-sr/d3-lite` download at revision
+  `03560c26f5199c3c04129a2ccb38960c913635e0` ran through the persistent job
+  manager. It checked the published file hashes and tensor formats, ran choice,
+  Boolean and score inference with MLX, and registered the verified artifact.
+  An independent real-model test also matched the recorded Ollama reference.
+  A second real d3 download was cancelled after it started: the worker and its
+  staging directory stopped and an unrelated fixture remained intact.
+- The rebuilt packaged app was launched with a separate test home containing
+  that verified d3 artifact. Its UI loaded and tested the model, then added a
+  second model by reusing the verified revision and automatically loaded it.
+  A separate local API client successfully exercised choice, Boolean and score
+  requests against that model; the UI then unloaded it. This part reused a local
+  checkpoint. The model detail also showed the recorded license, preparation
+  options and validation; these are recorded results, not a fresh checksum on
+  every refresh.
+- In a separate empty home, the packaged app started a fresh d3 download. The
+  UI cancelled it during transfer, confirmed the cancelled state after the
+  worker and staging directory were gone, and retried it as a new job. The
+  retry downloaded and verified the checkpoint, automatically loaded it, and
+  returned a bool result in the app. A separate local client successfully sent
+  choice, bool and score questions before the model was unloaded. The test used
+  an environment override for the loopback port and disabled Xet transfers.
+- The packaged app loaded, tested and unloaded pre-existing
+  `mlx-community/all-MiniLM-L6-v2-bf16` and
+  `mlx-community/Qwen3-Reranker-0.6B-4bit` models in the isolated home. The
+  first reranker test exposed incorrect ranking; after applying Qwen's input
+  framing and FP32 probability
+  calculation, a repeated UI test scored the matching text about 0.999 and the
+  unrelated text about 0.0003. An independent real-model test also checked a
+  relevant document against an unrelated one and compared single and batched
+  scores. These pre-existing models were installed by the development CLI, not
+  by the app's model-add UI.
+- The app's native Keychain code stored, updated, reopened and removed disposable
+  Hugging Face and agent secrets across two processes using a temporary Keychain.
+  The test did not add it to the user's Keychain search list. This does not yet
+  exercise the app's complete background reconnection flow with the login Keychain.
+- With the packaged app's server stopped, its read-only Hub cache inventory showed
+  an isolated synthetic repository with two revisions sharing one 23-byte file.
+  Automated tests also cover a missing cache, corrupt entries, authorization and
+  preservation of shared cache files during other model conversions. Xet cache
+  size and reclaimable space are not included in the inventory.
 - On the same Mac, the packaged app was also launched with a separate empty
   home directory. Through its UI, the original d1 repository was downloaded,
   converted to MLX FP16, validated, registered and automatically loaded. A

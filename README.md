@@ -203,7 +203,19 @@ the first source installation to retain a separate original copy under
 after verification. To retain a source that was not originally kept, install
 under another local name using `--name`.
 
+The `vllm-sr/d3-lite` profile uses the same isolated, cancellable preparation
+path and resolves the requested revision to a commit. It checks the published
+file hashes, architecture and tensor precision, then loads the checkpoint and
+runs choice, Boolean and score inference before registration. The BF16 model
+weights and FP32 readout are used directly by the MLX inference implementation;
+no converted copy or separate retained original is created. Its manifest
+records the resolved revision, validation, file hashes and the license returned
+by Hugging Face when available. Previously imported Ollama D3 installations
+remain usable but are not presented as newly verified installations.
+
 The CLI, `POST /api/pull`, and automatic downloads share this preparation path.
+Shared Hugging Face caches are also preserved when converting other model types;
+they may be used by other installations or applications.
 The API request accepts `name`, `type: "decision"`, an optional `revision`,
 and an optional local `model_name`;
 its newline-delimited events distinguish `resolving`, `downloading`, `checking`,

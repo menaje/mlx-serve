@@ -350,6 +350,65 @@ def test_missing_storage_is_not_reported_as_an_empty_model_list(tmp_path, monkey
     assert rejected.status_code == 503
 
 
+@pytest.mark.parametrize(
+    ("repo", "architecture", "precision", "required", "validation"),
+    [
+        ("LiquidAI/d1-omni-600M", "d1_omni", "float16", ["LICENSE", "model.safetensors"],
+         {"official_predict": True, "max_probability_difference": 0.001, "tolerance": 0.02}),
+        ("vllm-sr/d3-lite", "qwen3_5", "bfloat16",
+         ["decision_config.json", "readout.safetensors", "model.safetensors"],
+         {"mlx_predict": True, "published_file_hashes": True}),
+    ],
+)
+def test_management_reports_recorded_preparation_without_rehashing(
+    tmp_path, monkeypatch, client, repo, architecture, precision, required, validation,
+):
+    from mlx_serve.core import decision_prepare
+    from mlx_serve.core.decision_prepare_worker import MANIFEST
+    from mlx_serve.core.model_manager import model_manager
+
+    monkeypatch.setattr(settings, "models_dir", tmp_path)
+    model_dir = tmp_path / "test-model"
+    model_dir.mkdir()
+    for filename in ["config.json", "tokenizer.json", *required]:
+        (model_dir / filename).write_text("fixture")
+    revision = "a" * 40
+    manifest = {
+        "schema_version": 1, "source_repo": repo, "revision": revision,
+        "architecture": architecture, "precision": precision,
+        "files_sha256": {item.name: "recorded-hash" for item in model_dir.iterdir()},
+        "license": "test-license", "converted": True, "converter": "test-converter",
+        "converter_version": "1.0", "converter_options": {"dtype": precision},
+        "validation": {**validation, "sample_answers": ["private sample"]},
+    }
+    (model_dir / MANIFEST).write_text(json.dumps(manifest))
+    metadata = {"test-model": {"type": "decision", "hf_repo": repo, "revision": revision}}
+    monkeypatch.setattr(model_manager, "_metadata", metadata)
+    monkeypatch.setattr(model_manager, "_load_metadata", lambda: None)
+
+    def unexpected_hash(_):
+        raise AssertionError("Refreshing the UI must not rehash model weights")
+
+    monkeypatch.setattr(decision_prepare, "file_hash", unexpected_hash)
+    response = client.get("/management/state")
+    assert response.status_code == 200
+    record = response.json()["models"][0]["preparation"]
+    assert record["state"] == "recorded"
+    assert record["license"] == "test-license"
+    assert record["converter_options"] == {"dtype": precision}
+    assert record["validation"] == validation
+    assert "private sample" not in response.text
+
+    metadata["test-model"]["revision"] = "b" * 40
+    assert client.get("/management/state").json()["models"][0]["preparation"] == {
+        "state": "unavailable"
+    }
+    metadata["test-model"].pop("revision")
+    assert client.get("/management/state").json()["models"][0]["preparation"] == {
+        "state": "unavailable"
+    }
+
+
 def test_agent_rejects_storage_change_when_models_are_present(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
@@ -553,7 +612,10 @@ def test_management_deletion_uses_decision_worker_path_and_rejects_other_types(m
 
 
 @pytest.mark.asyncio
-async def test_job_cancel_terminates_process_and_preserves_existing_models(tmp_path, monkeypatch):
+@pytest.mark.parametrize("repo", ["LiquidAI/d1-omni-600M", "vllm-sr/d3-lite"])
+async def test_job_cancel_terminates_process_and_preserves_existing_models(
+    tmp_path, monkeypatch, repo
+):
     import mlx_serve.core.managed_jobs as managed_jobs
 
     models = tmp_path / "models"
@@ -582,7 +644,7 @@ async def test_job_cancel_terminates_process_and_preserves_existing_models(tmp_p
     monkeypatch.setattr(managed_jobs.asyncio, "create_subprocess_exec", spawn_fake)
     manager = JobManager(tmp_path / "jobs")
     await manager.recover()
-    params = {"repo": "LiquidAI/d1-omni-600M", "models_dir": str(models)}
+    params = {"repo": repo, "models_dir": str(models)}
     job = manager.start(params, token="hf_secret123")
     with pytest.raises(ValueError, match="active job"):
         manager.start({**params, "name": "another-name"})

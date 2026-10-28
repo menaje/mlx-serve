@@ -132,7 +132,7 @@ private func jobGuidance(_ category: String) -> String {
     case "network": return "네트워크 연결을 확인한 뒤 다시 시도하세요."
     case "missing_file": return "저장소 ID, revision과 필요한 모델 파일을 확인하세요."
     case "timeout": return "네트워크와 실행 환경을 확인한 뒤 다시 시도하세요."
-    case "unsupported": return "지원되는 d1 원본 또는 공식 MLX FP16 모델을 선택하세요."
+    case "unsupported": return "지원되는 d1 또는 d3 결정 모델을 선택하세요."
     case "validation": return "원본과 revision을 확인하고 검증된 파일을 다시 준비하세요."
     case "conversion": return "런타임 버전과 사용 가능한 자원을 확인한 뒤 다시 시도하세요."
     default: return "작업 기록에서 오류를 확인하고 원인을 수정한 뒤 다시 시도하세요."
@@ -184,6 +184,7 @@ struct PreferencesView: View {
     @State private var loginStatus = "확인 중"
     @State private var notificationStatus = "확인 중"
     @State private var reviewingOriginals = false
+    @State private var reviewingHFCache = false
     @State private var reviewingMigration = false
     @State private var previewingMigration = false
     @State private var migrationPreview: [String: Any] = [:]
@@ -207,6 +208,7 @@ struct PreferencesView: View {
             await updateNotificationStatus()
         }
         .sheet(isPresented: $reviewingOriginals) { OriginalCleanupView().environmentObject(store) }
+        .sheet(isPresented: $reviewingHFCache) { HFCacheInventoryView().environmentObject(store) }
         .sheet(isPresented: $reviewingMigration) {
             StorageMigrationPreviewView(preview: migrationPreview).environmentObject(store)
         }
@@ -342,6 +344,10 @@ struct PreferencesView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Hugging Face") {
+                Button("공유 캐시 사용량 확인…") { reviewingHFCache = true }
+                    .disabled(!store.agentReady)
+                Text("공유 캐시는 다른 앱에서도 사용할 수 있어 자동으로 삭제하지 않습니다.")
+                    .font(.caption).foregroundStyle(.secondary)
                 SecureField("토큰", text: $token)
                 HStack {
                     Button("Keychain에 저장") {
@@ -421,8 +427,9 @@ struct PreferencesView: View {
     var runtime: some View {
         Form {
             Section("변환과 런타임") {
-                LabeledContent("지원 모델", value: "d1 원본 / 공식 d1 MLX FP16")
+                LabeledContent("지원 모델", value: "d1 원본 / 공식 d1 MLX FP16 / d3-lite")
                 LabeledContent("변환 정밀도", value: "FP16")
+                LabeledContent("d3 정밀도", value: "BF16 / readout FP32")
                 LabeledContent("동시 변환", value: "1개")
                 Text("다운로드, 구조 확인, 필요한 변환, 검증과 등록을 서버에서 수행합니다.").foregroundStyle(.secondary)
                 Text(pretty(store.runtime)).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
@@ -561,6 +568,80 @@ struct StorageMigrationPreviewView: View {
                 }.disabled(!enoughSpace || preview["destination"] as? String == nil)
             }
         }.padding(24).frame(width: 600)
+    }
+}
+
+struct HFCacheInventoryView: View {
+    @EnvironmentObject var store: AppStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var inventory: [String: Any] = [:]
+    @State private var loading = false
+    @State private var error: String?
+
+    private var repositories: [[String: Any]] { inventory["repositories"] as? [[String: Any]] ?? [] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Hugging Face 공유 캐시").font(.title2.bold())
+            Text("이 목록은 읽기 전용입니다. 다른 앱이나 모델에서 같은 파일을 사용할 수 있어 삭제 가능한 공간으로 계산하지 않습니다.")
+                .foregroundStyle(.secondary)
+            if loading {
+                ProgressView("캐시 사용량을 확인하고 있습니다…")
+            } else if let error {
+                Text(error).foregroundStyle(.orange).textSelection(.enabled)
+            } else {
+                let count = inventory["repository_count"] as? Int ?? 0
+                let bytes = inventory["size_bytes"] as? Int64 ?? 0
+                Text("저장소 \(count)개 · 보고된 파일 크기 \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))")
+                if let path = inventory["path"] as? String {
+                    Text(path).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                Text("Hub 캐시의 파일 크기입니다. Xet 캐시와 작업 임시 파일은 포함되지 않으며, 실제 확보 가능한 용량과 다를 수 있습니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let warnings = inventory["warning_count"] as? Int, warnings > 0 {
+                    Text("\(warnings)개 항목을 확인하지 못해 사용량에 포함하지 않았습니다.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                if inventory["truncated"] as? Bool == true {
+                    Text("목록에는 처음 100개 저장소만 표시합니다.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if repositories.isEmpty {
+                    Text("확인된 캐시 저장소가 없습니다.").foregroundStyle(.secondary)
+                } else {
+                    List(repositories.indices, id: \.self) { index in
+                        let repo = repositories[index]
+                        VStack(alignment: .leading) {
+                            Text(repo["id"] as? String ?? "").textSelection(.enabled)
+                            let kind = repo["type"] as? String ?? ""
+                            let revisions = repo["revision_count"] as? Int ?? 0
+                            let size = repo["size_bytes"] as? Int64 ?? 0
+                            Text("\(kind) · revision \(revisions)개 · \(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }.frame(minHeight: 140, maxHeight: 250)
+                }
+            }
+            HStack {
+                Button("다시 확인") { Task { await scan() } }.disabled(loading)
+                Spacer()
+                Button("닫기") { dismiss() }
+            }
+        }
+        .padding(24).frame(width: 610).frame(minHeight: 300)
+        .task { await scan() }
+    }
+
+    private func scan() async {
+        loading = true
+        defer { loading = false }
+        do {
+            inventory = try await store.request("/hf-cache") as? [String: Any] ?? [:]
+            error = nil
+        } catch {
+            inventory = [:]
+            self.error = error.localizedDescription
+        }
     }
 }
 

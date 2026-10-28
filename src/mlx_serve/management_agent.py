@@ -615,6 +615,17 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
             authorization=controller.authorization(port), host=controller.address(port),
         )
 
+    @app.get("/hf-cache")
+    async def hf_cache() -> dict[str, Any]:
+        from mlx_serve.core.hf_cache_inventory import inspect_hf_cache
+
+        try:
+            return await asyncio.to_thread(inspect_hf_cache)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=503, detail="Hugging Face cache is unavailable"
+            ) from exc
+
     @app.get("/originals")
     async def originals() -> dict[str, Any]:
         port = await live_port()

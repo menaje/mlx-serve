@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from mlx_serve.core.decision_prepare_worker import MLX_REPO, SOURCE_REPO
+from mlx_serve.core.decision_prepare_worker import D3_REPO, MLX_REPO, SOURCE_REPO
 from mlx_serve.core.storage_access import model_storage_available
 
 ACTIVE_STATES = ("queued", "running", "cancelling", "recovery_pending")
@@ -60,7 +60,7 @@ def _error_guidance(message: str) -> tuple[str, str]:
     if any(part in text for part in ("timeout", "timed out")):
         return "timeout", "Check the network and runtime, then retry."
     if any(part in text for part in ("unsupported", "not supported", "architecture")):
-        return "unsupported", "Choose a supported d1 source or its official MLX FP16 model."
+        return "unsupported", "Choose a supported d1 or d3 decision model."
     if any(part in text for part in ("validation", "verification", "checksum", "manifest")):
         return "validation", "Check the source and revision; retry to obtain verified files."
     if any(part in text for part in ("conversion", "convert")):
@@ -348,8 +348,8 @@ class JobManager:
         if params.keys() - allowed:
             raise ValueError("Unsupported preparation options")
         repo = params.get("repo")
-        if repo not in {SOURCE_REPO, MLX_REPO}:
-            raise ValueError("Only the validated d1 source and MLX FP16 repositories are supported")
+        if repo not in {SOURCE_REPO, MLX_REPO, D3_REPO}:
+            raise ValueError("Only validated d1 and d3 repositories are supported")
         name = params.get("name") or None
         if name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
             raise ValueError("Invalid local model name")
@@ -361,7 +361,8 @@ class JobManager:
             raise ValueError("Model directory must be absolute")
         normalized = {
             "repo": repo, "name": name, "revision": revision,
-            "keep_original": bool(params.get("keep_original", False)), "models_dir": models_dir,
+            "keep_original": bool(params.get("keep_original", False)) if repo == SOURCE_REPO
+            else False, "models_dir": models_dir,
             "load_after": bool(params.get("load_after", False)),
         }
         # Two names still refer to the same underlying source and conversion.

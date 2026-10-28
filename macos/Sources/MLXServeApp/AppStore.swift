@@ -251,6 +251,7 @@ final class AppStore: ObservableObject {
                 message.replacingOccurrences(of: "Cleanup was incomplete; inspect ", with: "")
         }
         let translations = [
+            "Hugging Face cache is unavailable": "Hugging Face 캐시에 접근할 수 없습니다. 저장 장치와 권한을 확인하세요.",
             "Existing model files must be migrated before changing storage": "기존 모델이 있습니다. ‘기존 모델 복사 및 전환’을 이용하세요.",
             "Existing registered models must be migrated before changing storage": "등록된 모델이 있습니다. ‘기존 모델 복사 및 전환’을 이용하세요.",
             "The current model storage is unavailable; reconnect it first": "현재 모델 저장소에 접근할 수 없습니다. 저장 장치를 다시 연결한 뒤 시도하세요.",

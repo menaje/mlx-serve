@@ -376,6 +376,16 @@ class EmbeddingBatchProcessor:
         self.tokenizer = None
 
 
+# Qwen3-Reranker scores the next "yes"/"no" token after this chat framing.
+# See https://huggingface.co/Qwen/Qwen3-Reranker-0.6B#using-transformers
+_RERANK_PREFIX = (
+    "<|im_start|>system\nJudge whether the Document meets the requirements based on "
+    "the Query and the Instruct provided. Note that the answer can only be "
+    '"yes" or "no".<|im_end|>\n<|im_start|>user\n'
+)
+_RERANK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+
 class RerankBatchProcessor:
     """Batch processor for reranking operations."""
 
@@ -409,16 +419,8 @@ class RerankBatchProcessor:
             "Given a web search query, retrieve relevant passages "
             "that answer the query"
         )
-        self._prefix_tokens = (
-            [self.tokenizer.bos_token_id]
-            if getattr(self.tokenizer, "bos_token_id", None) is not None
-            else []
-        )
-        self._suffix_tokens = (
-            [self.tokenizer.eos_token_id]
-            if getattr(self.tokenizer, "eos_token_id", None) is not None
-            else []
-        )
+        self._prefix_tokens = self.tokenizer.encode(_RERANK_PREFIX, add_special_tokens=False)
+        self._suffix_tokens = self.tokenizer.encode(_RERANK_SUFFIX, add_special_tokens=False)
         self._pad_token_id = self._resolve_pad_token_id()
 
     def _resolve_pad_token_id(self) -> int:
@@ -438,7 +440,7 @@ class RerankBatchProcessor:
         document: str,
         instruction: str,
     ) -> list[int]:
-        """Encode one rerank prompt with explicit BOS/EOS handling."""
+        """Encode one query/document pair inside Qwen3's reranker chat framing."""
         prompt = f"<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {document}"
         input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         return self._prefix_tokens + input_ids + self._suffix_tokens
@@ -509,7 +511,8 @@ class RerankBatchProcessor:
 
         scores: list[float] = []
         for true_score, false_score in row_pairs:
-            probs = mx.softmax(mx.stack([false_score, true_score]))
+            # Model logits can be BF16; calculate the two-way softmax in FP32.
+            probs = mx.softmax(mx.stack([false_score, true_score]).astype(mx.float32))
             scores.append(float(probs[1]))
 
         return scores

@@ -1,4 +1,4 @@
-"""Isolated, bounded and atomic preparation of supported d1 checkpoints."""
+"""Isolated, bounded and atomic preparation of supported decision checkpoints."""
 
 from __future__ import annotations
 
@@ -19,35 +19,49 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi
 
 from mlx_serve.config import settings
-from mlx_serve.core.decision_prepare_worker import MANIFEST, MLX_REPO, SOURCE_REPO, file_hash
+from mlx_serve.core.decision_prepare_worker import (
+    D3_REPO,
+    MANIFEST,
+    MLX_REPO,
+    SOURCE_REPO,
+    file_hash,
+)
 from mlx_serve.core.storage_access import model_volume_mounted
 
 logger = logging.getLogger(__name__)
-SUPPORTED_REPOS = {SOURCE_REPO, MLX_REPO}
+SUPPORTED_REPOS = {SOURCE_REPO, MLX_REPO, D3_REPO}
 
 
 def read_verified_manifest(path: Path, *, verify_hashes: bool = True) -> dict[str, Any]:
     manifest = json.loads((path / MANIFEST).read_text())
+    repo = manifest.get("source_repo")
+    validation = manifest.get("validation", {})
+    if not isinstance(validation, dict):
+        raise ValueError("Decision model manifest is invalid")
+    is_d3 = repo == D3_REPO
     if (
-        manifest.get("schema_version") != 1
-        or manifest.get("source_repo") not in SUPPORTED_REPOS
-        or manifest.get("architecture") != "d1_omni"
-        or manifest.get("precision") != "float16"
-        or not manifest.get("revision")
-        or not manifest.get("validation", {}).get("official_predict")
+        manifest.get("schema_version") != 1 or repo not in SUPPORTED_REPOS
+        or manifest.get("architecture") != ("qwen3_5" if is_d3 else "d1_omni")
+        or manifest.get("precision") != ("bfloat16" if is_d3 else "float16")
+        or not re.fullmatch(r"[0-9a-f]{40}", str(manifest.get("revision", "")))
+        or not validation.get("mlx_predict" if is_d3 else "official_predict")
+        or (is_d3 and not validation.get("published_file_hashes"))
     ):
         raise ValueError("Decision model manifest is invalid")
     files = manifest.get("files_sha256")
-    if (
-        not isinstance(files, dict)
-        or not {"config.json", "tokenizer.json", "LICENSE"} <= files.keys()
-    ):
+    required = {"config.json", "tokenizer.json"}
+    required |= {"decision_config.json", "readout.safetensors"} if is_d3 else {"LICENSE"}
+    if not isinstance(files, dict) or not required <= files.keys():
         raise ValueError("Decision model manifest is incomplete")
     if not any(name.endswith(".safetensors") for name in files):
         raise ValueError("Decision model manifest has no weights")
+    if is_d3 and not any(
+        name.endswith(".safetensors") and name != "readout.safetensors" for name in files
+    ):
+        raise ValueError("D3 manifest has no backbone weights")
     actual = {str(p.relative_to(path)) for p in path.rglob("*") if p.is_file()}
     if actual != set(files) | {MANIFEST}:
         raise ValueError("Decision model contains unexpected or missing files")
@@ -92,7 +106,7 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
             await process.wait()
 
 
-async def prepare_d1(
+async def prepare_decision(
     manager: Any,
     repo: str,
     name: str,
@@ -115,6 +129,14 @@ async def prepare_d1(
         yield {"status": "error", "message": "Model storage is unavailable"}
         return
     model_dir = manager._get_model_dir(name)
+    if model_dir.exists() and not (model_dir / MANIFEST).is_file():
+        yield {
+            "status": "error",
+            "message": (
+                f"Model '{name}' already exists without a verified manifest; choose another name"
+            ),
+        }
+        return
     lock_dir = settings.models_dir / ".decision-locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / "d1-preparation.lock"
@@ -167,7 +189,7 @@ async def prepare_d1(
                     )
                 yield {"status": "success", "name": name, "revision": revision, "reused": True}
                 return
-            # Serialize d1 preparations and reuse any verified artifact with this source revision,
+            # Serialize preparations and reuse any verified artifact with this source revision,
             # including one registered under another local name.
             if manager._metadata_path.exists():
                 current = json.loads(manager._metadata_path.read_text())
@@ -251,6 +273,11 @@ async def prepare_d1(
                 if free < expected:
                     raise ValueError("Insufficient free disk space for decision model preparation")
                 environment = os.environ.copy()
+                license_name = getattr(getattr(info, "card_data", None), "license", None)
+                if isinstance(license_name, str) and len(license_name) <= 255:
+                    environment["MLX_SERVE_PREPARE_LICENSE"] = license_name
+                else:
+                    environment.pop("MLX_SERVE_PREPARE_LICENSE", None)
                 package_root = str(Path(__file__).resolve().parents[2])
                 environment["PYTHONPATH"] = os.pathsep.join(
                     filter(None, (package_root, environment.get("PYTHONPATH")))
@@ -321,8 +348,8 @@ async def prepare_d1(
                 "revision": revision,
                 "size": manager._get_dir_size(artifact),
                 "modified_at": datetime.now().isoformat(),
-                "precision": "float16",
-                "architecture": "d1_omni",
+                "precision": manifest["precision"],
+                "architecture": manifest["architecture"],
             }
             yield {"status": "registering", "name": name}
             metadata_lock = settings.models_dir.parent / ".decision-metadata.lock"
@@ -386,77 +413,6 @@ async def prepare_d1(
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-async def prepare_d3(manager: Any, repo: str, name: str) -> AsyncIterator[dict[str, Any]]:
-    """Download D3 into a private staging directory before publishing it."""
-    if not model_volume_mounted(settings.models_dir):
-        yield {"status": "error", "message": "Model storage is unavailable"}
-        return
-    model_dir = manager._get_model_dir(name)
-    if model_dir.exists():
-        yield {
-            "status": "error",
-            "message": f"Model '{name}' already exists; remove it before pulling again",
-        }
-        return
-
-    settings.models_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        with tempfile.TemporaryDirectory(
-            prefix=".decision-download-", dir=settings.models_dir
-        ) as temp:
-            artifact = Path(temp) / "artifact"
-            artifact.mkdir()
-            yield {"status": "downloading", "name": name, "hf_repo": repo}
-            download = asyncio.create_task(
-                asyncio.to_thread(snapshot_download, repo_id=repo, local_dir=str(artifact))
-            )
-            try:
-                await asyncio.shield(download)
-            except asyncio.CancelledError:
-                # Do not remove the staging directory while its download thread is writing.
-                with contextlib.suppress(Exception):
-                    await download
-                raise
-
-            yield {
-                "status": "converting",
-                "name": name,
-                "detail": "Decision model checkpoint ready",
-            }
-            metadata = {
-                "type": "decision",
-                "hf_repo": repo,
-                "size": manager._get_dir_size(artifact),
-                "modified_at": datetime.now().isoformat(),
-            }
-            deadline = time.monotonic() + settings.decision_prepare_timeout_seconds
-            metadata_lock = settings.models_dir.parent / ".decision-metadata.lock"
-            with metadata_lock.open("a+") as lock:
-                while True:
-                    try:
-                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError("Timed out waiting to register decision model")
-                        await asyncio.sleep(0.2)
-                try:
-                    manager._load_metadata()
-                    if name in manager._metadata or model_dir.exists():
-                        raise ValueError(
-                            f"Model '{name}' already exists; remove it before pulling again"
-                        )
-                    artifact.rename(model_dir)
-                    try:
-                        manager._metadata[name] = metadata
-                        manager._save_metadata()
-                    except BaseException:
-                        manager._metadata.pop(name, None)
-                        shutil.rmtree(model_dir, ignore_errors=True)
-                        raise
-                finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            yield {"status": "success", "name": name}
-    except Exception as exc:
-        logger.warning("Failed to prepare D3 model %s: %s", repo, exc)
-        yield {"status": "error", "message": str(exc)}
+# Preserve the existing internal import while all supported profiles share the
+# same bounded, cancellable preparation and atomic publication path.
+prepare_d1 = prepare_decision
