@@ -80,9 +80,11 @@ additional native and backend harness checks are identified below.
   screen. The overview changed from one loaded model to zero; the worker's
   reported MLX active memory fell from 1,505,837,192 to 1,032 bytes. The
   overview's system-memory and gateway-RSS values also matched the gateway's
-  live health snapshot within the normal refresh interval. This verifies the
-  main screen and actual worker, while the menu-bar display still requires a
-  separate visual check.
+  live health snapshot within the normal refresh interval. The user opened the
+  actual menu-bar panel and confirmed that it showed zero loaded models and
+  system memory out of 16 GB after unloading, and one loaded model after the
+  model was loaded again. The UI automation could not inspect the menu-bar
+  panel directly, so those menu observations are based on the user's report.
 - Queue size, request timeout, memory thresholds and server-log retention were
   changed through the current settings UI. Saved and applied values were shown
   separately until restart, after which the server reported the new values. An
