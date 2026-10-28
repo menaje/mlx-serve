@@ -1817,8 +1817,7 @@ async def create_completion(request: CompletionRequest):
     The unsupported parameters are accepted for API compatibility but have no effect.
     Only `n=1` is supported (generating a single completion per request).
     """
-    # DEBUG: Log incoming request for troubleshooting
-    logger.info(f"[DEBUG] Received completion request: {request.model_dump()}")
+    logger.debug("Received legacy completion request")
 
     # Log warning for unsupported parameters
     unsupported_params = []

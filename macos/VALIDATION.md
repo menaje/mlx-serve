@@ -108,7 +108,13 @@ additional native and backend harness checks are identified below.
 - Diagnostic export now includes only an allowlisted server and job summary.
   An endpoint test placed synthetic secrets in saved job inputs, results and
   errors and in an external server's health response; none appeared in the
-  exported report, which retained job status and the error category.
+  exported report, which retained job status and the error category. In the
+  packaged app, a separate isolated job with synthetic secrets was exported
+  through the save panel; its report likewise retained the failure category
+  without including those inputs, results or error details.
+- The legacy text-completion endpoint no longer writes its complete request to
+  the default log. Tests exercise both prompt and message inputs as well as the
+  separate request-validation failure path.
 - With both the development and bundled runtimes, the official d1 MLX FP16
   checkpoint was copied from an existing local installation, validated, and
   used for choice, Boolean and score inference without invoking a converter.

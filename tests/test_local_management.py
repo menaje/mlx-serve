@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import sqlite3
@@ -800,6 +801,29 @@ def test_invalid_inference_does_not_log_the_request_body(caplog):
     assert response.status_code == 422
     assert secret not in caplog.text
     assert "Request validation failed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["prompt", "messages"])
+async def test_legacy_completion_does_not_log_inputs(field, monkeypatch, caplog):
+    from fastapi import HTTPException
+
+    from mlx_serve.routers.chat import CompletionRequest, create_completion
+
+    secret = "private_completion_input_1234"
+    value = secret if field == "prompt" else [{"role": "user", "content": secret}]
+    request = CompletionRequest(model="fixture", user=secret, **{field: value})
+
+    def stop_before_loading(*_args):
+        raise HTTPException(status_code=400, detail="Fixture stopped before model loading")
+
+    monkeypatch.setattr(
+        "mlx_serve.routers.chat._ensure_generation_worker_kind", stop_before_loading
+    )
+    caplog.set_level(logging.INFO, logger="mlx_serve.routers.chat")
+    with pytest.raises(HTTPException):
+        await create_completion(request)
+    assert secret not in caplog.text
 
 
 def test_debug_body_redacts_credentials_and_omits_unparseable_input():
