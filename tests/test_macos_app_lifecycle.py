@@ -272,3 +272,65 @@ def test_app_exit_stops_only_its_own_server(
             hub_release.set()
             hub.shutdown()
             hub.server_close()
+
+
+@pytest.mark.parametrize("agent_crash", [False, True])
+def test_app_exit_cleans_workers_after_gateway_is_killed(native_harness, tmp_path, agent_crash):
+    home = tmp_path / "home"
+    home.mkdir()
+    models = tmp_path / "models"
+    models.mkdir()
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(home), "HF_HOME": str(home / "hf"),
+        "MLX_SERVE_PYTHON": os.environ.get("MLX_SERVE_TEST_PYTHON", sys.executable),
+        "MLX_SERVE_HOST": "127.0.0.1", "MLX_SERVE_PORT": str(_port()),
+        "MLX_SERVE_MODELS_DIR": str(models),
+        "MLX_SERVE_RETRIEVAL_WORKER_ISOLATION_ENABLED": "true",
+        "MLX_SERVE_GENERATION_WORKER_ISOLATION_ENABLED": "true",
+        "MLX_SERVE_GENERATION_WORKER_MODE": "type",
+    })
+    app = subprocess.Popen(
+        [str(native_harness)], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    agent_pid = server_pid = None
+    worker_pids = []
+    try:
+        assert app.stdout is not None
+        ready, _, _ = select.select([app.stdout], [], [], 60)
+        assert ready and app.stdout.readline().strip() == "READY app"
+        agent_pid = _find_child(app.pid, "mlx_serve.management_agent")
+        assert agent_pid is not None
+        server_pid = _find_server(agent_pid)
+        assert server_pid is not None
+        worker_pids = [
+            pid for pid, ppid, command in _processes()
+            if ppid == server_pid and _is_server(command)
+        ]
+        assert len(worker_pids) == 5
+        if not agent_crash:
+            # A stopped worker cannot run its own parent-lifetime monitor.
+            os.kill(worker_pids[0], signal.SIGSTOP)
+        os.kill(server_pid, signal.SIGKILL)
+        if agent_crash:
+            os.kill(agent_pid, signal.SIGKILL)
+        assert app.stdin is not None
+        app.stdin.write("quit\n")
+        app.stdin.flush()
+        app.wait(timeout=10)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and any(_has_server(pid) for pid in worker_pids):
+            time.sleep(0.2)
+        assert not any(_has_server(pid) for pid in worker_pids)
+    finally:
+        if app.poll() is None:
+            app.terminate()
+            app.wait(timeout=10)
+        if agent_pid is not None and _has_process(agent_pid, "mlx_serve.management_agent"):
+            os.kill(agent_pid, signal.SIGKILL)
+        if server_pid is not None and _has_server(server_pid):
+            os.kill(server_pid, signal.SIGKILL)
+        for pid in worker_pids:
+            if _has_server(pid):
+                os.kill(pid, signal.SIGKILL)

@@ -49,6 +49,7 @@ from mlx_serve.routers.retrieval_proxy import perform_worker_request
 
 router = APIRouter(tags=["local management"])
 internal_router = APIRouter()
+_WORKER_STATE_DEADLINE_SECONDS = 5.0
 
 
 class ModelOperation(BaseModel):
@@ -207,16 +208,13 @@ async def management_state(request: Request) -> dict[str, Any]:
     """Keep each worker's cache and memory separate and report unreachable workers."""
     local = _local_snapshot()
     workers: dict[str, Any] = {}
+    probe_urls: dict[str, str] = {}
     if settings.retrieval_worker_isolation_enabled:
         urls = getattr(request.app.state, "retrieval_worker_urls", {})
         for kind in ("embedding", "reranker", "decision"):
-            try:
-                if kind not in urls:
-                    raise HTTPException(status_code=503)
-                workers[kind] = {"available": True, **await _worker_request(
-                    urls[kind], "/internal/management/state"
-                )}
-            except HTTPException:
+            if kind in urls:
+                probe_urls[kind] = urls[kind]
+            else:
                 workers[kind] = {"available": False}
     generation = getattr(request.app.state, "generation_worker_supervisor", None)
     if settings.generation_worker_isolation_enabled:
@@ -228,14 +226,30 @@ async def management_state(request: Request) -> dict[str, Any]:
                 if kind not in snapshots:
                     workers[f"generation:{kind}"] = {"available": False}
         for key, worker in snapshots.items():
-            try:
-                if not worker.get("alive"):
-                    raise HTTPException(status_code=503)
-                workers[f"generation:{key}"] = {"available": True, **await _worker_request(
-                    str(worker["url"]), "/internal/management/state"
-                )}
-            except (HTTPException, KeyError):
+            if worker.get("alive") and "url" in worker:
+                probe_urls[f"generation:{key}"] = str(worker["url"])
+            else:
                 workers[f"generation:{key}"] = {"available": False}
+
+    async def probe(url: str) -> dict[str, Any]:
+        try:
+            return {"available": True, **await _worker_request(url, "/internal/management/state")}
+        except HTTPException:
+            return {"available": False}
+
+    tasks = {key: asyncio.create_task(probe(url)) for key, url in probe_urls.items()}
+    if tasks:
+        try:
+            done, _ = await asyncio.wait(
+                tasks.values(), timeout=_WORKER_STATE_DEADLINE_SECONDS
+            )
+            for key, task in tasks.items():
+                workers[key] = task.result() if task in done else {"available": False}
+        finally:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
     storage_available = model_storage_available(settings.models_dir)
     defaults = {kind: default_model(kind) for kind in DEFAULT_TYPES} if storage_available else {}
     if storage_available:

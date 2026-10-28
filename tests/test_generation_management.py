@@ -4,6 +4,7 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -289,3 +290,68 @@ async def test_internal_model_scoped_worker_rejects_a_different_model(monkeypatc
     with pytest.raises(HTTPException) as error:
         await _local_operation("unload", ModelOperation(name="model-b", type="llm"))
     assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_management_state_probes_unresponsive_workers_concurrently(monkeypatch):
+    from mlx_serve.routers import management
+
+    monkeypatch.setattr(settings, "retrieval_worker_isolation_enabled", True)
+    monkeypatch.setattr(settings, "generation_worker_isolation_enabled", True)
+    monkeypatch.setattr(settings, "generation_worker_mode", "type")
+    monkeypatch.setattr(management, "_local_snapshot", lambda: {})
+    monkeypatch.setattr(management, "model_storage_available", lambda _: False)
+    started = []
+    all_started = asyncio.Event()
+
+    async def unresponsive(url, _path):
+        started.append(url)
+        if len(started) == 5:
+            all_started.set()
+        await all_started.wait()
+        raise HTTPException(status_code=503)
+
+    monkeypatch.setattr(management, "_worker_request", unresponsive)
+    supervisor = SimpleNamespace(snapshot=lambda: {
+        kind: {"url": kind, "alive": True} for kind in ("llm", "vlm")
+    })
+    state = SimpleNamespace(
+        retrieval_worker_urls={kind: kind for kind in ("embedding", "reranker", "decision")},
+        generation_worker_supervisor=supervisor,
+    )
+    result = await asyncio.wait_for(
+        management.management_state(SimpleNamespace(app=SimpleNamespace(state=state))), timeout=1,
+    )
+    assert len(started) == 5
+    assert result["state"] == "degraded"
+    assert all(not item["available"] for item in result["workers"].values())
+
+
+@pytest.mark.asyncio
+async def test_management_state_bounds_probes_and_keeps_reachable_workers(monkeypatch):
+    from mlx_serve.routers import management
+
+    monkeypatch.setattr(settings, "retrieval_worker_isolation_enabled", True)
+    monkeypatch.setattr(settings, "generation_worker_isolation_enabled", False)
+    monkeypatch.setattr(management, "_local_snapshot", lambda: {})
+    monkeypatch.setattr(management, "model_storage_available", lambda _: False)
+    monkeypatch.setattr(management, "_WORKER_STATE_DEADLINE_SECONDS", 0.05)
+    cancelled = asyncio.Event()
+
+    async def probe(url, _path):
+        if url == "healthy":
+            return {"cache": {}, "requests": {}}
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(management, "_worker_request", probe)
+    state = SimpleNamespace(retrieval_worker_urls={"embedding": "healthy", "reranker": "slow"})
+    result = await asyncio.wait_for(
+        management.management_state(SimpleNamespace(app=SimpleNamespace(state=state))), timeout=1,
+    )
+    assert result["workers"]["embedding"]["available"]
+    assert not result["workers"]["reranker"]["available"]
+    assert not result["workers"]["decision"]["available"]
+    assert cancelled.is_set()

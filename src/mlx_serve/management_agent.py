@@ -255,10 +255,32 @@ def _clean_completed_server_logs(directory: Path, retention_days: int | None) ->
     return failures
 
 
+def _peek_process_exit(process: subprocess.Popen) -> tuple[int | None, bool]:
+    """Inspect a child without reaping it, keeping its process-group ID reserved."""
+    if not hasattr(process, "pid") or not hasattr(process, "returncode"):
+        return process.poll(), False
+    if process.returncode is not None:
+        return process.returncode, False
+    if not all(hasattr(os, name) for name in ("waitid", "P_PID", "WNOWAIT")):
+        return process.poll(), False
+    try:
+        result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        # If another component reaped the child, its former group ID is no
+        # longer a safe target for a signal.
+        return process.poll(), False
+    if result is None:
+        return None, True
+    code = result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+    return code, True
+
+
 class ServerController:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self.process: subprocess.Popen | None = None
+        self.process_group: int | None = None
+        self.process_lock = asyncio.Lock()
         self.port: int | None = None
         self.host: str | None = None
         self.management_secret: str | None = None
@@ -270,7 +292,7 @@ class ServerController:
     def _finish_log(self) -> None:
         """Mark a log completed only after the server's process group has stopped."""
         process, path = self.process, self.log_path
-        if process is None or path is None or process.poll() is None:
+        if process is None or path is None or _peek_process_exit(process)[0] is None:
             return
         try:
             os.killpg(process.pid, 0)
@@ -289,20 +311,28 @@ class ServerController:
             pass
 
     def authorization(self, port: int) -> str | None:
-        if self.port == port and self.process is not None and self.process.poll() is None:
+        if (
+            self.port == port and self.process is not None
+            and _peek_process_exit(self.process)[0] is None
+        ):
             return self.management_secret
         return None
 
     def address(self, port: int) -> str:
-        if self.port == port and self.process is not None and self.process.poll() is None:
+        if (
+            self.port == port and self.process is not None
+            and _peek_process_exit(self.process)[0] is None
+        ):
             return self.host or "127.0.0.1"
         return _loopback_host(Settings().host)
 
     async def status(self) -> dict[str, Any]:
+        await self._reap_failed_server()
         self._finish_log()
         config = Settings()
-        port = self.port if self.process and self.process.poll() is None else config.port
-        managed = bool(self.process and self.process.poll() is None)
+        exit_code = _peek_process_exit(self.process)[0] if self.process is not None else None
+        port = self.port if self.process and exit_code is None else config.port
+        managed = bool(self.process and exit_code is None)
         host = self.address(port)
         try:
             health = await asyncio.to_thread(_request_json, port, "/health", timeout=2, host=host)
@@ -321,7 +351,6 @@ class ServerController:
                 "log_cleanup_failures": self.log_cleanup_failures,
             }
         except (HTTPException, ValueError):
-            exit_code = self.process.poll() if self.process is not None else None
             if managed:
                 elapsed = time.monotonic() - self.started_at if self.started_at is not None else 0
                 unavailable = "degraded" if self.ready_once or elapsed >= 30 else "starting"
@@ -381,6 +410,7 @@ class ServerController:
                 stdin=subprocess.DEVNULL, stdout=fd, stderr=fd, start_new_session=True,
                 env=env,
             )
+            self.process_group = getattr(self.process, "pid", None)
             self.log_path = log_path
             self.port = config.port
             self.host = _loopback_host(config.host)
@@ -390,25 +420,69 @@ class ServerController:
             os.close(fd)
         return await self.status()
 
-    async def stop(self) -> None:
-        process = self.process
-        if process is None or process.poll() is not None:
-            raise HTTPException(status_code=409, detail="The app does not own a running server")
-        process.terminate()
-        try:
-            await asyncio.to_thread(process.wait, 50)
-        except subprocess.TimeoutExpired:
-            # Only the process created by this agent is signalled.
-            with contextlib.suppress(ProcessLookupError):
+    def _kill_owned_group(self, process: subprocess.Popen) -> None:
+        _, anchored = _peek_process_exit(process)
+        if anchored and self.process_group == process.pid:
+            # The live or unreaped child reserves this ID, so it cannot have
+            # been reassigned to an unrelated process group.
+            # macOS may report EPERM when the only remaining group member is
+            # the unreaped zombie; a still-present group keeps its log pending.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGKILL)
+
+    async def _reap_failed_server(self) -> None:
+        async with self.process_lock:
+            process = self.process
+            if process is None:
+                return
+            code, anchored = _peek_process_exit(process)
+            if code is None or not anchored:
+                return
+            self._kill_owned_group(process)
             await asyncio.to_thread(process.wait)
-        self._finish_log()
-        self.process = None
-        self.port = None
-        self.host = None
-        self.management_secret = None
-        self.started_at = None
-        self.ready_once = False
+
+    async def stop(self) -> None:
+        async with self.process_lock:
+            process = self.process
+            if process is None:
+                raise HTTPException(status_code=409, detail="The app does not own a running server")
+            code, anchored = _peek_process_exit(process)
+            if code is None:
+                with contextlib.suppress(ProcessLookupError):
+                    # Popen.terminate() polls and may reap a just-exited child
+                    # before its remaining process group can be cleaned up.
+                    if anchored:
+                        os.kill(process.pid, signal.SIGTERM)
+                    else:
+                        process.terminate()
+
+                async def wait_until_exited() -> None:
+                    while _peek_process_exit(process)[0] is None:
+                        await asyncio.sleep(0.1)
+
+                try:
+                    await asyncio.wait_for(wait_until_exited(), timeout=50)
+                except TimeoutError:
+                    if _peek_process_exit(process)[1]:
+                        self._kill_owned_group(process)
+                    else:
+                        process.kill()
+            self._kill_owned_group(process)
+            await asyncio.to_thread(process.wait)
+            # Group termination may be asynchronous; retain the running log
+            # until every member has actually exited.
+            for _ in range(20):
+                self._finish_log()
+                if self.log_path is None:
+                    break
+                await asyncio.sleep(0.1)
+            self.process = None
+            self.process_group = None
+            self.port = None
+            self.host = None
+            self.management_secret = None
+            self.started_at = None
+            self.ready_once = False
 
 
 class SettingsChanges(BaseModel):
@@ -546,7 +620,7 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
             migration_cancel.set()
             await migration_task
         await jobs.close()
-        if controller.process is not None and controller.process.poll() is None:
+        if controller.process is not None:
             await controller.stop()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)

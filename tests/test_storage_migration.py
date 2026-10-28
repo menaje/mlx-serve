@@ -80,6 +80,32 @@ def test_copy_preserves_original_and_updates_registry_defaults_and_settings(stor
     assert progress[-1][0] == "applying"
 
 
+def test_migration_restores_read_only_directory_modes_after_copy(storage):
+    model = storage.source / "sample"
+    nested = model / "read-only"
+    nested.mkdir()
+    (nested / "weights").write_bytes(b"nested weights")
+    nested.chmod(0o555)
+    model.chmod(0o555)
+    copied_model = storage.destination / "sample"
+    try:
+        _migrate(storage)
+        copied_nested = copied_model / "read-only"
+        assert (copied_nested / "weights").read_bytes() == b"nested weights"
+        assert copied_model.stat().st_mode & 0o777 == 0o555
+        assert copied_nested.stat().st_mode & 0o777 == 0o555
+        assert model.stat().st_mode & 0o777 == 0o555
+        assert _effective_config(storage) == str(storage.destination)
+    finally:
+        model.chmod(0o755)
+        nested.chmod(0o755)
+        if copied_model.exists():
+            copied_model.chmod(0o755)
+        copied_nested = copied_model / "read-only"
+        if copied_nested.exists():
+            copied_nested.chmod(0o755)
+
+
 def test_failed_config_write_retains_source_and_the_copied_destination(storage):
     original_config = storage.config.read_bytes()
 

@@ -121,7 +121,10 @@ class RetrievalWorkerSupervisor:
             str(port),
         ]
         if env.get("MLX_SERVE_APP_OWNED") == "1":
-            command.extend(["--log-level", settings.log_level.lower(), "--no-access-log"])
+            command = [
+                sys.executable, "-m", "mlx_serve.app_server_runner",
+                "--host", host, "--port", str(port), "--parent", str(os.getpid()),
+            ]
         process = subprocess.Popen(command, env=env)
 
         worker = RetrievalWorkerProcess(

@@ -23,6 +23,8 @@ completion criteria. Other unverified flows are listed below.
   real-model test then passed separately using a fresh public checkpoint.
   Two additional generation-worker log-level cases were added and passed
   separately after that full run.
+- After the subsequent worker and storage review fixes, the full suite passed
+  417 tests with both real-model checkpoints supplied and no skips.
 
 ## Observed flows
 
@@ -30,6 +32,17 @@ The current public-only, quit-to-stop build was exercised through the packaged
 app UI in an isolated home after the Mac was unlocked. Earlier builds and
 additional native and backend harness checks are identified below.
 
+- A native lifecycle regression killed an app-owned gateway with five workers
+  running. When the agent remained alive, it stopped the owned process group,
+  including a deliberately suspended worker; when the agent was also killed,
+  the workers exited after detecting their gateway had gone away. Both cases
+  passed with the development and bundled runtimes. A separate check prevents
+  signalling a group whose original leader has already been reaped and could
+  have had its PID reused.
+- A worker-state regression starts five unresponsive probes together and checks
+  that a deadline preserves the available responses while marking the rest
+  unavailable. A migration regression copies nested read-only directories and
+  verifies that their original permissions are restored after copying.
 - In a clean test home, the model-add UI defaulted to
   `LiquidAI/d1-omni-600M-MLX-fp16` with automatic loading enabled. A fresh
   download of revision `05e99e49eb1799f1f9f98ec619b6fef2b0dd0960` passed

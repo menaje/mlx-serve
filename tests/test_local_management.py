@@ -745,6 +745,21 @@ def test_server_log_is_completed_only_after_process_group_exits(tmp_path):
             process.wait(timeout=5)
 
 
+def test_reaped_server_group_is_not_signalled(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from mlx_serve.management_agent import ServerController
+
+    controller = ServerController(tmp_path)
+    process = SimpleNamespace(pid=12345, returncode=-9)
+    controller.process = process
+    controller.process_group = process.pid
+    signals = []
+    monkeypatch.setattr("mlx_serve.management_agent.os.killpg", lambda *args: signals.append(args))
+    controller._kill_owned_group(process)
+    assert signals == []
+
+
 @pytest.mark.parametrize("owns_group", [True, False])
 def test_orphaned_job_guard_only_signals_a_group_it_owns(monkeypatch, owns_group):
     import mlx_serve.core.managed_job_runner as runner

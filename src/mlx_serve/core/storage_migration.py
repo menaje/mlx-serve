@@ -267,7 +267,15 @@ def migrate_storage(
                 raise ValueError("Model storage volume is unavailable; reconnect it first")
             target = destination.parent / entry.relative
             if stat.S_ISDIR(entry.identity[2]):
-                target.mkdir(mode=stat.S_IMODE(entry.identity[2]))
+                # The source may be read-only. Keep the private copy writable
+                # until its contents and integrity checks have completed.
+                target.mkdir(mode=0o700)
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+                fd = os.open(target, flags)
+                try:
+                    os.fchmod(fd, 0o700)
+                finally:
+                    os.close(fd)
             elif entry.source == source.parent / "metadata.json":
                 _write_registry(target, _rewrite_registry(registry, source, destination))
                 report(entry.identity[3])
@@ -306,6 +314,23 @@ def migrate_storage(
             raise ValueError("Copied model files changed during migration")
         if not model_volume_mounted(source) or not model_volume_mounted(destination):
             raise ValueError("Model storage volume is unavailable; reconnect it first")
+        copied_directories = {
+            entry.relative: entry.identity
+            for entry in copied_entries if stat.S_ISDIR(entry.identity[2])
+        }
+        for entry in reversed(before):
+            if not stat.S_ISDIR(entry.identity[2]):
+                continue
+            target = destination.parent / entry.relative
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+            fd = os.open(target, flags)
+            try:
+                if _identity(os.fstat(fd)) != copied_directories.get(entry.relative):
+                    raise ValueError("Copied model files changed during migration")
+                os.fchmod(fd, stat.S_IMODE(entry.identity[2]))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         update("applying", copied, total)
         save({"models_dir": str(destination)}, expected_models_dir=source)
         return {"source": str(source), "destination": str(destination), "size_bytes": total}
