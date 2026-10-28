@@ -39,6 +39,7 @@ EDITABLE_FIELDS: dict[str, tuple[str, str]] = {
     "decision_prepare_max_memory_bytes": ("decision", "prepare_max_memory_bytes"),
     "decision_prepare_max_disk_bytes": ("decision", "prepare_max_disk_bytes"),
     "log_level": ("logging", "level"),
+    "app_log_retention_days": ("logging", "app_log_retention_days"),
     "debug_log_chat_request_bodies": ("logging", "debug_chat_request_bodies"),
 }
 

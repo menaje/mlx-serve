@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import signal
 import sys
+import threading
 
 
 async def run(parent: int, job_id: str) -> int:
@@ -49,15 +51,38 @@ async def run(parent: int, job_id: str) -> int:
         loop.remove_signal_handler(signal.SIGTERM)
 
 
+def _enforce_parent_lifetime(parent: int, finished: threading.Event) -> None:
+    """Bound orphan cleanup even when a download thread cannot be cancelled."""
+    while not finished.wait(1):
+        if os.getppid() == parent:
+            continue
+        pid = os.getpid()
+        # Only signal the group when the job runner owns it. Otherwise leave
+        # unrelated processes alone and stop the runner itself.
+        target = os.killpg if os.getpgrp() == pid else os.kill
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            target(pid, signal.SIGTERM)
+        if not finished.wait(10):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                target(pid, signal.SIGKILL)
+        return
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--parent", type=int, required=True)
     args = parser.parse_args()
+    finished = threading.Event()
+    threading.Thread(
+        target=_enforce_parent_lifetime, args=(args.parent, finished), daemon=True,
+    ).start()
     try:
         raise SystemExit(asyncio.run(run(args.parent, args.job_id)))
     except BrokenPipeError:
         raise SystemExit(1) from None
+    finally:
+        finished.set()
 
 
 if __name__ == "__main__":

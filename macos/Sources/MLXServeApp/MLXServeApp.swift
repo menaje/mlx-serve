@@ -194,7 +194,7 @@ struct OverviewView: View {
                     GroupBox("작업") {
                         VStack(alignment: .leading, spacing: 5) {
                             Text("\(store.activeJobs)개 진행 중").font(.title2.bold())
-                            Text(store.backgroundEnabled ? "앱 종료 후에도 작업을 유지합니다." : "앱을 종료하면 앱이 시작한 작업을 정리합니다.")
+                            Text("앱을 종료하면 앱이 시작한 작업과 서버를 종료합니다.")
                                 .foregroundStyle(.secondary)
                         }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
                     }

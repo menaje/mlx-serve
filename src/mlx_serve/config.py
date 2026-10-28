@@ -57,6 +57,12 @@ class Settings(BaseSettings):
         default="text",
         description="Log format (text or json)",
     )
+    app_log_retention_days: int | None = Field(
+        default=None,
+        ge=1,
+        le=36500,
+        description="Days to keep completed app-owned server logs; None keeps them indefinitely",
+    )
     debug_log_chat_request_bodies: bool = Field(
         default=False,
         description="Write full /v1/chat/completions request bodies to debug logs",

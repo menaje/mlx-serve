@@ -7,14 +7,18 @@ The app starts a local management process and can either start its own engine or
 connect to an existing server. The management process only listens on loopback,
 uses an encrypted channel authenticated with a per-launch secret, and never
 stops a server it did not start. Closing the window leaves the menu-bar app
-running; by default, quitting cancels its preparation jobs and stops its own
-server. The user can opt in to retaining the app-owned agent, jobs and server
-after quitting; the connection secret is then kept in Keychain for reconnection.
-When preparation requests automatic loading, the agent records and performs
-that step even while the app is closed. A loading failure is recorded separately
-from successful preparation so the user can load the model manually.
+running. Quitting the app cancels its preparation jobs and stops its own server;
+an independently started server is left running. When preparation requests
+automatic loading, a loading failure is recorded separately from successful
+preparation so the user can load the model manually.
 The app also inspects known CLI paths and the user's launchd service without
 changing those services.
+
+When upgrading from an earlier experimental build with its former background
+mode enabled, disable that option in the old build and quit it before starting
+this version. A surviving old manager can hold the job-history lock or appear
+as an external server. The new app does not access its old Keychain entry or
+terminate processes it cannot identify as its own.
 
 Supported installs are LiquidAI's original d1 checkpoint, its official MLX
 FP16 checkpoint, `vllm-sr/d3-lite`,
@@ -61,11 +65,21 @@ Configuration, model files, and job records are kept outside the app in
 `~/.mlx-serve`. A fresh app install creates a local-only server configuration;
 an existing CLI installation is left unchanged. Settings show saved, effective
 on restart, and currently applied values separately. Existing external servers
-are not reconfigured by the app. Hugging Face credentials are saved in macOS
-Keychain and passed only to the preparation process for a job. Keychain is built
-into macOS; no separate account or Developer ID is required. A token is optional
-for public models, and the default quit-and-stop mode needs no background
-reconnection secret.
+are not reconfigured by the app. Queue size and timeout can be limited or left
+unlimited; the timeout also covers batch processing. Memory protection settings
+control request and model-load checks, not a macOS-enforced memory limit.
+App-owned server logs are kept in `~/.mlx-serve/app-server-logs`. They are kept
+indefinitely by default. If a retention period is configured, expired completed
+session logs are removed when the app next starts its server; running logs and
+logs whose process group could not be confirmed stopped are left alone. The
+previous `~/.mlx-serve/app-server.log` and other services' logs are never
+automatically removed by this policy.
+The app supports publicly accessible models
+that do not require login or access approval. It does not read or store Hugging
+Face tokens or use Keychain, and its own server and preparation processes disable
+automatic use of existing Hugging Face credentials. Existing credentials on the
+Mac are left untouched. This restriction applies to app-owned processes; an
+independent CLI or server continues to use its own configuration.
 Paths under `/Volumes/<name>` must refer to a mounted volume. This prevents
 starting the engine or creating a replacement directory after that volume is
 disconnected. With the server and preparations stopped, existing model storage

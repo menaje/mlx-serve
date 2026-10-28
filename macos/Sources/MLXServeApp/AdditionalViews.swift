@@ -124,8 +124,7 @@ private func jobDate(_ timestamp: String) -> Date? {
 
 private func jobGuidance(_ category: String) -> String {
     switch category {
-    case "authentication": return "Hugging Face 토큰을 확인하거나 다시 저장한 뒤 시도하세요."
-    case "access_approval": return "Hugging Face에서 모델 접근 승인과 토큰 권한을 확인하세요."
+    case "authentication", "access_approval": return "이 앱은 로그인이나 접근 승인 없이 받을 수 있는 공개 모델을 지원합니다. 모델 공개 상태를 확인하세요."
     case "storage_permission": return "모델 저장 위치의 권한과 장치 연결 상태를 확인하세요."
     case "disk": return "저장 공간을 확보하고 모델 저장 장치의 연결을 확인하세요."
     case "memory": return "다른 모델을 언로드하거나 메모리를 확보한 뒤 시도하세요."
@@ -169,8 +168,12 @@ struct PreferencesView: View {
     @State private var preload = ""
     @State private var ttl = "1800"
     @State private var queue = "8"
+    @State private var queueTimeout = "180"
     @State private var concurrency = "1"
     @State private var memoryGuard = true
+    @State private var processMemoryFraction = "0.75"
+    @State private var availableMemoryFraction = "0.1"
+    @State private var loadHeadroomFraction = "0.1"
     @State private var preset = "custom"
     @State private var embeddingCache = "3"
     @State private var rerankerCache = "2"
@@ -179,8 +182,8 @@ struct PreferencesView: View {
     @State private var rerankerDocuments = "4"
     @State private var rerankerTokens = "2048"
     @State private var logLevel = "INFO"
+    @State private var logRetention = ""
     @State private var logBodies = false
-    @State private var token = ""
     @State private var loginStatus = "확인 중"
     @State private var notificationStatus = "확인 중"
     @State private var reviewingOriginals = false
@@ -188,10 +191,11 @@ struct PreferencesView: View {
     @State private var reviewingMigration = false
     @State private var previewingMigration = false
     @State private var migrationPreview: [String: Any] = [:]
-    @State private var changingBackground = false
     @AppStorage("automaticStartServer") private var automaticStartServer = false
     @AppStorage("automaticRecoverServer") private var automaticRecoverServer = false
     @AppStorage("jobNotifications") private var jobNotifications = false
+
+    private var settingsReady: Bool { store.settings["fields"] as? [String: Any] != nil }
 
     var body: some View {
         TabView {
@@ -206,6 +210,11 @@ struct PreferencesView: View {
         .task {
             await store.reloadSettings(); populate(); updateLoginStatus()
             await updateNotificationStatus()
+        }
+        .onChange(of: store.agentReady) { _, ready in
+            if ready && !settingsReady {
+                Task { await store.reloadSettings(); populate() }
+            }
         }
         .sheet(isPresented: $reviewingOriginals) { OriginalCleanupView().environmentObject(store) }
         .sheet(isPresented: $reviewingHFCache) { HFCacheInventoryView().environmentObject(store) }
@@ -230,18 +239,6 @@ struct PreferencesView: View {
                 Toggle("앱이 시작한 서버 종료 시 자동 복구", isOn: $automaticRecoverServer)
                 Text("자동 시작은 서버가 중지된 경우에만 실행합니다. 자동 복구는 앱 실행 중 최대 세 번 시도하며, 직접 중지한 서버나 기존 서버에는 적용하지 않습니다.")
                     .font(.caption).foregroundStyle(.secondary)
-                Toggle("앱 종료 후에도 서버와 작업 유지", isOn: Binding(
-                    get: { store.backgroundEnabled },
-                    set: { enabled in
-                        changingBackground = true
-                        Task {
-                            await store.setBackground(enabled)
-                            changingBackground = false
-                        }
-                    }
-                )).disabled(!store.agentReady || changingBackground || store.busy)
-                Text("앱이 시작한 서버와 작업만 유지합니다. 앱을 다시 열면 안전하게 연결합니다. Mac을 로그아웃하거나 재시동한 뒤 자동 실행하려면 로그인 항목과 자동 시작 설정을 사용하세요.")
-                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("서버 중단·모델 준비 완료 및 실패 알림", isOn: Binding(
                     get: { jobNotifications },
                     set: { enabled in
@@ -257,9 +254,7 @@ struct PreferencesView: View {
                 LabeledContent("시스템 알림 상태", value: notificationStatus)
                 Text("알림에는 입력 내용이나 인증정보를 포함하지 않습니다. 앱이 실행 중일 때 발생한 변경을 알립니다.")
                     .font(.caption).foregroundStyle(.secondary)
-                Text(store.backgroundEnabled
-                    ? "창을 닫거나 앱을 종료해도 앱이 시작한 서버와 작업이 유지됩니다."
-                    : "창을 닫아도 앱과 서버는 유지됩니다. 앱을 종료하면 앱이 시작한 작업과 서버를 정리합니다.")
+                Text("창을 닫아도 앱과 서버는 유지됩니다. 앱을 종료하면 앱이 시작한 작업과 서버를 종료합니다. 기존 외부 서버는 계속 실행됩니다.")
                     .foregroundStyle(.secondary)
             }
         }.formStyle(.grouped)
@@ -281,17 +276,34 @@ struct PreferencesView: View {
                 Button("연결 설정 저장") {
                     guard let value = Int(port) else { store.message = "포트는 숫자로 입력하세요."; return }
                     Task { await store.saveSettings(["host": host, "port": value]) }
-                }.disabled(store.ownership == "external")
+                }.disabled(store.ownership == "external" || !settingsReady || store.busy)
                 Text("앱이 시작한 이 버전의 서버는 LAN을 켜도 관리 기능을 로컬로 제한합니다.")
                     .foregroundStyle(.secondary)
             }
             Section("대기열") {
                 TextField("모델당 대기 요청 수", text: $queue)
+                TextField("요청 대기 시간 제한 (초)", text: $queueTimeout)
                 fieldState("inference_max_queue_per_model")
+                fieldState("inference_queue_timeout_seconds")
+                Text("빈칸은 해당 제한을 사용하지 않습니다. 요청 수를 0으로 설정하면 대기 없이 초과 요청을 거절합니다. 시간 제한에는 배치 처리 시간도 포함됩니다.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Button("대기열 저장") {
-                    guard let value = Int(queue) else { store.message = "대기열 크기를 숫자로 입력하세요."; return }
-                    Task { await store.saveSettings(["inference_max_queue_per_model": value]) }
-                }.disabled(store.ownership == "external")
+                    let trimmedQueue = queue.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let queueValue: Any
+                    if trimmedQueue.isEmpty {
+                        queueValue = NSNull()
+                    } else if let value = Int(trimmedQueue), value >= 0 {
+                        queueValue = value
+                    } else {
+                        store.message = "대기 요청 수는 0 이상의 정수로 입력하거나 비워 두세요."; return
+                    }
+                    let timeout = optionalDecimal(queueTimeout, allowsZero: false)
+                    guard timeout.valid else {
+                        store.message = "대기 시간은 0보다 큰 초 단위 숫자로 입력하거나 비워 두세요."; return
+                    }
+                    Task { await store.saveSettings(["inference_max_queue_per_model": queueValue,
+                                                     "inference_queue_timeout_seconds": timeout.value]) }
+                }.disabled(store.ownership == "external" || !settingsReady || store.busy)
             }
         }.formStyle(.grouped)
     }
@@ -323,7 +335,7 @@ struct PreferencesView: View {
                             } catch { store.message = error.localizedDescription }
                         }
                     }
-                }.disabled(store.ownership == "external" || store.migratingStorage || previewingMigration)
+                }.disabled(store.ownership == "external" || !settingsReady || store.busy || store.migratingStorage || previewingMigration)
                 Text("복사할 때는 아직 없는 새 상위 폴더 안의 경로를 지정하세요. 예: /Volumes/외장디스크/MLXServe/models")
                     .font(.caption).foregroundStyle(.secondary)
                 if store.migratingStorage {
@@ -348,18 +360,8 @@ struct PreferencesView: View {
                     .disabled(!store.agentReady)
                 Text("공유 캐시는 다른 앱에서도 사용할 수 있어 자동으로 삭제하지 않습니다.")
                     .font(.caption).foregroundStyle(.secondary)
-                SecureField("토큰", text: $token)
-                HStack {
-                    Button("Keychain에 저장") {
-                        do { try HFKeychain.save(token); token = ""; store.message = "Keychain에 저장했습니다." }
-                        catch { store.message = error.localizedDescription }
-                    }
-                    Button("토큰 제거") {
-                        do { try HFKeychain.save(""); token = ""; store.message = "Keychain에서 제거했습니다." }
-                        catch { store.message = error.localizedDescription }
-                    }
-                }
-                Text("토큰은 설정 파일이나 작업 이력에 저장하지 않습니다.").foregroundStyle(.secondary)
+                Text("로그인이나 접근 승인 없이 받을 수 있는 공개 모델을 사용합니다. 토큰은 사용하지 않습니다.")
+                    .foregroundStyle(.secondary)
             }
         }.formStyle(.grouped)
     }
@@ -404,6 +406,16 @@ struct PreferencesView: View {
                     TextField("리랭커 배치 토큰 예산", text: $rerankerTokens)
                     fieldState("rerank_batch_max_tokens")
                 }
+                DisclosureGroup("메모리 보호 기준") {
+                    TextField("프로세스 RSS 기준 비율", text: $processMemoryFraction)
+                    fieldState("memory_process_limit_fraction")
+                    TextField("시스템 가용 메모리 최소 비율", text: $availableMemoryFraction)
+                    fieldState("memory_min_available_fraction")
+                    TextField("로드·생성 시 확보할 여유 비율", text: $loadHeadroomFraction)
+                    fieldState("memory_load_headroom_fraction")
+                    Text("전체 메모리 대비 비율입니다. 예: 0.75는 75%. 빈칸은 해당 기준을 사용하지 않습니다. 로드·생성 시 여유 기준은 요청 보호와 별도로 적용됩니다.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Button("성능 설정 저장") {
                     guard let seconds = Int(ttl), let limit = Int(concurrency),
                           let embedding = Int(embeddingCache), let reranker = Int(rerankerCache),
@@ -411,13 +423,22 @@ struct PreferencesView: View {
                           let documents = Int(rerankerDocuments), let tokens = Int(rerankerTokens) else {
                         store.message = "시간, 캐시, 배치와 동시 요청 수를 숫자로 입력하세요."; return
                     }
+                    let processFraction = optionalDecimal(processMemoryFraction, allowsZero: false, maximum: 1)
+                    let availableFraction = optionalDecimal(availableMemoryFraction, allowsZero: false, maximum: 1)
+                    let headroomFraction = optionalDecimal(loadHeadroomFraction, allowsZero: true, maximum: 1)
+                    guard processFraction.valid, availableFraction.valid, headroomFraction.valid else {
+                        store.message = "메모리 비율은 0보다 크고 1보다 작은 숫자로 입력하세요. 로드 여유 비율에는 0도 사용할 수 있습니다."; return
+                    }
                     let names = preload.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
                     Task { await store.saveSettings(["preload_models": names, "cache_ttl_seconds": seconds,
                                                      "inference_max_concurrency_per_model": limit, "memory_guard_enabled": memoryGuard,
+                                                     "memory_process_limit_fraction": processFraction.value,
+                                                     "memory_min_available_fraction": availableFraction.value,
+                                                     "memory_load_headroom_fraction": headroomFraction.value,
                                                      "cache_max_embedding_models": embedding, "cache_max_reranker_models": reranker,
                                                      "cache_max_decision_models": decision, "embedding_batch_max_texts": batch,
                                                      "rerank_batch_max_documents": documents, "rerank_batch_max_tokens": tokens]) }
-                }.disabled(store.ownership == "external")
+                }.disabled(store.ownership == "external" || !settingsReady || store.busy)
                 Text("메모리 보호는 요청을 제한하는 기준이며 macOS의 강제 메모리 상한이 아닙니다.")
                     .foregroundStyle(.secondary)
             }
@@ -443,12 +464,31 @@ struct PreferencesView: View {
                 Picker("로그 수준", selection: $logLevel) {
                     ForEach(["DEBUG", "INFO", "WARNING", "ERROR"], id: \.self) { Text($0).tag($0) }
                 }
+                TextField("앱 서버 로그 보관 기간 (일, 빈칸은 무기한)", text: $logRetention)
                 Toggle("채팅 요청 본문 디버그 기록", isOn: $logBodies)
                 fieldState("log_level")
+                fieldState("app_log_retention_days")
                 fieldState("debug_log_chat_request_bodies")
                 Button("로그 설정 저장") {
-                    Task { await store.saveSettings(["log_level": logLevel, "debug_log_chat_request_bodies": logBodies]) }
-                }.disabled(store.ownership == "external")
+                    let input = logRetention.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let days: Any
+                    if input.isEmpty {
+                        days = NSNull()
+                    } else if let value = Int(input), (1...36500).contains(value) {
+                        days = value
+                    } else {
+                        store.message = "로그 보관 기간은 1~36500일로 입력하거나 비워 두세요."; return
+                    }
+                    Task { await store.saveSettings(["log_level": logLevel, "app_log_retention_days": days,
+                                                     "debug_log_chat_request_bodies": logBodies]) }
+                }.disabled(store.ownership == "external" || !settingsReady || store.busy)
+                LabeledContent("앱 서버 로그", value: "~/.mlx-serve/app-server-logs")
+                Text("기간을 지정하면 서버를 시작할 때 종료된 앱 서버의 오래된 로그만 삭제합니다. 실행 중이거나 종료를 확인하지 못한 로그와 이전 app-server.log는 보존합니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if (store.server["log_cleanup_failures"] as? Int ?? 0) > 0 {
+                    Text("일부 오래된 로그를 정리하지 못했습니다. 로그 폴더의 접근 권한을 확인하세요.")
+                        .foregroundStyle(.orange)
+                }
                 Button("진단 자료 내보내기…") { Task { await store.exportDiagnostics() } }
                 Text("요청 본문은 기본적으로 기록하지 않습니다. 진단 자료에는 본문, 인증정보와 로그가 포함되지 않습니다.")
                     .foregroundStyle(.secondary)
@@ -459,7 +499,8 @@ struct PreferencesView: View {
     @ViewBuilder func fieldState(_ name: String) -> some View {
         let value = store.field(name)
         let saved = displayValue(value["saved"], field: name)
-        let actual = displayValue(value["applied"], field: name)
+        let actual = store.settings["server_settings_available"] as? Bool == false
+            ? "확인 불가" : displayValue(value["applied"], field: name)
         let next = displayValue(value["effective_on_restart"], field: name)
         let sources = ["yaml": "설정 파일", "environment": "환경 변수", "dotenv": "환경 파일", "default": "기본값"]
         let source = sources[value["source"] as? String ?? ""] ?? "확인 불가"
@@ -468,7 +509,13 @@ struct PreferencesView: View {
     }
 
     func displayValue(_ raw: Any?, field: String) -> String {
-        guard let raw, !(raw is NSNull) else { return "확인 불가" }
+        guard let raw else { return "확인 불가" }
+        if raw is NSNull {
+            if field == "app_log_retention_days" { return "무기한 보관" }
+            return ["inference_max_queue_per_model", "inference_queue_timeout_seconds",
+                    "memory_process_limit_fraction", "memory_min_available_fraction",
+                    "memory_load_headroom_fraction"].contains(field) ? "제한 없음" : "확인 불가"
+        }
         if field == "preload_models", let models = raw as? [String] {
             return models.isEmpty ? "없음" : models.joined(separator: ", ")
         }
@@ -479,6 +526,15 @@ struct PreferencesView: View {
         return String(describing: raw)
     }
 
+    func optionalDecimal(_ text: String, allowsZero: Bool, maximum: Double? = nil) -> (valid: Bool, value: Any) {
+        let input = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if input.isEmpty { return (true, NSNull()) }
+        guard let number = Double(input), number.isFinite,
+              (allowsZero ? number >= 0 : number > 0),
+              maximum.map({ number < $0 }) ?? true else { return (false, NSNull()) }
+        return (true, number)
+    }
+
     func populate() {
         func saved(_ key: String) -> Any? { store.field(key)["saved"] }
         host = saved("host") as? String ?? "127.0.0.1"
@@ -486,9 +542,13 @@ struct PreferencesView: View {
         modelsDir = saved("models_dir") as? String ?? ""
         preload = (saved("preload_models") as? [String] ?? []).joined(separator: ", ")
         ttl = String(saved("cache_ttl_seconds") as? Int ?? 1800)
-        queue = String(saved("inference_max_queue_per_model") as? Int ?? 8)
+        queue = (saved("inference_max_queue_per_model") as? NSNumber).map { String($0.intValue) } ?? ""
+        queueTimeout = (saved("inference_queue_timeout_seconds") as? NSNumber).map { String($0.doubleValue) } ?? ""
         concurrency = String(saved("inference_max_concurrency_per_model") as? Int ?? 1)
         memoryGuard = saved("memory_guard_enabled") as? Bool ?? true
+        processMemoryFraction = (saved("memory_process_limit_fraction") as? NSNumber).map { String($0.doubleValue) } ?? ""
+        availableMemoryFraction = (saved("memory_min_available_fraction") as? NSNumber).map { String($0.doubleValue) } ?? ""
+        loadHeadroomFraction = (saved("memory_load_headroom_fraction") as? NSNumber).map { String($0.doubleValue) } ?? ""
         embeddingCache = String(saved("cache_max_embedding_models") as? Int ?? 3)
         rerankerCache = String(saved("cache_max_reranker_models") as? Int ?? 2)
         decisionCache = String(saved("cache_max_decision_models") as? Int ?? 1)
@@ -496,6 +556,7 @@ struct PreferencesView: View {
         rerankerDocuments = String(saved("rerank_batch_max_documents") as? Int ?? 4)
         rerankerTokens = String(saved("rerank_batch_max_tokens") as? Int ?? 2048)
         logLevel = saved("log_level") as? String ?? "INFO"
+        logRetention = (saved("app_log_retention_days") as? NSNumber).map { String($0.intValue) } ?? ""
         logBodies = saved("debug_log_chat_request_bodies") as? Bool ?? false
     }
 

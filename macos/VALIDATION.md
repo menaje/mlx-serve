@@ -11,13 +11,44 @@ its current completion criteria. Other unverified flows are listed below.
   huggingface-hub 1.33.0, transformers 5.21.0.
 - Bundled environment: Python 3.14.10 with the same package versions above;
   the complete pinned dependency list is in `requirements-runtime.txt`.
-- The Python test suite passed 380 tests with real d3-lite and Qwen3-Reranker
+- The Python test suite passed 394 tests with real d3-lite and Qwen3-Reranker
   checkpoints supplied; no tests were skipped. The run emitted one third-party
   Starlette deprecation warning. Set `MLX_SERVE_D3_TEST_MODEL_DIR` and
   `MLX_SERVE_RERANK_TEST_MODEL_DIR` to local checkpoint directories to include
   those optional real-model tests in a future run.
 
 ## Observed flows
+
+The UI flows below were performed in earlier builds. The current version removes
+Keychain and the option to keep app-owned processes running after app exit; while
+the Mac was locked it was verified through native and backend harnesses rather
+than a new full-UI pass.
+
+- A native harness compiled from the current `AppStore` started the actual
+  agent and its server in an isolated home. After the harness exited normally
+  or was killed, the agent, server and observed worker processes stopped. Both
+  cases were repeated with a model-preparation job waiting on an isolated test
+  Hub: the runner stopped, the job was recorded as cancelled, and its staging
+  directory was absent. A separate test used an independently started server
+  and confirmed that it kept running after the harness exited. The lifecycle
+  cases were exercised with the development and bundled Python runtimes. Tests
+  using both runtimes also killed the management agent itself; the app-owned
+  server stopped and a job blocked on the test Hub was bounded and subsequently
+  recovered as interrupted. A log whose process group could not be confirmed
+  stopped remains ineligible for automatic log cleanup.
+- Public-model jobs reject token input, clear inherited Hugging Face token
+  variables, and disable implicit cached credentials in their child processes.
+  Tests placed synthetic credentials in both the environment and token file,
+  then verified that the actual Hugging Face header builder sent no
+  authorization header. With synthetic credentials present, fresh public
+  embedding and reranker downloads, validation and inference also succeeded.
+  The app-owned server uses the same credential policy; existing CLI
+  configurations and credentials are not modified.
+- Queue and memory limit settings were checked for optional values, valid
+  boundaries, atomic saves and rejection of invalid values. A native, non-UI
+  harness checked the current Swift input and display helpers. Tests also check
+  server-log completion and retention: only expired completed app-owned logs
+  are eligible, and active, legacy, unrelated and linked files are preserved.
 
 - In an isolated, initially empty home directory, the management agent using
   the development runtime downloaded `LiquidAI/d1-omni-600M` revision
@@ -75,10 +106,6 @@ its current completion criteria. Other unverified flows are listed below.
   model-add UI itself was not exercised during this run. With the app's
   bytecode-writing protection applied, the rebuilt bundle's ad-hoc signature
   still verified after these operations.
-- The app's native Keychain code stored, updated, reopened and removed disposable
-  Hugging Face and agent secrets across two processes using a temporary Keychain.
-  The test did not add it to the user's Keychain search list. This does not yet
-  exercise the app's complete background reconnection flow with the login Keychain.
 - In an earlier packaged app build with its server stopped, the Hub cache
   inventory showed
   an isolated synthetic repository with two revisions sharing one 23-byte file.
@@ -153,35 +180,17 @@ its current completion criteria. Other unverified flows are listed below.
   and copied a disposable synthetic model through its settings UI. Automated
   tests cover interrupted copies, changed files, concurrent configuration,
   links, insufficient space and failed saves.
-- In an isolated home, the development agent and app-owned server continued
-  after their parent process exited while a real preparation job was running.
-  An authenticated encrypted client reattached, cancelled the job, and stopped
-  and restarted the owned server. After disabling the option and ending the
-  attached parent, the agent and server exited. The protocol tests cover replay,
-  incorrect keys, remote and browser-origin requests, and discovery records.
-- In separate isolated homes, the agent also completed an official MLX FP16 d1
-  preparation and automatically loaded it after the app's parent process exited.
-  Repeated runs reused a verified artifact and exercised the current asynchronous
-  load request, including one using the rebuilt app's bundled runtime. Tests cover
-  load failure, cancellation during loading, and recovery of a saved load request.
-  These process tests do not exercise macOS Keychain.
 - Existing CLI and launchd detection is read-only; tests cover running, loaded,
   absent and uninspectable user services. System service files are identified,
   but their running state is not determined.
 - After the encrypted management channel and launchd detection were added, the
   rebuilt packaged app was launched in a separate test home. Its UI displayed
-  the test port and service state, started and stopped its own server, and showed
-  the background option disabled. Its ad-hoc signature was checked after use.
+  the test port and service state, and started and stopped its own server. Its
+  ad-hoc signature was checked after use.
 - A separate temporary ad-hoc test app registered and unregistered a real
   `SMAppService` login item. It reported enabled after registration and
   unregistered afterward. This did not test the packaged app's UI or login
   behavior after a reboot.
-- A native test harness using the app's actual background-setting code attempted
-  to enable the option while the Mac/login Keychain was locked and Keychain UI
-  interaction was disabled for the test. The operation returned a Keychain
-  interaction error and did not enable background mode. A successful relaunch
-  using the login Keychain has not been tested in this state.
-
 ## Remaining validation and limitations
 
 - One development UI session terminated with an AppKit layout-constraint
@@ -200,8 +209,8 @@ its current completion criteria. Other unverified flows are listed below.
   to individually reviewed detached revisions as described in `README.md`.
   Defaults are limited to decision, embedding and reranker models, and new model
   installation is limited to the documented profiles. The new cleanup and
-  offline-removal controls and the optional background mode's successful login
-  Keychain reconnection were not exercised through the full app UI while the Mac
-  was locked.
+  offline-removal controls, new settings, and the current public-only,
+  quit-to-stop behavior were not exercised through the full app UI while the
+  Mac was locked.
 - Notification transition filtering is tested, but the macOS permission prompt
   and visible delivery have not been exercised end to end.

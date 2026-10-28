@@ -3,8 +3,10 @@
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -52,6 +54,41 @@ def test_settings_save_is_atomic_and_reports_environment_override(tmp_path, monk
         save_settings({"port": 70000}, path)
     assert path.read_text() == before
     assert path.stat().st_mode & 0o077 == 0
+
+
+def test_optional_queue_and_memory_limits_round_trip_and_reject_invalid_values(tmp_path):
+    path = tmp_path / "config.yaml"
+    values = {
+        "models_dir": str(tmp_path / "models"),
+        "inference_max_queue_per_model": None,
+        "inference_queue_timeout_seconds": None,
+        "memory_process_limit_fraction": None,
+        "memory_min_available_fraction": 0.15,
+        "memory_load_headroom_fraction": 0.0,
+        "app_log_retention_days": None,
+    }
+    save_settings(values, path)
+    snapshot = settings_snapshot(path)["fields"]
+    assert {key: snapshot[key]["saved"] for key in values} == values
+
+    save_settings({"inference_max_queue_per_model": 0,
+                   "inference_queue_timeout_seconds": 12.5,
+                   "app_log_retention_days": 30}, path)
+    snapshot = settings_snapshot(path)["fields"]
+    assert snapshot["inference_max_queue_per_model"]["saved"] == 0
+    assert snapshot["inference_queue_timeout_seconds"]["saved"] == 12.5
+    assert snapshot["app_log_retention_days"]["saved"] == 30
+    before = path.read_text()
+    for changes in (
+        {"inference_queue_timeout_seconds": 0},
+        {"memory_process_limit_fraction": 1.0},
+        {"memory_load_headroom_fraction": -0.1},
+        {"app_log_retention_days": 0},
+        {"app_log_retention_days": 36501},
+    ):
+        with pytest.raises(ValidationError):
+            save_settings(changes, path)
+        assert path.read_text() == before
 
 
 def test_invalid_config_is_not_overwritten_or_included_in_errors(tmp_path):
@@ -182,6 +219,15 @@ def test_management_agent_requires_secret_and_local_non_browser_requests(tmp_pat
         invalid = local.post("/jobs", headers=header, json={"repo": "model", "token": secret})
         assert invalid.status_code == 422
         assert secret not in invalid.text
+        invalid = local.post("/jobs", headers=header, json={
+            "repo": "LiquidAI/d1-omni-600M", "token": "hf_test_secret",
+        })
+        assert invalid.status_code == 422
+        assert "hf_test_secret" not in invalid.text
+        assert local.post("/background", headers=header, json={"enabled": True}).status_code == 404
+        assert local.post(
+            "/background/attach", headers=header, json={"pid": 123},
+        ).status_code == 404
         browser = local.get("/jobs", headers={**header, "Origin": "https://evil.example"})
         assert browser.status_code == 403
         assert local.get("http://evil.example/jobs", headers=header).status_code == 403
@@ -518,7 +564,7 @@ async def test_unexpected_server_exit_is_visible_and_allows_restart(tmp_path, mo
     import mlx_serve.management_agent as agent
 
     monkeypatch.setattr(agent, "Settings", lambda: SimpleNamespace(
-        port=8000, host="127.0.0.1", models_dir=tmp_path,
+        port=8000, host="127.0.0.1", models_dir=tmp_path, app_log_retention_days=None,
     ))
     monkeypatch.setattr(agent, "_port_is_busy", lambda *args: False)
 
@@ -536,13 +582,128 @@ async def test_unexpected_server_exit_is_visible_and_allows_restart(tmp_path, mo
     log = tmp_path / "app-server.log"
     log.write_text("previous diagnostic output")
     log.chmod(0o644)
-    monkeypatch.setattr(agent.subprocess, "Popen", lambda *args, **kwargs: SimpleNamespace(
-        poll=lambda: None,
-    ))
+    monkeypatch.setenv("HF_TOKEN", "hf_environment_fixture")
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hf_legacy_fixture")
+
+    def spawn_server(*args, **kwargs):
+        environment = kwargs["env"]
+        assert "HF_TOKEN" not in environment and "HUGGING_FACE_HUB_TOKEN" not in environment
+        assert environment["HF_HUB_DISABLE_IMPLICIT_TOKEN"] == "1"
+        assert environment["MLX_SERVE_MANAGEMENT_TOKEN"]
+        return SimpleNamespace(poll=lambda: None)
+
+    monkeypatch.setattr(agent.subprocess, "Popen", spawn_server)
     restarted = await controller.start()
     assert restarted["state"] == "starting"
     assert restarted["ownership"] == "app"
-    assert log.stat().st_mode & 0o077 == 0
+    assert log.read_text() == "previous diagnostic output"
+    created_logs = list((tmp_path / "app-server-logs").glob("running-*.log"))
+    assert len(created_logs) == 1 and created_logs[0].stat().st_mode & 0o077 == 0
+
+
+def test_server_log_retention_preserves_active_legacy_and_unrelated_files(tmp_path):
+    from mlx_serve.management_agent import _clean_completed_server_logs
+
+    old = tmp_path / f"server-{'a' * 32}.log"
+    recent = tmp_path / f"server-{'b' * 32}.log"
+    active = tmp_path / f"running-{'c' * 32}.log"
+    unrelated = tmp_path / "app-server.log"
+    linked = tmp_path / f"server-{'d' * 32}.log"
+    hard_linked = tmp_path / f"server-{'e' * 32}.log"
+    for path in (old, recent, active, unrelated):
+        path.write_text(path.name)
+    linked.symlink_to(unrelated)
+    os.link(unrelated, hard_linked)
+    expired = time.time() - 10 * 24 * 60 * 60
+    for path in (old, active, unrelated):
+        os.utime(path, (expired, expired))
+    assert _clean_completed_server_logs(tmp_path, None) == 0
+    assert old.exists()
+    assert _clean_completed_server_logs(tmp_path, 7) == 0
+    assert not old.exists()
+    assert recent.exists() and active.exists() and unrelated.exists() and linked.is_symlink()
+    assert hard_linked.exists()
+
+
+@pytest.mark.parametrize("kind", ["file", "file_link", "directory_link"])
+@pytest.mark.asyncio
+async def test_server_log_directory_rejects_links_and_files(tmp_path, monkeypatch, kind):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    import mlx_serve.management_agent as agent
+
+    target = tmp_path / "user-data"
+    if kind == "directory_link":
+        target.mkdir()
+        content = target / "data"
+    else:
+        content = target
+    content.write_text("keep")
+    log_dir = tmp_path / "app-server-logs"
+    if kind != "file":
+        log_dir.symlink_to(target)
+    else:
+        log_dir.write_text("keep")
+    monkeypatch.setattr(agent, "Settings", lambda: SimpleNamespace(
+        port=8000, host="127.0.0.1", models_dir=tmp_path, app_log_retention_days=7,
+    ))
+    monkeypatch.setattr(agent, "_port_is_busy", lambda *args: False)
+
+    def unavailable(*args, **kwargs):
+        raise HTTPException(status_code=503)
+
+    monkeypatch.setattr(agent, "_request_json", unavailable)
+    with pytest.raises(HTTPException, match="Server log directory is unavailable"):
+        await agent.ServerController(tmp_path).start()
+    assert content.read_text() == "keep"
+    assert log_dir.is_symlink() if kind != "file" else log_dir.read_text() == "keep"
+
+
+def test_server_log_is_completed_only_after_process_group_exits(tmp_path):
+    from mlx_serve.management_agent import ServerController
+
+    path = tmp_path / f"running-{'a' * 32}.log"
+    path.write_text("server log")
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True,
+    )
+    controller = ServerController(tmp_path)
+    controller.process = process
+    controller.log_path = path
+    try:
+        controller._finish_log()
+        assert path.exists()
+        process.terminate()
+        process.wait(timeout=5)
+        controller._finish_log()
+        assert not path.exists()
+        assert (tmp_path / f"server-{'a' * 32}.log").read_text() == "server log"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("owns_group", [True, False])
+def test_orphaned_job_guard_only_signals_a_group_it_owns(monkeypatch, owns_group):
+    import mlx_serve.core.managed_job_runner as runner
+
+    sent = []
+    monkeypatch.setattr(runner.os, "getpid", lambda: 123)
+    monkeypatch.setattr(runner.os, "getppid", lambda: 1)
+    monkeypatch.setattr(runner.os, "getpgrp", lambda: 123 if owns_group else 456)
+    monkeypatch.setattr(runner.os, "kill", lambda pid, sig: sent.append(("process", pid, sig)))
+    monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: sent.append(("group", pid, sig)))
+
+    class NeverFinished:
+        def wait(self, _seconds):
+            return False
+
+    runner._enforce_parent_lifetime(999, NeverFinished())
+    kind = "group" if owns_group else "process"
+    assert sent == [(kind, 123, signal.SIGTERM), (kind, 123, signal.SIGKILL)]
 
 
 @pytest.mark.asyncio
@@ -616,8 +777,9 @@ def test_management_deletion_uses_decision_worker_path_and_rejects_other_types(m
     "LiquidAI/d1-omni-600M", "vllm-sr/d3-lite",
     "mlx-community/all-MiniLM-L6-v2-bf16", "mlx-community/Qwen3-Reranker-0.6B-4bit",
 ])
+@pytest.mark.parametrize("shutdown", [False, True])
 async def test_job_cancel_terminates_process_and_preserves_existing_models(
-    tmp_path, monkeypatch, repo
+    tmp_path, monkeypatch, repo, shutdown
 ):
     import mlx_serve.core.managed_jobs as managed_jobs
 
@@ -626,9 +788,20 @@ async def test_job_cancel_terminates_process_and_preserves_existing_models(
     existing = models / "existing"
     existing.mkdir()
     (existing / "model").write_text("keep")
+    hf_home = tmp_path / "hf-home"
+    hf_home.mkdir()
+    (hf_home / "token").write_text("hf_saved_fixture")
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.setenv("HF_TOKEN", "hf_secret123")
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hf_other_fixture")
+    monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "0")
     script = tmp_path / "fake_runner.py"
     script.write_text(
         "import json, os, pathlib, signal, sys, time\n"
+        "from huggingface_hub.utils import build_hf_headers\n"
+        "assert 'HF_TOKEN' not in os.environ and 'HUGGING_FACE_HUB_TOKEN' not in os.environ\n"
+        "assert os.environ.get('HF_HUB_DISABLE_IMPLICIT_TOKEN') == '1'\n"
+        "assert 'authorization' not in build_hf_headers()\n"
         "p=json.loads(sys.stdin.readline())\n"
         "job=sys.argv[1]\n"
         "stage=pathlib.Path(p['models_dir']) / ('.decision-prepare-'+job+'-fake')\n"
@@ -648,7 +821,7 @@ async def test_job_cancel_terminates_process_and_preserves_existing_models(
     manager = JobManager(tmp_path / "jobs")
     await manager.recover()
     params = {"repo": repo, "models_dir": str(models)}
-    job = manager.start(params, token="hf_secret123")
+    job = manager.start(params)
     with pytest.raises(ValueError, match="active job"):
         manager.start({**params, "name": "another-name"})
     with pytest.raises(ValueError, match="active job"):
@@ -662,13 +835,18 @@ async def test_job_cancel_terminates_process_and_preserves_existing_models(
         pytest.fail("Job did not begin downloading")
     assert current["stage"] == "downloading"
     pid = current["pid"]
-    result = await manager.cancel(job["id"])
+    if shutdown:
+        await manager.close()
+        result = manager.get(job["id"])
+    else:
+        result = await manager.cancel(job["id"])
     assert result["status"] == "cancelled"
     assert not list(models.glob(".decision-prepare-*"))
     assert (existing / "model").read_text() == "keep"
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
-    await manager.close()
+    if not shutdown:
+        await manager.close()
     reopened = JobManager(tmp_path / "jobs")
     await reopened.recover()
     assert reopened.get(job["id"])["status"] == "cancelled"

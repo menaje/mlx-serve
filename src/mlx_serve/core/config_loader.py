@@ -119,6 +119,7 @@ def build_default_config_dict(settings_obj: Any | None = None) -> dict[str, Any]
         "logging": {
             "level": settings_obj.log_level,
             "format": settings_obj.log_format,
+            "app_log_retention_days": settings_obj.app_log_retention_days,
             "debug_chat_request_bodies": settings_obj.debug_log_chat_request_bodies,
         },
     }
@@ -294,6 +295,7 @@ def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         # logging section
         ("logging", "level"): "log_level",
         ("logging", "format"): "log_format",
+        ("logging", "app_log_retention_days"): "app_log_retention_days",
         ("logging", "debug_chat_request_bodies"): "debug_log_chat_request_bodies",
     }
 
@@ -417,5 +419,6 @@ generation:
 logging:
   level: INFO
   format: json  # text | json
+  app_log_retention_days: null  # null keeps completed app-owned server logs
   debug_chat_request_bodies: false
 """

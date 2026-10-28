@@ -8,10 +8,12 @@ import contextlib
 import importlib.metadata
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -27,17 +29,17 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from mlx_serve.config import Settings
-from mlx_serve.core.background_agent import BackgroundControl, SecureAgentChannel, key_identifier
+from mlx_serve.core.agent_channel import SecureAgentChannel
 from mlx_serve.core.local_access import is_local_management_request, open_local_http
 from mlx_serve.core.managed_config import (
     initialize_app_config,
     save_settings,
     settings_snapshot,
 )
-from mlx_serve.core.managed_jobs import ACTIVE_STATES, JobManager
+from mlx_serve.core.managed_jobs import ACTIVE_STATES, JobManager, public_hf_environment
 from mlx_serve.core.storage_access import model_storage_available, model_volume_mounted
 from mlx_serve.core.storage_migration import migrate_storage, preview_storage_migration
 
@@ -169,6 +171,37 @@ def _check_storage_change(current: Path, requested: str, active_jobs: bool) -> N
             raise ValueError("Existing registered models must be migrated before changing storage")
 
 
+def _clean_completed_server_logs(directory: Path, retention_days: int | None) -> int:
+    """Remove only expired, app-created log files from completed server sessions."""
+    if retention_days is None:
+        return 0
+    cutoff = time.time() - retention_days * 24 * 60 * 60
+    failures = 0
+    try:
+        candidates = list(directory.iterdir())
+    except OSError:
+        return 1
+    for path in candidates:
+        if not re.fullmatch(r"server-[0-9a-f]{32}\.log", path.name):
+            continue
+        try:
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_mtime > cutoff):
+                continue
+            current = path.lstat()
+            if (current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size) != (
+                info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size
+            ):
+                continue
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            failures += 1
+    return failures
+
+
 class ServerController:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
@@ -178,6 +211,29 @@ class ServerController:
         self.management_secret: str | None = None
         self.started_at: float | None = None
         self.ready_once = False
+        self.log_path: Path | None = None
+        self.log_cleanup_failures = 0
+
+    def _finish_log(self) -> None:
+        """Mark a log completed only after the server's process group has stopped."""
+        process, path = self.process, self.log_path
+        if process is None or path is None or process.poll() is None:
+            return
+        try:
+            os.killpg(process.pid, 0)
+            return
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return
+        completed = path.with_name(path.name.replace("running-", "server-", 1))
+        try:
+            os.link(path, completed, follow_symlinks=False)
+            path.unlink()
+            self.log_path = None
+        except OSError:
+            # An unconfirmed or unmovable log is never eligible for retention cleanup.
+            pass
 
     def authorization(self, port: int) -> str | None:
         if self.port == port and self.process is not None and self.process.poll() is None:
@@ -190,6 +246,7 @@ class ServerController:
         return _loopback_host(Settings().host)
 
     async def status(self) -> dict[str, Any]:
+        self._finish_log()
         config = Settings()
         port = self.port if self.process and self.process.poll() is None else config.port
         managed = bool(self.process and self.process.poll() is None)
@@ -208,6 +265,7 @@ class ServerController:
                 "state": "degraded" if health.get("status") != "healthy" else "connected",
                 "ownership": "app" if managed else "external", "port": port,
                 "url": _server_url(port, host), "health": health,
+                "log_cleanup_failures": self.log_cleanup_failures,
             }
         except (HTTPException, ValueError):
             exit_code = self.process.poll() if self.process is not None else None
@@ -225,6 +283,7 @@ class ServerController:
                 "ownership": "app" if managed else None,
                 "port": port, "url": _server_url(port, host), "health": None,
                 "last_exit_code": exit_code if unavailable == "failed" else None,
+                "log_cleanup_failures": self.log_cleanup_failures,
             }
 
     async def start(self) -> dict[str, Any]:
@@ -238,20 +297,38 @@ class ServerController:
             raise HTTPException(
                 status_code=422, detail="Model storage volume is unavailable; reconnect it first"
             )
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        log_path = self.data_dir / "app-server.log"
-        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        log_dir = self.data_dir / "app-server-logs"
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            log_dir.mkdir(mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=422, detail="Server log directory is unavailable"
+            ) from exc
+        if log_dir.is_symlink() or not log_dir.is_dir():
+            raise HTTPException(status_code=422, detail="Server log directory is unavailable")
+        self.log_cleanup_failures = _clean_completed_server_logs(
+            log_dir, config.app_log_retention_days
+        )
+        log_path = log_dir / f"running-{secrets.token_hex(16)}.log"
+        try:
+            fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=422, detail="Server log directory is unavailable"
+            ) from exc
         try:
             os.fchmod(fd, 0o600)
             self.management_secret = secrets.token_urlsafe(32)
-            env = os.environ.copy()
+            env = public_hf_environment()
             env["MLX_SERVE_MANAGEMENT_TOKEN"] = self.management_secret
             self.process = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "mlx_serve.server:app", "--host", config.host,
-                 "--port", str(config.port), "--no-access-log", "--no-proxy-headers"],
+                [sys.executable, "-m", "mlx_serve.app_server_runner", "--host", config.host,
+                 "--port", str(config.port), "--parent", str(os.getpid())],
                 stdin=subprocess.DEVNULL, stdout=fd, stderr=fd, start_new_session=True,
                 env=env,
             )
+            self.log_path = log_path
             self.port = config.port
             self.host = _loopback_host(config.host)
             self.started_at = time.monotonic()
@@ -272,6 +349,7 @@ class ServerController:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
             await asyncio.to_thread(process.wait)
+        self._finish_log()
         self.process = None
         self.port = None
         self.host = None
@@ -288,25 +366,18 @@ class StorageMigrationRequest(BaseModel):
     destination: str = Field(min_length=1, max_length=4096)
 
 
-class BackgroundRequest(BaseModel):
-    enabled: bool
-
-
-class BackgroundAttachRequest(BaseModel):
-    pid: int = Field(gt=1)
-
-
 class SecureRequest(BaseModel):
     payload: str = Field(max_length=2 * 1024 * 1024)
 
 
 class JobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     repo: str
     name: str | None = None
     revision: str | None = None
     keep_original: bool = False
     load_after: bool = False
-    token: str | None = Field(default=None, max_length=4096)
 
 
 class ModelCommand(BaseModel):
@@ -338,7 +409,6 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
     secure_channel = SecureAgentChannel(token)
     jobs: JobManager | None = None
     storage_guard = asyncio.Lock()
-    background_guard = asyncio.Lock()
     migration_lock = threading.Lock()
     migration_cancel = threading.Event()
     migration_task: asyncio.Task | None = None
@@ -444,9 +514,6 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
             return await call_next(request)
         if not secrets.compare_digest(bearer, f"Bearer {token}"):
             return JSONResponse(status_code=403, content={"detail": "Local authorization required"})
-        control = getattr(app.state, "background_control", None)
-        if control is not None:
-            control.touch()
         return await call_next(request)
 
     @app.post("/secure")
@@ -489,38 +556,9 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
     @app.get("/status")
     async def status() -> dict[str, Any]:
         state = await controller.status()
-        control = getattr(app.state, "background_control", None)
-        state["background_enabled"] = control.enabled if control is not None else False
         state["next_bind_host"] = Settings().host
         state["installation"] = await existing_installation()
         return state
-
-    @app.post("/background")
-    async def set_background(payload: BackgroundRequest) -> dict[str, bool]:
-        async with background_guard:
-            control = getattr(app.state, "background_control", None)
-            if control is None:
-                raise HTTPException(status_code=503, detail="Background agent is unavailable")
-            try:
-                if payload.enabled:
-                    await asyncio.to_thread(control.enable)
-                else:
-                    await asyncio.to_thread(control.disable)
-            except (OSError, ValueError) as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            return {"enabled": control.enabled}
-
-    @app.post("/background/attach")
-    async def attach_background(payload: BackgroundAttachRequest) -> dict[str, bool]:
-        async with background_guard:
-            control = getattr(app.state, "background_control", None)
-            if control is None or not control.enabled:
-                raise HTTPException(status_code=409, detail="Background agent is unavailable")
-            try:
-                await asyncio.to_thread(control.attach, payload.pid)
-            except ValueError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            return {"enabled": True}
 
     @app.post("/server/start")
     async def start_server() -> dict[str, Any]:
@@ -782,9 +820,9 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
             if not model_storage_available(Path(models_dir)):
                 raise HTTPException(status_code=503, detail="Model storage is unavailable")
             try:
-                params = payload.model_dump(exclude={"token"})
+                params = payload.model_dump()
                 params["models_dir"] = models_dir
-                return jobs.start(params, token=payload.token)
+                return jobs.start(params)
             except (ValueError, OSError) as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -826,17 +864,15 @@ async def _serve(token: str, parent_pid: int) -> None:
     listener.bind(("127.0.0.1", 0))
     listener.listen(128)
     listener.set_inheritable(False)
-    key_id = key_identifier(token)
-    control = BackgroundControl(DATA_DIR, listener.getsockname()[1], parent_pid, key_id)
-    app.state.background_control = control
     config = uvicorn.Config(app, log_level="warning", access_log=False, proxy_headers=False)
     server = uvicorn.Server(config)
 
     async def monitor_parent() -> None:
         while not server.should_exit:
-            await asyncio.sleep(1)
-            if await asyncio.to_thread(control.should_exit):
+            if os.getppid() != parent_pid:
                 server.should_exit = True
+                return
+            await asyncio.sleep(1)
 
     watcher = asyncio.create_task(monitor_parent())
     print(json.dumps({"port": listener.getsockname()[1]}), flush=True)
@@ -846,7 +882,6 @@ async def _serve(token: str, parent_pid: int) -> None:
         watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watcher
-        await asyncio.to_thread(control.disable)
         listener.close()
 
 

@@ -19,7 +19,6 @@ final class AppStore: ObservableObject {
     @Published var modelError: String?
     @Published var busy = false
     @Published var automaticStartNote: String?
-    @Published var backgroundEnabled = false
 
     private var agent: Process?
     private var agentPort: Int?
@@ -45,15 +44,6 @@ final class AppStore: ObservableObject {
     init() { Task { await launchAgent() } }
 
     private func launchAgent() async {
-        do {
-            if try await reconnectBackgroundAgent() {
-                startPolling(nil)
-                return
-            }
-        } catch {
-            message = error.localizedDescription
-            return
-        }
         let bundled = Bundle.main.resourceURL?.appendingPathComponent("runtime/bin/python3").path
         let development = ProcessInfo.processInfo.environment["MLX_SERVE_PYTHON"]
         guard let executable = [bundled, development].compactMap({ $0 }).first(where: {
@@ -76,6 +66,7 @@ final class AppStore: ObservableObject {
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "HF_TOKEN")
         environment.removeValue(forKey: "HUGGING_FACE_HUB_TOKEN")
+        environment["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
         environment.removeValue(forKey: "PYTHONPATH")
         environment.removeValue(forKey: "PYTHONHOME")
         environment["PYTHONNOUSERSITE"] = "1"
@@ -120,81 +111,20 @@ final class AppStore: ObservableObject {
             }
             agentReady = true
             startPolling(process)
-            if UserDefaults.standard.bool(forKey: "backgroundServer") {
-                await setBackground(true)
-            }
         } catch {
             message = error.localizedDescription
         }
     }
 
-    private struct AgentRecord: Decodable {
-        let version: Int
-        let pid: Int32
-        let port: Int
-        let session: String
-        let keyID: String
-
-        enum CodingKeys: String, CodingKey {
-            case version, pid, port, session
-            case keyID = "key_id"
-        }
-    }
-
-    private var agentKeyID: String {
-        let input = Data("mlx-serve-agent-key-id-v1:".utf8) + Data(secret.utf8)
-        return SHA256.hash(data: input).map { String(format: "%02x", $0) }.joined()
-    }
-
-    private func reconnectBackgroundAgent() async throws -> Bool {
-        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
-        let file = URL(fileURLWithPath: home).appendingPathComponent(".mlx-serve/app-agent.json")
-        guard FileManager.default.fileExists(atPath: file.path) else { return false }
-        let values = try file.resourceValues(forKeys: [.isSymbolicLinkKey, .fileSizeKey])
-        guard values.isSymbolicLink != true, (values.fileSize ?? 4097) <= 4096,
-              let record = try? JSONDecoder().decode(AgentRecord.self, from: Data(contentsOf: file)),
-              record.version == 1, record.pid > 1, (1...65535).contains(record.port),
-              !record.session.isEmpty, record.keyID.count == 64,
-              record.keyID.allSatisfy({ $0.isHexDigit }) else {
-            throw AppError("백그라운드 연결 정보를 확인할 수 없습니다. 저장소와 실행 중인 서비스를 확인하세요.")
-        }
-        errno = 0
-        if kill(record.pid, 0) != 0 && errno == ESRCH { return false }
-        guard let saved = try AgentKeychain.read(record.keyID) else {
-            throw AppError("백그라운드 서버의 Keychain 연결 정보를 찾을 수 없습니다.")
-        }
-        secret = saved
-        guard agentKeyID == record.keyID else {
-            secret = ""
-            throw AppError("백그라운드 서버의 Keychain 연결 정보를 확인하지 못했습니다.")
-        }
-        agentPort = record.port
-        do {
-            _ = try await request("/background/attach", method: "POST", body: [
-                "pid": Int(ProcessInfo.processInfo.processIdentifier)
-            ])
-        } catch {
-            agentPort = nil
-            secret = ""
-            throw AppError("실행 중인 백그라운드 서버를 안전하게 확인하지 못했습니다. 기존 서비스와 Keychain 상태를 확인하세요.")
-        }
-        backgroundEnabled = true
-        agentReady = true
-        UserDefaults.standard.set(true, forKey: "backgroundServer")
-        return true
-    }
-
-    private func startPolling(_ process: Process?) {
+    private func startPolling(_ process: Process) {
         Task {
             while !Task.isCancelled {
-                if let process, !process.isRunning { break }
+                if !process.isRunning { break }
                 await refresh()
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
-            if process != nil {
-                agentReady = false
-                message = "로컬 관리 구성요소가 종료됐습니다. 앱을 다시 실행하세요."
-            }
+            agentReady = false
+            message = "로컬 관리 구성요소가 종료됐습니다. 앱을 다시 실행하세요."
         }
     }
 
@@ -297,13 +227,8 @@ final class AppStore: ObservableObject {
             "Copied model files changed during migration": "검증 중 복사본이 변경되어 저장 위치를 바꾸지 않았습니다. 기존 파일과 복사본을 확인하세요.",
             "Model storage copy was interrupted": "모델 복사가 중단되어 기존 저장 위치를 유지했습니다. 복사 대상 폴더를 확인하세요.",
             "Model storage copy failed": "모델 복사에 실패했습니다. 기존 파일과 복사 대상 폴더를 확인하세요.",
-            "Background agent is unavailable": "백그라운드 관리 구성요소를 사용할 수 없습니다. 앱을 다시 실행하세요.",
-            "Another background agent is already running": "다른 백그라운드 관리 구성요소가 실행 중입니다. 기존 앱을 확인하세요.",
-            "Another background agent may still be running": "기존 백그라운드 관리 구성요소가 남아 있을 수 있습니다. 실행 중인 서비스를 확인하세요.",
-            "Background agent record is invalid": "백그라운드 연결 정보가 올바르지 않습니다. 저장소와 실행 중인 서비스를 확인하세요.",
-            "Background agent lock is invalid": "백그라운드 연결 잠금 파일을 확인할 수 없습니다. 저장소 권한을 확인하세요.",
-            "The application process could not be verified": "앱 프로세스를 확인하지 못해 백그라운드 연결을 중지했습니다.",
             "External server settings are read-only": "기존 서버의 설정은 이 앱에서 변경할 수 없습니다.",
+            "Server log directory is unavailable": "서버 로그 폴더에 접근할 수 없습니다. 폴더와 접근 권한을 확인하세요.",
             "The configured port is already in use": "설정된 포트를 다른 서비스가 사용 중입니다. 포트나 해당 서비스를 확인하세요.",
             "The app does not own a running server": "이 앱이 시작한 서버가 아닙니다. 기존 서비스에서 서버를 관리하세요.",
             "Cancel or finish active jobs first": "진행 중인 작업을 마치거나 취소한 뒤 서버를 중지하세요.",
@@ -319,7 +244,6 @@ final class AppStore: ObservableObject {
     func refresh() async {
         do {
             server = try await request("/status") as? [String: Any] ?? [:]
-            backgroundEnabled = server["background_enabled"] as? Bool ?? false
             jobs = try await request("/jobs") as? [[String: Any]] ?? []
             let previousMigration = storageMigration["status"] as? String
             storageMigration = try await request("/storage/migration") as? [String: Any] ?? [:]
@@ -403,29 +327,6 @@ final class AppStore: ObservableObject {
         if state == "stopped" { serverStartPolicy.manualStopRequested() }
     }
 
-    func setBackground(_ enabled: Bool) async {
-        guard agentReady, !busy else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            if enabled {
-                try AgentKeychain.save(secret, keyID: agentKeyID)
-                do {
-                    _ = try await request("/background", method: "POST", body: ["enabled": true])
-                } catch {
-                    try? AgentKeychain.remove(agentKeyID)
-                    throw error
-                }
-            } else {
-                _ = try await request("/background", method: "POST", body: ["enabled": false])
-            }
-            backgroundEnabled = enabled
-            UserDefaults.standard.set(enabled, forKey: "backgroundServer")
-            if !enabled { try AgentKeychain.remove(agentKeyID) }
-            await refresh()
-        } catch { message = error.localizedDescription }
-    }
-
     func modelCommand(_ operation: String, name: String, type: String) async {
         await action {
             _ = try await self.request("/models/\(operation)", method: "POST", body: ["name": name, "type": type])
@@ -439,7 +340,6 @@ final class AppStore: ObservableObject {
             ]
             if !name.isEmpty { body["name"] = name }
             if !revision.isEmpty { body["revision"] = revision }
-            if let token = HFKeychain.read(), !token.isEmpty { body["token"] = token }
             let result = try await self.request("/jobs", method: "POST", body: body) as? [String: Any] ?? [:]
             if let id = result["id"] as? String {
                 self.selectedJob = id

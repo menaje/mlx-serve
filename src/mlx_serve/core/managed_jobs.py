@@ -25,18 +25,25 @@ from mlx_serve.core.storage_access import model_storage_available
 ACTIVE_STATES = ("queued", "running", "cancelling", "recovery_pending")
 
 
+def public_hf_environment() -> dict[str, str]:
+    """Keep app-owned processes from sending existing Hugging Face credentials."""
+    env = os.environ.copy()
+    env.pop("HF_TOKEN", None)
+    env.pop("HUGGING_FACE_HUB_TOKEN", None)
+    env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    return env
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _sanitize(value: Any, token: str | None = None) -> Any:
+def _sanitize(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: _sanitize(item, token) for key, item in value.items()}
+        return {key: _sanitize(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_sanitize(item, token) for item in value]
+        return [_sanitize(item) for item in value]
     if isinstance(value, str):
-        if token:
-            value = value.replace(token, "[redacted]")
         value = re.sub(r"hf_[A-Za-z0-9_]+", "[redacted]", value)
         return value[:4096]
     return value
@@ -45,9 +52,9 @@ def _sanitize(value: Any, token: str | None = None) -> Any:
 def _error_guidance(message: str) -> tuple[str, str]:
     text = message.lower()
     if any(part in text for part in ("gated", "403", "access denied", "forbidden")):
-        return "access_approval", "Check model access approval and token permissions."
+        return "access_approval", "Choose a public model that does not require access approval."
     if any(part in text for part in ("401", "unauthorized", "authentication", "invalid token")):
-        return "authentication", "Check or replace the Hugging Face token."
+        return "authentication", "Choose a public model that does not require signing in."
     if any(part in text for part in ("permission denied", "read-only file system")):
         return "storage_permission", "Check access to the model storage directory."
     if any(part in text for part in ("no space", "disk", "insufficient free")):
@@ -199,8 +206,8 @@ class JobManager:
         with self._db() as db:
             db.execute(f"UPDATE jobs SET {keys} WHERE id = ?", (*fields.values(), job_id))
 
-    def _event(self, job_id: str, event: dict[str, Any], token: str | None) -> None:
-        sanitized = _sanitize(event, token)
+    def _event(self, job_id: str, event: dict[str, Any]) -> None:
+        sanitized = _sanitize(event)
         with self._db() as db:
             db.execute(
                 "INSERT INTO events (job_id, time, payload) VALUES (?, ?, ?)",
@@ -211,12 +218,12 @@ class JobManager:
             self._update(job_id, stage=str(stage))
 
     async def _load_prepared_model(
-        self, job_id: str, result: dict[str, Any], token: str | None = None,
+        self, job_id: str, result: dict[str, Any],
     ) -> dict[str, Any]:
         """Record loading separately from the outcome of verified preparation."""
         if result.get("auto_load") in ("succeeded", "failed"):
             return result
-        self._event(job_id, {"status": "loading"}, token)
+        self._event(job_id, {"status": "loading"})
         try:
             name = result.get("name")
             current = self.get(job_id)
@@ -243,7 +250,7 @@ class JobManager:
                 ),
             }
         result = {**result, "auto_load": state}
-        self._event(job_id, event, token)
+        self._event(job_id, event)
         self._update(job_id, result=json.dumps(result, ensure_ascii=False))
         return result
 
@@ -348,7 +355,7 @@ class JobManager:
                     error="Cleanup could not be confirmed. Reconnect storage and retry recovery.",
                 )
 
-    def start(self, params: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+    def start(self, params: dict[str, Any]) -> dict[str, Any]:
         allowed = {"repo", "name", "revision", "keep_original", "models_dir", "load_after"}
         if params.keys() - allowed:
             raise ValueError("Unsupported preparation options")
@@ -388,24 +395,22 @@ class JobManager:
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("This source and conversion already have an active job") from exc
-        task = asyncio.create_task(self._run(job_id, normalized, token))
+        task = asyncio.create_task(self._run(job_id, normalized))
         self._tasks[job_id] = task
         task.add_done_callback(lambda _: self._tasks.pop(job_id, None))
         result = self.get(job_id)
         assert result is not None
         return result
 
-    async def _run(self, job_id: str, params: dict[str, Any], token: str | None) -> None:
+    async def _run(self, job_id: str, params: dict[str, Any]) -> None:
         process: asyncio.subprocess.Process | None = None
         result: dict[str, Any] | None = None
         error: str | None = None
         final_status = "failed"
         try:
-            env = os.environ.copy()
+            env = public_hf_environment()
             env.pop("MLX_SERVE_MANAGEMENT_TOKEN", None)
             env["MLX_SERVE_MODELS_DIR"] = params["models_dir"]
-            if token:
-                env["HF_TOKEN"] = token
             process = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "mlx_serve.core.managed_job_runner",
                 "--job-id", job_id, "--parent", str(os.getpid()),
@@ -429,8 +434,8 @@ class JobManager:
                         continue
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
-                event = _sanitize(event, token)
-                self._event(job_id, event, token)
+                event = _sanitize(event)
+                self._event(job_id, event)
                 if event.get("status") == "success":
                     result = event
                     self._update(job_id, result=json.dumps(result, ensure_ascii=False))
@@ -459,7 +464,7 @@ class JobManager:
             cleaned = workers_stopped and self._cleanup_stage(job_id, params)
             if cleaned:
                 if final_status == "succeeded" and result is not None and params["load_after"]:
-                    result = await self._load_prepared_model(job_id, result, token)
+                    result = await self._load_prepared_model(job_id, result)
                 self._update(
                     job_id, status=final_status,
                     stage="complete" if final_status == "succeeded" else final_status,
