@@ -230,7 +230,7 @@ async def tokenize_text(
             ),
         ) from e
     except Exception as e:
-        logger.error(f"Tokenization failed: {e}")
+        logger.error("Tokenization failed (%s)", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail={

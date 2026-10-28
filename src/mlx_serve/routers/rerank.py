@@ -202,7 +202,7 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Reranking failed: {e}")
+        logger.error("Reranking failed (%s)", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail={

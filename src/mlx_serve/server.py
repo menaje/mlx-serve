@@ -1,6 +1,7 @@
 """FastAPI server for mlx-serve."""
 
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -42,6 +43,20 @@ from mlx_serve.routers import (
     retrieval_proxy_router,
     tokenize_router,
 )
+
+if os.environ.get("MLX_SERVE_APP_OWNED") == "1":
+    # Configure only our own loggers: third-party DEBUG output can contain
+    # credentials or request data, and Uvicorn has separate loggers.
+    app_logger = logging.getLogger("mlx_serve")
+    app_logger.setLevel(settings.log_level)
+    if not any(
+        getattr(handler, "_mlx_serve_app_handler", False) for handler in app_logger.handlers
+    ):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s: %(name)s: %(message)s"))
+        handler._mlx_serve_app_handler = True
+        app_logger.addHandler(handler)
+    app_logger.propagate = False
 
 logger = logging.getLogger(__name__)
 apply_process_title()
@@ -248,7 +263,7 @@ def create_app() -> FastAPI:
 
                 request._receive = receive
             except Exception as e:
-                logger.error(f"[REQUEST BODY] Failed to read body: {e}")
+                logger.error("[REQUEST BODY] Failed to read body (%s)", type(e).__name__)
 
         try:
             response = await call_next(request)

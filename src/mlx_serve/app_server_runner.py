@@ -9,10 +9,15 @@ import os
 
 import uvicorn
 
+from mlx_serve.config import settings
+
 
 async def _serve(host: str, port: int, parent_pid: int) -> None:
+    # Propagate app ownership to isolated workers so they use the same log policy.
+    os.environ["MLX_SERVE_APP_OWNED"] = "1"
     config = uvicorn.Config(
         "mlx_serve.server:app", host=host, port=port, access_log=False, proxy_headers=False,
+        log_level=settings.log_level.lower(),
     )
     server = uvicorn.Server(config)
 

@@ -246,19 +246,19 @@ class GenerationWorkerSupervisor:
         else:
             env.pop("MLX_SERVE_PRELOAD_MODELS", None)
 
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "uvicorn",
-                "mlx_serve.server:app",
-                "--host",
-                host,
-                "--port",
-                str(port),
-            ],
-            env=env,
-        )
+        command = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "mlx_serve.server:app",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
+        if env.get("MLX_SERVE_APP_OWNED") == "1":
+            command.extend(["--log-level", settings.log_level.lower(), "--no-access-log"])
+        process = subprocess.Popen(command, env=env)
 
         worker = GenerationWorkerProcess(
             kind=kind,

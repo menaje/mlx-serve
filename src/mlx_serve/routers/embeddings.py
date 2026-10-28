@@ -341,7 +341,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
             ),
         ) from e
     except Exception as e:
-        logger.error(f"Embedding generation failed: {e}")
+        logger.error("Embedding generation failed (%s)", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail={

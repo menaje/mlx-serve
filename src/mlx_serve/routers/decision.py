@@ -249,17 +249,20 @@ async def _handle_decision(request: DecisionRequest, *, typed: bool) -> dict[str
                 except asyncio.CancelledError:
                     try:
                         await task
-                    except Exception:
-                        logger.exception(
-                            "Decision inference failed after the request was cancelled"
+                    except Exception as exc:
+                        logger.error(
+                            "Decision inference failed after the request was cancelled (%s)",
+                            type(exc).__name__,
                         )
                     raise
 
     running = asyncio.create_task(run_with_lease())
 
     def observe_background(task: asyncio.Task) -> None:
-        if not task.cancelled() and task.exception() is not None:
-            logger.error("Decision inference failed after the request ended: %s", task.exception())
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.error(
+                "Decision inference failed after the request ended (%s)", type(exc).__name__
+            )
 
     try:
         result = await asyncio.wait_for(

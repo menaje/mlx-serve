@@ -68,8 +68,10 @@ import Foundation
         encoding="utf-8",
     )
     executable = target / "lifecycle-test"
-    sources = ["AppStore.swift", "LocalSession.swift", "Notifications.swift",
-               "NotificationPolicy.swift", "ServerStartPolicy.swift"]
+    sources = [
+        "AppStore.swift", "AppStatusSummary.swift", "LocalSession.swift", "Notifications.swift",
+        "NotificationPolicy.swift", "ServerStartPolicy.swift",
+    ]
     subprocess.run(
         ["swiftc", "-parse-as-library", *(str(root / item) for item in sources),
          str(main), "-o", str(executable)],

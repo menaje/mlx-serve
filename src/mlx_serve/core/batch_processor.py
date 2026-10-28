@@ -176,7 +176,7 @@ class BatchProcessor(Generic[T, R]):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Batch processing error: {e}")
+                logger.error("Batch processing error (%s)", type(e).__name__)
                 await asyncio.sleep(0.1)
 
     async def _collect_batch(self) -> list[BatchRequest[T]]:
@@ -273,7 +273,7 @@ class BatchProcessor(Generic[T, R]):
             for request in batch:
                 if not request.future.done():
                     request.future.set_exception(e)
-            logger.error(f"Batch processing failed: {e}")
+            logger.error("Batch processing failed (%s)", type(e).__name__)
 
 
 class EmbeddingBatchProcessor:

@@ -146,7 +146,7 @@ async def forward_to_generation_worker(
         elif supervisor is not None and hasattr(supervisor, "ensure_worker"):
             base_url = await asyncio.to_thread(supervisor.ensure_worker, worker_kind, model_name)
     except (OSError, RuntimeError) as exc:
-        logger.error("Could not start generation worker: %s", exc)
+        logger.error("Could not start generation worker (%s)", type(exc).__name__)
         raise HTTPException(
             status_code=503,
             detail=build_overload_detail(f"{worker_kind} generation worker is unavailable"),
@@ -177,7 +177,7 @@ async def forward_to_generation_worker(
                 if isinstance(opened, WorkerStreamingResponse) else None,
             )
         except urllib.error.URLError as exc:
-            logger.error("Generation worker stream failed: %s", exc)
+            logger.error("Generation worker stream failed (%s)", type(exc).__name__)
             return JSONResponse(
                 status_code=503,
                 content=build_overload_detail(f"{worker_kind} generation worker is unavailable"),
@@ -200,7 +200,7 @@ async def forward_to_generation_worker(
             lease,
         )
     except urllib.error.URLError as exc:
-        logger.error("Generation worker request failed: %s", exc)
+        logger.error("Generation worker request failed (%s)", type(exc).__name__)
         return JSONResponse(
             status_code=503,
             content=build_overload_detail(f"{worker_kind} generation worker is unavailable"),

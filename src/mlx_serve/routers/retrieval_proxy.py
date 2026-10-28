@@ -116,7 +116,7 @@ async def forward_to_retrieval_worker(
             **request_options,
         )
     except (OSError, urllib.error.URLError) as exc:
-        logger.error("Retrieval worker request failed: %s", exc)
+        logger.error("Retrieval worker request failed (%s)", type(exc).__name__)
         return JSONResponse(
             status_code=503,
             content=build_overload_detail(f"{worker_kind} retrieval worker is unavailable"),

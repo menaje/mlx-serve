@@ -826,6 +826,44 @@ async def test_legacy_completion_does_not_log_inputs(field, monkeypatch, caplog)
     assert secret not in caplog.text
 
 
+def test_chat_template_failure_does_not_log_input(caplog):
+    from mlx_serve.routers.chat import ChatMessage, _format_messages_for_model
+
+    secret = "private_chat_template_input_1234"
+
+    class FailingTokenizer:
+        def apply_chat_template(self, messages, **_kwargs):
+            raise ValueError(messages[0]["content"])
+
+    prompt = _format_messages_for_model(
+        [ChatMessage(role="user", content=secret)], FailingTokenizer()
+    )
+
+    assert secret in prompt
+    assert "Chat template failed" in caplog.text
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_batch_failure_does_not_log_input(caplog):
+    from mlx_serve.core.batch_processor import BatchProcessor
+
+    secret = "private_batch_input_1234"
+
+    def fail_with_input(inputs):
+        raise ValueError(inputs[0])
+
+    processor = BatchProcessor(fail_with_input, max_wait_ms=1)
+    try:
+        with pytest.raises(ValueError, match=secret):
+            await processor.submit(secret)
+    finally:
+        await processor.stop()
+
+    assert "Batch processing failed" in caplog.text
+    assert secret not in caplog.text
+
+
 def test_debug_body_redacts_credentials_and_omits_unparseable_input():
     from mlx_serve.server import _redact_debug_body
 

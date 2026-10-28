@@ -18,6 +18,11 @@ completion criteria. Other unverified flows are listed below.
   treated that warning as an error. Set `MLX_SERVE_D3_TEST_MODEL_DIR` and
   `MLX_SERVE_RERANK_TEST_MODEL_DIR` to local checkpoint directories to include
   those optional real-model tests in a future run.
+- After the logging changes, a full run passed 408 tests and skipped the
+  optional reranker checkpoint test because its path was not supplied. That
+  real-model test then passed separately using a fresh public checkpoint.
+  Two additional generation-worker log-level cases were added and passed
+  separately after that full run.
 
 ## Observed flows
 
@@ -64,6 +69,12 @@ additional native and backend harness checks are identified below.
   log was removed; recent, unconfirmed, unrelated and legacy logs remained.
   The packaged app's own login-item control was registered and unregistered,
   with the displayed status changing accordingly; it was left unregistered.
+- Separate subprocess tests started the app-owned server with each saved log
+  level (DEBUG, INFO, WARNING and ERROR). The expected application and server
+  messages appeared or were suppressed, and input was absent. DEBUG and
+  WARNING were also tested with all three retrieval workers, and separately
+  with both generation workers, running. The DEBUG/retrieval and
+  WARNING/generation cases also passed with the bundled Python runtime.
 - An ad-hoc-signed test copy launched from a temporary folder could not request
   notification permission on this Mac. The app now leaves notifications off
   and displays the failure and suggested next steps; this was checked in its
@@ -114,7 +125,10 @@ additional native and backend harness checks are identified below.
   without including those inputs, results or error details.
 - The legacy text-completion endpoint no longer writes its complete request to
   the default log. Tests exercise both prompt and message inputs as well as the
-  separate request-validation failure path.
+  separate request-validation failure path. Selected inference error paths record
+  the exception type instead of an exception message that may contain input;
+  targeted tests reproduced and checked this for chat-template and batch
+  failures. The affected native and Python test selection passed 125 tests.
 - With both the development and bundled runtimes, the official d1 MLX FP16
   checkpoint was copied from an existing local installation, validated, and
   used for choice, Boolean and score inference without invoking a converter.

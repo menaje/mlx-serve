@@ -199,7 +199,7 @@ async def create_speech(request: SpeechRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Speech synthesis failed: {e}")
+        logger.error("Speech synthesis failed (%s)", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail={
@@ -379,7 +379,7 @@ async def create_transcription(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Transcription failed: {e}")
+        logger.error("Transcription failed (%s)", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail={
