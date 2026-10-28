@@ -1,8 +1,9 @@
 # macOS app validation
 
 The app is still under development. Issue #12 excludes Developer ID signing,
-notarization, signed updates and a separate development-tools-free Mac from
-its current completion criteria. Other unverified flows are listed below.
+notarization, signed updates, a separate development-tools-free Mac, actual
+system sleep/wake, and login execution after a reboot from its current
+completion criteria. Other unverified flows are listed below.
 
 ## Tested environment
 
@@ -256,10 +257,11 @@ additional native and backend harness checks are identified below.
   after a separate list-clipping issue was found. Subsequent UI sessions
   completed the flows above, but the original exception has not been reliably
   reproduced or definitively resolved.
-- Sleep/wake, login behavior after a reboot, physically disconnected external
-  storage, and the minimum macOS 26 deployment target have not been tested end
-  to end. The packaged app's login item was registered and unregistered on this
-  Mac, but an actual login after restart was not exercised.
+- System sleep/wake and login execution after a reboot are excluded from the
+  completion criteria and were not tested end to end. The packaged app's
+  login item was registered and unregistered on this Mac. Physically disconnected
+  external storage and the minimum macOS 26 deployment target also remain
+  unverified end to end.
 - The bundle has an ad-hoc signature only. Developer ID signing, notarization,
   distribution of a release DMG, and installation on a separate Mac without
   development tools and signed installer updates are outside the current issue
