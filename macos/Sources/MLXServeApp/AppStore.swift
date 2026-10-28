@@ -36,6 +36,8 @@ final class AppStore: ObservableObject {
     var baseURL: String { server["url"] as? String ?? "http://127.0.0.1:8000" }
     var models: [[String: Any]] { modelState["models"] as? [[String: Any]] ?? [] }
     var modelStateAvailable: Bool { modelState["models"] is [[String: Any]] }
+    var modelSummary: ModelStatusSummary { ModelStatusSummary(modelState: modelState) }
+    var memorySummary: MemoryStatusSummary { MemoryStatusSummary(server: server) }
     var migratingStorage: Bool { storageMigration["status"] as? String == "running" }
     var activeJobs: Int {
         jobs.filter { ["queued", "running", "cancelling", "recovery_pending"].contains($0["status"] as? String ?? "") }.count

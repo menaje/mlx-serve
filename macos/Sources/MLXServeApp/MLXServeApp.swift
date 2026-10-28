@@ -25,6 +25,8 @@ struct MenuContent: View {
     var body: some View {
         Text("서버: \(readableState(store.state))")
         Text("진행 작업: \(store.activeJobs)")
+        Text("모델: \(store.modelSummary.loadedText)")
+        Text(store.memorySummary.systemText)
         Divider()
         Button("MLX Serve 열기") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
         SettingsLink { Text("설정…") }
@@ -181,9 +183,9 @@ struct OverviewView: View {
                 HStack(alignment: .top, spacing: 14) {
                     GroupBox("모델") {
                         VStack(alignment: .leading, spacing: 5) {
-                            if store.modelStateAvailable {
-                                Text("\(store.models.count)개 설치됨").font(.title2.bold())
-                                Text("\(store.models.filter { $0["load_state"] as? String == "loaded" }.count)개 메모리에 적재됨")
+                            if let installed = store.modelSummary.installedCount {
+                                Text("\(installed)개 설치됨").font(.title2.bold())
+                                Text(store.modelSummary.loadedText)
                                     .foregroundStyle(.secondary)
                             } else {
                                 Text("확인 불가").font(.title2.bold())
@@ -199,19 +201,12 @@ struct OverviewView: View {
                         }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
                     }
                 }
-                if let health = store.server["health"] as? [String: Any],
-                   let memory = health["memory"] as? [String: Any],
-                   let snapshot = memory["snapshot"] as? [String: Any],
-                   let available = snapshot["system_available_bytes"] as? Int64,
-                   let total = snapshot["system_total_bytes"] as? Int64,
-                   let gatewayRSS = snapshot["process_rss_bytes"] as? Int64 {
-                    GroupBox("메모리") {
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text("시스템 여유 \(ByteCountFormatter.string(fromByteCount: available, countStyle: .memory)) / 전체 \(ByteCountFormatter.string(fromByteCount: total, countStyle: .memory))")
-                            Text("게이트웨이 프로세스 RSS \(ByteCountFormatter.string(fromByteCount: gatewayRSS, countStyle: .memory)); 추론 워커는 포함하지 않습니다.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
-                    }
+                GroupBox("메모리") {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(store.memorySummary.systemText)
+                        Text(store.memorySummary.gatewayText)
+                            .font(.caption).foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
                 }
                 if let error = store.modelError { Text(error).foregroundStyle(.orange) }
                 Text("CONI 연결 주소는 위의 API 주소입니다. 클라이언트에는 적재할 모델 ID도 함께 지정하세요.")

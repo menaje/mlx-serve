@@ -49,6 +49,14 @@ additional native and backend harness checks are identified below.
   server did not respond, returned to healthy after it resumed, and retained
   the completed and cancelled job history. Quitting stopped the test server and
   workers. This exercises a temporary outage, not an actual system sleep/wake.
+- After the model and memory summaries were shared with the menu bar, the
+  packaged app's overview showed the system memory and gateway RSS while its
+  isolated server was running, and showed those values as unavailable when the
+  server was stopped. With a synthetic installed-model record and the server
+  stopped, the overview distinguished its unknown load state from the confirmed
+  loaded count. A native summary test also covers loaded, unloaded and unknown
+  model states and missing memory data. The new menu-bar text itself was not
+  independently inspected in this pass.
 - Queue size, request timeout, memory thresholds and server-log retention were
   changed through the current settings UI. Saved and applied values were shown
   separately until restart, after which the server reported the new values. An
