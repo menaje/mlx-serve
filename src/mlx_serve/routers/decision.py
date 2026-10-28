@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import logging
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from mlx_serve.config import settings
 from mlx_serve.core.d1_decision import DecisionInputError
+from mlx_serve.core.default_models import clear_deleted_decision_default, request_model_default
 from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
@@ -58,7 +60,13 @@ async def delete_decision_model(name: str) -> bool:
                     return False
                 if model_manager.get_model_type(name) != "decision":
                     return False
-                return model_manager.delete_model(name)
+                deleted = model_manager.delete_model(name)
+                if deleted:
+                    # A damaged defaults file must not turn a successful delete
+                    # into a failure; stale selections are checked on every use.
+                    with contextlib.suppress(OSError, ValueError):
+                        clear_deleted_decision_default(name, settings.models_dir)
+                return deleted
             finally:
                 fcntl.flock(registry_lock.fileno(), fcntl.LOCK_UN)
 
@@ -158,6 +166,11 @@ class DecisionRequest(BaseModel):
     images: list[str] = Field(default_factory=list)
     videos: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def use_default_model(cls, data: Any) -> Any:
+        return request_model_default(data, "decision")
+
     @field_validator("questions")
     @classmethod
     def validate_question_names(cls, questions: dict[str, DecisionQuestion]):
@@ -236,17 +249,20 @@ async def _handle_decision(request: DecisionRequest, *, typed: bool) -> dict[str
                 except asyncio.CancelledError:
                     try:
                         await task
-                    except Exception:
-                        logger.exception(
-                            "Decision inference failed after the request was cancelled"
+                    except Exception as exc:
+                        logger.error(
+                            "Decision inference failed after the request was cancelled (%s)",
+                            type(exc).__name__,
                         )
                     raise
 
     running = asyncio.create_task(run_with_lease())
 
     def observe_background(task: asyncio.Task) -> None:
-        if not task.cancelled() and task.exception() is not None:
-            logger.error("Decision inference failed after the request ended: %s", task.exception())
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.error(
+                "Decision inference failed after the request ended (%s)", type(exc).__name__
+            )
 
     try:
         result = await asyncio.wait_for(

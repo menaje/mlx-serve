@@ -394,10 +394,10 @@ def pull(
         False,
         "--keep-original",
         "-k",
-        help="Keep original model in HuggingFace cache after conversion",
+        help="Keep a separate d1 source after successful verification",
     ),
     revision: Optional[str] = typer.Option(
-        None, "--revision", help="Hugging Face branch, tag or commit for d1"
+        None, "--revision", help="Hugging Face branch, tag or commit for supported decision models"
     ),
     local_name: Optional[str] = typer.Option(
         None, "--name", help="Optional local name for the installed model"
@@ -405,16 +405,15 @@ def pull(
 ) -> None:
     """Download and convert a model from Hugging Face to MLX format.
 
-    For d1, shared Hugging Face caches are never deleted. Use --keep-original
-    to retain the downloaded source separately after successful verification.
-    Other conversion paths may delete the Hugging Face cache unless retained.
+    Shared Hugging Face caches are never deleted automatically. Use
+    --keep-original to retain a separate d1 source after verification.
 
     Examples:
         mlx-serve pull Qwen/Qwen3-Embedding-0.6B --type embedding
         mlx-serve pull vllm-sr/d3-lite --type decision
         mlx-serve pull meta-llama/Llama-3.2-1B-Instruct --type llm --quantize 4
         mlx-serve pull mlx-community/Qwen2.5-7B-Instruct-4bit --type llm
-        mlx-serve pull meta-llama/Llama-3.2-1B --type llm --keep-original
+        mlx-serve pull LiquidAI/d1-omni-600M --type decision --keep-original
     """
     if quantize_bits is not None and quantize_bits not in [4, 8]:
         console.print("[red]Quantize bits must be 4 or 8[/red]")

@@ -914,7 +914,8 @@ class ModelManager:
             model_type: Type of model.
             model_name: Optional custom name for the model.
             quantize: Quantization bits (4 or 8). None for no quantization.
-            keep_original: If False, delete HF cache after conversion (default: False).
+            keep_original: Retain a separate original for a d1 source installation.
+                Shared Hugging Face caches are never removed automatically.
 
         Yields status updates during the process.
         """
@@ -929,7 +930,7 @@ class ModelManager:
             return
 
         if model_type == "decision":
-            from mlx_serve.core.decision_prepare import SUPPORTED_REPOS, prepare_d1, prepare_d3
+            from mlx_serve.core.decision_prepare import SUPPORTED_REPOS, prepare_decision
 
             try:
                 model_name = resolve_decision_install_name(model_name, hf_repo)
@@ -937,22 +938,31 @@ class ModelManager:
                 yield {"status": "error", "message": str(exc)}
                 return
             if hf_repo in SUPPORTED_REPOS:
-                async for status in prepare_d1(
+                async for status in prepare_decision(
                     self, hf_repo, model_name, revision, keep_original=keep_original
                 ):
                     yield status
                 return
-            if hf_repo != "vllm-sr/d3-lite":
-                yield {"status": "error", "message": "Unsupported decision model architecture"}
+            yield {"status": "error", "message": "Unsupported decision model architecture"}
+            return
+        from mlx_serve.core.retrieval_prepare_worker import RETRIEVAL_PROFILES
+
+        if hf_repo in RETRIEVAL_PROFILES:
+            if model_type != RETRIEVAL_PROFILES[hf_repo] or quantize is not None:
+                yield {"status": "error", "message": "Unsupported model type or quantization"}
                 return
-            if revision is not None:
-                yield {"status": "error", "message": "Revision selection is supported for d1 only"}
-                return
-            async for status in prepare_d3(self, hf_repo, model_name):
+            from mlx_serve.core.decision_prepare import prepare_decision
+
+            async for status in prepare_decision(
+                self, hf_repo, model_name, revision, model_type=model_type,
+            ):
                 yield status
             return
         if revision is not None:
-            yield {"status": "error", "message": "Revision selection is supported for d1 only"}
+            yield {
+                "status": "error",
+                "message": "Revision selection is supported for decision models only",
+            }
             return
 
         # Add quantization suffix to model name
@@ -1002,11 +1012,6 @@ class ModelManager:
                     yield {"status": "error", "message": "Conversion failed"}
                     return
 
-                # Clean up HF cache if not keeping original
-                if not keep_original:
-                    yield {"status": "cleaning", "name": output_name, "detail": "Removing HF cache"}
-                    self._cleanup_hf_cache(hf_repo)
-
             # Update metadata
             metadata_entry = {
                 "type": model_type,
@@ -1031,41 +1036,6 @@ class ModelManager:
         mlx_indicators = ["mlx-community", "mlx-", "-mlx", "4bit", "8bit"]
         repo_lower = hf_repo.lower()
         return any(indicator in repo_lower for indicator in mlx_indicators)
-
-    def _cleanup_hf_cache(self, hf_repo: str) -> bool:
-        """
-        Remove a model from the HuggingFace cache.
-
-        Args:
-            hf_repo: HuggingFace repository ID.
-
-        Returns:
-            True if cleanup succeeded, False otherwise.
-        """
-        try:
-            from huggingface_hub import scan_cache_dir
-
-            cache_info = scan_cache_dir()
-
-            # Find the repo in cache
-            for repo in cache_info.repos:
-                if repo.repo_id == hf_repo:
-                    # Delete all revisions of this repo
-                    delete_strategy = cache_info.delete_revisions(
-                        *[rev.commit_hash for rev in repo.revisions]
-                    )
-                    delete_strategy.execute()
-                    # Log cleanup (freed_size_str may not exist in all versions)
-                    freed_size = getattr(delete_strategy, "freed_size_str", "unknown size")
-                    logger.info(f"Cleaned up HF cache for {hf_repo}: freed {freed_size}")
-                    return True
-
-            logger.debug(f"Model {hf_repo} not found in HF cache")
-            return True  # Not an error if not in cache
-
-        except Exception as e:
-            logger.warning(f"Failed to cleanup HF cache for {hf_repo}: {e}")
-            return False
 
     async def _convert_model(
         self,
@@ -1247,6 +1217,22 @@ class ModelManager:
 
         return {"unloaded": unloaded, "skipped_active": skipped_active}
 
+    def _verify_retrieval_preparation(self, name: str, kind: str, path: Path) -> None:
+        """Recheck recorded app-prepared models; leave older CLI installs usable."""
+        from mlx_serve.core.decision_prepare import read_verified_retrieval_manifest
+        from mlx_serve.core.retrieval_prepare_worker import MANIFEST
+
+        self._load_metadata()
+        metadata = self._metadata.get(name, {})
+        if metadata.get("preparation_format") != "retrieval-v1" and not (path / MANIFEST).exists():
+            return
+        manifest = read_verified_retrieval_manifest(path)
+        if (metadata.get("preparation_format") != "retrieval-v1"
+                or metadata.get("type") != kind or manifest["type"] != kind
+                or metadata.get("hf_repo") != manifest["source_repo"]
+                or metadata.get("revision") != manifest["revision"]):
+            raise ValueError("Retrieval model metadata does not match its preparation record")
+
     def get_embedding_model(self, model_name: str) -> Any:
         """Get or load an embedding model.
 
@@ -1287,6 +1273,7 @@ class ModelManager:
                     )
 
             self._ensure_load_memory_available("embedding", resolved_name, model_dir)
+            self._verify_retrieval_preparation(resolved_name, "embedding", model_dir)
             logger.info(f"Loading embedding model: {resolved_name}")
             before_process_rss, before_mlx_active = self._memory_calibration_baseline()
 
@@ -1348,6 +1335,7 @@ class ModelManager:
                     )
 
             self._ensure_load_memory_available("reranker", resolved_name, model_dir)
+            self._verify_retrieval_preparation(resolved_name, "reranker", model_dir)
             logger.info(f"Loading reranker model: {resolved_name}")
             before_process_rss, before_mlx_active = self._memory_calibration_baseline()
 
@@ -1430,6 +1418,17 @@ class ModelManager:
                     model = D1DecisionModel(model_dir)
                 else:
                     from mlx_serve.core.decision import D3DecisionModel
+                    from mlx_serve.core.decision_prepare import read_verified_manifest
+                    from mlx_serve.core.decision_prepare_worker import D3_REPO
+
+                    metadata = self._metadata.get(resolved_name, {})
+                    if metadata.get("hf_repo") == D3_REPO and metadata.get("revision"):
+                        manifest = read_verified_manifest(model_dir)
+                        if (
+                            manifest["source_repo"] != D3_REPO
+                            or manifest["revision"] != metadata["revision"]
+                        ):
+                            raise ValueError("Decision model metadata does not match its manifest")
 
                     model = D3DecisionModel(model_dir)
             except Exception:

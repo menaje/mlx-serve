@@ -88,6 +88,52 @@ def test_checkpoint_checks_actual_head_precision_and_required_files(tmp_path):
         validate_checkpoint(tmp_path, converted=True)
 
 
+@pytest.mark.parametrize("repo,converted", [(SOURCE_REPO, True), (MLX_REPO, False)])
+def test_d1_preparation_only_converts_the_original_checkpoint(
+    tmp_path, monkeypatch, repo, converted,
+):
+    import huggingface_hub
+    import mlx_vlm
+
+    from mlx_serve.core import decision_prepare_worker as worker
+
+    conversions = []
+    statuses = []
+
+    def download(repo_id, revision, local_dir, allow_patterns):
+        assert repo_id == repo and revision == REVISION and allow_patterns
+        source = Path(local_dir)
+        source.mkdir()
+        (source / "config.json").write_text('{"model_type": "d1_omni"}')
+        (source / "tokenizer.json").write_text("{}")
+        (source / "LICENSE").write_text("license")
+        (source / "model.safetensors").write_bytes(b"published-weights")
+
+    def convert(source, mlx_path, **options):
+        conversions.append(options)
+        shutil.copytree(source, mlx_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    monkeypatch.setattr(mlx_vlm, "convert", convert)
+    monkeypatch.setattr(worker, "version", lambda name: "0.7.10" if name == "mlx-vlm" else "test")
+    monkeypatch.setattr(worker, "emit", lambda status, **_details: statuses.append(status))
+    monkeypatch.setattr(worker, "validate_checkpoint", lambda *_args, **_kwargs: {
+        "model_type": "d1_omni", "temperatures": {},
+    })
+    monkeypatch.setattr(worker, "sample_prediction", lambda _path: {
+        "answers": {"example": {"type": "bool", "value": True, "probability": 0.9}},
+    })
+    artifact = tmp_path / "artifact"
+    worker.prepare(repo, REVISION, tmp_path / "download", artifact)
+    manifest = json.loads((artifact / MANIFEST).read_text())
+    assert manifest["converted"] is converted
+    assert len(conversions) == int(converted)
+    assert ("converting" in statuses) is converted
+    assert (artifact / "model.safetensors").read_bytes() == b"published-weights"
+    assert manifest["converter"] == ("mlx-vlm" if converted else None)
+    assert manifest["converter_version"] == ("0.7.10" if converted else None)
+
+
 def test_probability_comparison_preserves_option_ids_and_tolerance():
     original = {
         "answers": {"x": {"type": "choice", "value": "b", "probabilities": {"a": 0.1, "b": 0.9}}}
@@ -342,11 +388,45 @@ async def test_preparation_registers_once_and_reuses_verified_model(preparation,
     )
     results = [event async for event in prepare_d1(model_manager, SOURCE_REPO, "d1-test", REVISION)]
     assert results[-1]["status"] == "success"
+    estimate = next(event for event in results if event["status"] == "checking")
+    assert estimate["estimate_basis"] == "partial_repository_metadata"
+    assert estimate["estimated_disk_bytes"] == 128 * 1024**2
+    assert estimate["free_disk_bytes"] > 0
+    assert any(event.get("temporary_file_bytes", 0) > 0 for event in results)
     assert model_manager._metadata["d1-test"]["revision"] == REVISION
     assert model_manager._metadata["d1-test"]["size"] > 0
     reused = [event async for event in prepare_d1(model_manager, SOURCE_REPO, "d1-test", REVISION)]
     assert reused[-1]["reused"] is True
+    copied = [event async for event in prepare_d1(model_manager, SOURCE_REPO, "d1-copy", REVISION)]
+    copy_estimate = next(event for event in copied if event["status"] == "checking")
+    measurement = next(event for event in copied if event["status"] == "resources")
+    assert copy_estimate["estimate_basis"] == "verified_copy"
+    assert copy_estimate["estimated_disk_bytes"] == measurement["temporary_file_bytes"] > 0
+    assert copied[-1]["reused"] is True
     assert calls == 1
+    assert not list(settings.models_dir.glob(".decision-prepare-*"))
+
+
+@pytest.mark.asyncio
+async def test_preparation_reports_space_estimate_before_rejecting_full_volume(
+    preparation, monkeypatch
+):
+    monkeypatch.setattr(
+        "mlx_serve.core.decision_prepare.HfApi.model_info",
+        lambda *a, **k: SimpleNamespace(sha=REVISION, siblings=[SimpleNamespace(size=1000)]),
+    )
+    monkeypatch.setattr(
+        "mlx_serve.core.decision_prepare.shutil.disk_usage",
+        lambda path: SimpleNamespace(free=10),
+    )
+    events = [event async for event in prepare_d1(model_manager, SOURCE_REPO, "d1-test", REVISION)]
+    estimate = next(event for event in events if event["status"] == "checking")
+    assert estimate["estimate_basis"] == "repository_metadata"
+    assert estimate["estimated_disk_bytes"] == 1600 + 128 * 1024**2
+    assert estimate["free_disk_bytes"] == 10
+    assert events[-1]["status"] == "error"
+    assert "Insufficient free disk" in events[-1]["message"]
+    assert not (settings.models_dir / "d1-test").exists()
     assert not list(settings.models_dir.glob(".decision-prepare-*"))
 
 
@@ -601,7 +681,7 @@ def test_gateway_unloads_the_isolated_decision_worker(client, monkeypatch):
         "active_inference": [],
     }
 
-    def worker_request(url, method, body, headers):
+    def worker_request(url, method, body, headers, **kwargs):
         seen.append((url, method, json.loads(body)))
         payload = {
             "unloaded": [{"name": "d1-omni-600M", "type": "decision"}],
@@ -642,7 +722,7 @@ async def test_timed_out_inference_keeps_model_reserved_until_thread_finishes(mo
     monkeypatch.setattr("mlx_serve.core.model_manager.clear_mlx_cache", lambda **kwargs: True)
     transport = httpx.ASGITransport(app=create_app())
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
             response = await client.post(
                 "/v1/decisions",
                 json={
@@ -752,7 +832,7 @@ async def test_worker_delete_blocks_loading_then_removes_cached_model(preparatio
     monkeypatch.setattr(model_manager, "get_decision_model", load_model)
     transport = httpx.ASGITransport(app=create_app())
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
             running = asyncio.create_task(
                 client.post(
                     "/v1/decisions",
@@ -796,7 +876,7 @@ def test_gateway_deletes_in_worker_and_handles_worker_unavailable(preparation, m
     client.app.state.retrieval_worker_urls = {"decision": "http://worker"}
     calls = []
 
-    def unavailable(url, method, body, headers):
+    def unavailable(url, method, body, headers, **kwargs):
         raise urllib.error.URLError("worker down")
 
     monkeypatch.setattr("mlx_serve.routers.retrieval_proxy.perform_worker_request", unavailable)
@@ -804,7 +884,7 @@ def test_gateway_deletes_in_worker_and_handles_worker_unavailable(preparation, m
     assert response.status_code == 503
     assert (settings.models_dir / name).exists()
 
-    def worker_request(url, method, body, headers):
+    def worker_request(url, method, body, headers, **kwargs):
         calls.append((url, method, json.loads(body)))
         model_manager.delete_model("d1-omni")
         return WorkerProxyResponse(200, b'{"deleted": true}', {})

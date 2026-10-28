@@ -30,13 +30,13 @@ def test_worker_request_uses_bounded_timeout(monkeypatch):
         def read(self):
             return b'{"ok":true}'
 
-    def fake_urlopen(request, timeout):
+    def fake_urlopen(request, timeout, **kwargs):
         observed["timeout"] = timeout
         return FakeResponse()
 
     monkeypatch.setattr(settings, "inference_queue_timeout_seconds", 12.5)
     monkeypatch.setattr(
-        "mlx_serve.routers.retrieval_proxy.urllib.request.urlopen",
+        "mlx_serve.routers.retrieval_proxy.open_local_http",
         fake_urlopen,
     )
 
@@ -112,13 +112,13 @@ def test_decision_proxy_preserves_unbounded_queue_wait(monkeypatch):
         def read(self):
             return b'{"ok":true}'
 
-    def fake_urlopen(request, timeout):
+    def fake_urlopen(request, timeout, **kwargs):
         observed["timeout"] = timeout
         return FakeResponse()
 
     monkeypatch.setattr(settings, "retrieval_worker_isolation_enabled", True)
     monkeypatch.setattr(settings, "inference_queue_timeout_seconds", None)
-    monkeypatch.setattr("mlx_serve.routers.retrieval_proxy.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("mlx_serve.routers.retrieval_proxy.open_local_http", fake_urlopen)
     app = create_app()
     app.state.retrieval_worker_urls = {"decision": "http://127.0.0.1:19080"}
     client = TestClient(app)

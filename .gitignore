@@ -86,6 +86,7 @@ dmypy.json
 .ruff_cache/
 
 # Local development
+/macos/.build/
 *.local
 *.log
 

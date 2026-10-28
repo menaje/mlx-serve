@@ -8,12 +8,50 @@ import json
 import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mlx_serve.config import settings
-from mlx_serve.core.model_manager import model_manager
+from mlx_serve.core.decision_prepare import read_verified_manifest
+from mlx_serve.core.decision_prepare_worker import D3_REPO, MANIFEST, file_hash, prepare_d3
+from mlx_serve.core.model_manager import TTLLRUCache, model_manager
 from mlx_serve.core.ollama_import import import_ollama_decision
+
+D3_REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+
+def create_d3_artifact(path: Path) -> None:
+    path.mkdir(parents=True)
+    for name, data in {
+        "config.json": b"{}", "decision_config.json": b"{}", "tokenizer.json": b"{}",
+        "readout.safetensors": b"readout", "model.safetensors": b"complete",
+    }.items():
+        (path / name).write_bytes(data)
+    manifest = {
+        "schema_version": 1, "source_repo": D3_REPO, "revision": D3_REVISION,
+        "architecture": "qwen3_5", "precision": "bfloat16",
+        "files_sha256": {p.name: file_hash(p) for p in path.iterdir()},
+        "validation": {"mlx_predict": True, "published_file_hashes": True},
+    }
+    (path / MANIFEST).write_text(json.dumps(manifest))
+
+
+def mock_model_info(monkeypatch):
+    monkeypatch.setattr(
+        "mlx_serve.core.decision_prepare.HfApi.model_info",
+        lambda *args, **kwargs: SimpleNamespace(sha=D3_REVISION, siblings=[]),
+    )
+
+
+def fake_worker(returncode=0, output=b""):
+    reader = asyncio.StreamReader()
+    reader.feed_data(output)
+    reader.feed_eof()
+    return SimpleNamespace(
+        stdout=reader, pid=os.getpid(), returncode=returncode,
+        wait=lambda: asyncio.sleep(0, result=returncode),
+    )
 
 
 @pytest.fixture
@@ -106,42 +144,49 @@ async def test_pull_does_not_mix_downloaded_and_imported_weights(ollama_source):
 
 @pytest.mark.asyncio
 async def test_failed_d3_download_can_be_retried(ollama_source, monkeypatch):
+    mock_model_info(monkeypatch)
     attempts = 0
 
-    def download(*, repo_id, local_dir):
+    async def worker(*args, **kwargs):
         nonlocal attempts
         attempts += 1
-        (Path(local_dir) / "weights").write_text("partial" if attempts == 1 else "complete")
         if attempts == 1:
-            raise OSError("download interrupted")
+            return fake_worker(
+                1, b'MLX_PREP_STATUS={"status":"error","message":"download interrupted"}\n'
+            )
+        create_d3_artifact(Path(args[-1]))
+        return fake_worker()
 
-    monkeypatch.setattr("mlx_serve.core.decision_prepare.snapshot_download", download)
+    monkeypatch.setattr("mlx_serve.core.decision_prepare.asyncio.create_subprocess_exec", worker)
     first = [event async for event in model_manager.pull_model("vllm-sr/d3-lite", "decision")]
     assert first[-1]["status"] == "error"
     assert not (settings.models_dir / "d3-lite").exists()
-    assert list(settings.models_dir.iterdir()) == []
+    assert not list(settings.models_dir.glob(".decision-prepare-*"))
     assert "d3-lite" not in model_manager._metadata
 
     second = [event async for event in model_manager.pull_model("vllm-sr/d3-lite", "decision")]
     assert second[-1]["status"] == "success"
-    assert (settings.models_dir / "d3-lite" / "weights").read_text() == "complete"
+    assert (settings.models_dir / "d3-lite" / "model.safetensors").read_bytes() == b"complete"
     assert model_manager._metadata["d3-lite"]["type"] == "decision"
+    assert model_manager._metadata["d3-lite"]["revision"] == D3_REVISION
 
 
 @pytest.mark.asyncio
 async def test_d3_registration_failure_removes_only_the_new_download(ollama_source, monkeypatch):
+    mock_model_info(monkeypatch)
     settings.models_dir.mkdir()
     existing = settings.models_dir / "other"
     existing.mkdir()
     (existing / "weights").write_text("preserved")
 
-    def download(*, repo_id, local_dir):
-        (Path(local_dir) / "weights").write_text("new")
+    async def worker(*args, **kwargs):
+        create_d3_artifact(Path(args[-1]))
+        return fake_worker()
 
     def fail_save():
         raise OSError("cannot save registry")
 
-    monkeypatch.setattr("mlx_serve.core.decision_prepare.snapshot_download", download)
+    monkeypatch.setattr("mlx_serve.core.decision_prepare.asyncio.create_subprocess_exec", worker)
     monkeypatch.setattr(model_manager, "_save_metadata", fail_save)
     events = [event async for event in model_manager.pull_model("vllm-sr/d3-lite", "decision")]
     assert events[-1]["status"] == "error"
@@ -150,32 +195,165 @@ async def test_d3_registration_failure_removes_only_the_new_download(ollama_sour
 
 
 @pytest.mark.asyncio
-async def test_cancelled_d3_download_waits_for_thread_before_cleaning_stage(
+async def test_d3_with_corrupted_output_is_not_registered(ollama_source, monkeypatch):
+    mock_model_info(monkeypatch)
+
+    async def worker(*args, **kwargs):
+        artifact = Path(args[-1])
+        create_d3_artifact(artifact)
+        (artifact / "readout.safetensors").write_bytes(b"corrupted")
+        return fake_worker()
+
+    monkeypatch.setattr("mlx_serve.core.decision_prepare.asyncio.create_subprocess_exec", worker)
+    events = [event async for event in model_manager.pull_model(D3_REPO, "decision")]
+    assert events[-1]["status"] == "error"
+    assert "checksum" in events[-1]["message"]
+    assert "d3-lite" not in model_manager._metadata
+    assert not (settings.models_dir / "d3-lite").exists()
+    assert not list(settings.models_dir.glob(".decision-prepare-*"))
+
+
+@pytest.mark.asyncio
+async def test_d3_preparation_uses_license_from_the_resolved_revision(ollama_source, monkeypatch):
+    monkeypatch.setattr(
+        "mlx_serve.core.decision_prepare.HfApi.model_info",
+        lambda *args, **kwargs: SimpleNamespace(
+            sha=D3_REVISION, siblings=[], card_data=SimpleNamespace(license="apache-2.0")
+        ),
+    )
+
+    async def worker(*args, **kwargs):
+        assert kwargs["env"]["MLX_SERVE_PREPARE_LICENSE"] == "apache-2.0"
+        create_d3_artifact(Path(args[-1]))
+        return fake_worker()
+
+    monkeypatch.setattr("mlx_serve.core.decision_prepare.asyncio.create_subprocess_exec", worker)
+    events = [event async for event in model_manager.pull_model(D3_REPO, "decision")]
+    assert events[-1]["status"] == "success"
+
+
+def test_d3_manifest_rechecks_identity_and_all_files(tmp_path):
+    artifact = tmp_path / "artifact"
+    create_d3_artifact(artifact)
+    assert read_verified_manifest(artifact)["revision"] == D3_REVISION
+    (artifact / "readout.safetensors").write_bytes(b"modified")
+    with pytest.raises(ValueError, match="checksum"):
+        read_verified_manifest(artifact)
+    (artifact / "readout.safetensors").write_bytes(b"readout")
+    manifest_file = artifact / MANIFEST
+    manifest = json.loads(manifest_file.read_text())
+    manifest["validation"]["published_file_hashes"] = False
+    manifest_file.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="invalid"):
+        read_verified_manifest(artifact)
+
+    manifest["validation"]["published_file_hashes"] = True
+    del manifest["files_sha256"]["model.safetensors"]
+    (artifact / "model.safetensors").unlink()
+    manifest_file.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="backbone"):
+        read_verified_manifest(artifact)
+
+
+def test_prepared_d3_is_checked_again_before_loading(ollama_source, monkeypatch):
+    artifact = settings.models_dir / "d3-lite"
+    create_d3_artifact(artifact)
+    model_manager._metadata["d3-lite"] = {
+        "type": "decision", "hf_repo": D3_REPO, "revision": D3_REVISION,
+    }
+    model_manager._save_metadata()
+    monkeypatch.setattr(model_manager, "_decision_cache", TTLLRUCache(maxsize=1, ttl=60))
+    monkeypatch.setattr(model_manager, "_ensure_load_memory_available", lambda *args: None)
+    monkeypatch.setattr(model_manager, "_memory_calibration_baseline", lambda: (0, None))
+    monkeypatch.setattr(
+        "mlx_serve.core.decision.D3DecisionModel",
+        lambda path: pytest.fail("A modified checkpoint must never be loaded"),
+    )
+    (artifact / "readout.safetensors").write_bytes(b"modified")
+    with pytest.raises(ValueError, match="checksum"):
+        model_manager.get_decision_model("d3-lite")
+
+
+def test_d3_worker_rejects_incorrect_published_hashes_before_loading(tmp_path, monkeypatch):
+    def download(*, repo_id, revision, local_dir, allow_patterns):
+        source = Path(local_dir)
+        source.mkdir()
+        hashes = {
+            "tokenizer.json": "0" * 64,
+            "tokenizer_config.json": "0" * 64,
+            "readout.safetensors": "0" * 64,
+            "model.safetensors": "0" * 64,
+        }
+        (source / "MODEL_MANIFEST.json").write_text(json.dumps({
+            "repo_id": D3_REPO, "format_id": "d3-code-readout-v1",
+            "identity": {"files_sha256": hashes},
+        }))
+        for name in hashes:
+            (source / name).write_bytes(b"corrupted")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    with pytest.raises(ValueError, match="checksum"):
+        prepare_d3(D3_REPO, D3_REVISION, tmp_path / "source", tmp_path / "artifact")
+    assert not (tmp_path / "artifact").exists()
+
+
+def test_d3_worker_rejects_extra_weight_files(tmp_path, monkeypatch):
+    def download(*, repo_id, revision, local_dir, allow_patterns):
+        source = Path(local_dir)
+        source.mkdir()
+        hashes = {name: "0" * 64 for name in (
+            "tokenizer.json", "tokenizer_config.json", "readout.safetensors", "model.safetensors"
+        )}
+        (source / "MODEL_MANIFEST.json").write_text(json.dumps({
+            "repo_id": D3_REPO, "format_id": "d3-code-readout-v1",
+            "identity": {"files_sha256": hashes},
+        }))
+        for name in (*hashes, "unexpected.safetensors"):
+            (source / name).write_bytes(b"unexpected")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    with pytest.raises(ValueError, match="unexpected or missing weight"):
+        prepare_d3(D3_REPO, D3_REVISION, tmp_path / "source", tmp_path / "artifact")
+    assert not (tmp_path / "artifact").exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_d3_download_stops_worker_before_cleaning_stage(
     ollama_source, monkeypatch
 ):
-    started = threading.Event()
-    release = threading.Event()
+    mock_model_info(monkeypatch)
+    started = asyncio.Event()
+    stopped = []
 
-    def download(*, repo_id, local_dir):
+    class Process:
+        pid = os.getpid()
+        returncode = None
+        stdout = asyncio.StreamReader()
+
+        def terminate(self):
+            self.returncode = -15
+            stopped.append(True)
+
+        async def wait(self):
+            return self.returncode
+
+    async def worker(*args, **kwargs):
         started.set()
-        release.wait(timeout=5)
-        (Path(local_dir) / "weights").write_text("complete")
+        return Process()
 
-    monkeypatch.setattr("mlx_serve.core.decision_prepare.snapshot_download", download)
-    events = model_manager.pull_model("vllm-sr/d3-lite", "decision")
-    assert (await anext(events))["status"] == "downloading"
-    pending = asyncio.create_task(anext(events))
-    try:
-        assert await asyncio.to_thread(started.wait, 3)
-        pending.cancel()
-        await asyncio.sleep(0.05)
-        assert not pending.done()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await pending
-        assert list(settings.models_dir.iterdir()) == []
-    finally:
-        release.set()
+    monkeypatch.setattr("mlx_serve.core.decision_prepare.asyncio.create_subprocess_exec", worker)
+
+    async def install():
+        return [event async for event in model_manager.pull_model(D3_REPO, "decision")]
+
+    pending = asyncio.create_task(install())
+    await asyncio.wait_for(started.wait(), timeout=3)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert stopped
+    assert not (settings.models_dir / "d3-lite").exists()
+    assert not list(settings.models_dir.glob(".decision-prepare-*"))
 
 
 @pytest.mark.asyncio

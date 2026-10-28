@@ -1,4 +1,4 @@
-"""Prepare a d1 checkpoint in a disposable process; never execute repository code."""
+"""Prepare a decision checkpoint in a disposable process without repository code."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import math
+import os
 import shutil
 import sys
 import time
@@ -17,6 +18,7 @@ from typing import Any
 MANIFEST = "mlx_serve_decision_manifest.json"
 SOURCE_REPO = "LiquidAI/d1-omni-600M"
 MLX_REPO = "LiquidAI/d1-omni-600M-MLX-fp16"
+D3_REPO = "vllm-sr/d3-lite"
 
 
 def emit(status: str, **data: Any) -> None:
@@ -138,11 +140,139 @@ def compare_predictions(before: dict[str, Any], after: dict[str, Any]) -> float:
     return maximum
 
 
+def prepare_d3(repo: str, revision: str, source: Path, artifact: Path) -> None:
+    """Verify the published checkpoint and run native MLX inference before publication."""
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    from mlx_serve.core.decision import D3DecisionModel
+
+    emit("downloading", hf_repo=repo, revision=revision)
+    snapshot_download(
+        repo_id=repo, revision=revision, local_dir=str(source),
+        allow_patterns=["*.json", "*.safetensors", "*.jinja", "*.txt", "LICENSE", "README.md"],
+    )
+    shutil.rmtree(source / ".cache", ignore_errors=True)
+    emit("checking", detail="Checking D3 architecture and published file hashes")
+    published = json.loads((source / "MODEL_MANIFEST.json").read_text())
+    if (
+        published.get("repo_id") != repo
+        or published.get("format_id") != "d3-code-readout-v1"
+        or not isinstance(published.get("identity", {}).get("files_sha256"), dict)
+    ):
+        raise ValueError("Invalid D3 package manifest")
+    hashes = published["identity"]["files_sha256"]
+    required = {"tokenizer.json", "tokenizer_config.json", "readout.safetensors"}
+    if not required <= hashes.keys() or not any(
+        name.endswith(".safetensors") and name != "readout.safetensors" for name in hashes
+    ):
+        raise ValueError("Incomplete D3 package manifest")
+    expected_weights = {name for name in hashes if name.endswith(".safetensors")}
+    actual_weights = {
+        str(path.relative_to(source))
+        for path in (
+            list(source.glob("*.safetensors")) + list((source / "weights").glob("*.safetensors"))
+        )
+    }
+    if actual_weights != expected_weights:
+        raise ValueError("D3 checkpoint has unexpected or missing weight files")
+    for name, expected in hashes.items():
+        path = source / name
+        if (
+            not isinstance(name, str) or not isinstance(expected, str)
+            or not path.resolve().is_relative_to(source.resolve()) or not path.is_file()
+            or file_hash(path) != expected
+        ):
+            raise ValueError(f"D3 file checksum mismatch: {name}")
+
+    config = json.loads((source / "config.json").read_text())
+    if config.get("model_type") != "qwen3_5" or config.get("dtype") != "bfloat16":
+        raise ValueError("Unsupported D3 architecture or precision")
+    for name in hashes:
+        if not name.endswith(".safetensors"):
+            continue
+        with safe_open(source / name, framework="numpy") as tensors:
+            expected_dtype = "F32" if name == "readout.safetensors" else "BF16"
+            if not tensors.keys() or any(
+                tensors.get_slice(key).get_dtype() != expected_dtype for key in tensors.keys()
+            ):
+                raise ValueError(f"Unsupported D3 tensor precision: {name}")
+
+    emit("validating", detail="Running the D3 model with MLX")
+    model = D3DecisionModel(source)
+    questions = {
+        "choice": {"type": "choice", "instructions": "Which animal is mentioned?",
+                   "criteria": {"cat": "a cat", "dog": "a dog"}},
+        "bool": {"type": "noul", "instructions": "Is a cat mentioned?"},
+        "score": {"type": "score", "instructions": "How positive is the statement?",
+                  "criteria": ["negative", "neutral", "positive"]},
+    }
+    result = model.system_one("I love my cat. It makes me happy.", questions)
+    answers = result.get("answers", {})
+    if set(answers) != set(questions):
+        raise ValueError("Incomplete D3 validation response")
+    for name, answer in answers.items():
+        if name == "bool":
+            probability = answer.get("noul")
+            if (
+                not isinstance(probability, (float, int)) or not math.isfinite(probability)
+                or not 0 <= probability <= 1
+            ):
+                raise ValueError("Invalid D3 Boolean probability")
+            continue
+        probabilities = answer.get("probabilities", {})
+        if (
+            not probabilities
+            or any(not isinstance(p, (float, int)) or not math.isfinite(p) or not 0 <= p <= 1
+                   for p in probabilities.values())
+            or not math.isclose(sum(probabilities.values()), 1, abs_tol=0.001)
+        ):
+            raise ValueError("Invalid D3 decision probability distribution")
+        if name == "choice" and answer.get("choice") not in probabilities:
+            raise ValueError("Invalid D3 choice")
+        if name == "score":
+            expected = sum(int(level) * p for level, p in probabilities.items())
+            if not math.isclose(answer.get("score", float("nan")), expected, abs_tol=0.002):
+                raise ValueError("Invalid D3 expected score")
+    del model
+    gc.collect()
+    import mlx.core as mx
+
+    mx.clear_cache()
+    source.rename(artifact)
+    files = {
+        str(path.relative_to(artifact)): file_hash(path)
+        for path in sorted(artifact.rglob("*")) if path.is_file()
+    }
+    manifest = {
+        "schema_version": 1, "source_repo": repo, "revision": revision,
+        "architecture": "qwen3_5", "license": os.environ.get("MLX_SERVE_PREPARE_LICENSE"),
+        "precision": "bfloat16",
+        "converter": None, "converter_options": {"trust_remote_code": False},
+        "converted": False, "files_sha256": files, "source_files_sha256": files,
+        "environment": {
+            "python": sys.version.split()[0],
+            **{
+                name: version(name)
+                for name in ("mlx", "mlx-vlm", "transformers", "huggingface-hub", "safetensors")
+            },
+        },
+        "validation": {"mlx_predict": True, "published_file_hashes": True,
+                       "sample_answers": answers},
+        "prepared_at": int(time.time()),
+    }
+    (artifact / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    emit("ready")
+
+
 def prepare(repo: str, revision: str, source: Path, artifact: Path) -> None:
     from huggingface_hub import snapshot_download
 
     if version("mlx-vlm") != "0.7.10":
         raise ValueError("Decision preparation requires mlx-vlm 0.7.10")
+    if repo == D3_REPO:
+        prepare_d3(repo, revision, source, artifact)
+        return
     emit("downloading", hf_repo=repo, revision=revision)
     snapshot_download(
         repo_id=repo,
@@ -193,8 +323,8 @@ def prepare(repo: str, revision: str, source: Path, artifact: Path) -> None:
         "architecture": config["model_type"],
         "license": "lfm1.0",
         "precision": "float16",
-        "converter": "mlx-vlm",
-        "converter_version": version("mlx-vlm"),
+        "converter": "mlx-vlm" if is_original else None,
+        "converter_version": version("mlx-vlm") if is_original else None,
         "environment": {
             "python": sys.version.split()[0],
             **{
@@ -202,7 +332,10 @@ def prepare(repo: str, revision: str, source: Path, artifact: Path) -> None:
                 for name in ("mlx", "mlx-vlm", "transformers", "huggingface-hub", "safetensors")
             },
         },
-        "converter_options": {"dtype": "float16", "trust_remote_code": False},
+        "converter_options": (
+            {"dtype": "float16", "trust_remote_code": False}
+            if is_original else {"trust_remote_code": False}
+        ),
         "converted": is_original,
         "temperatures": config["temperatures"],
         "max_length": config.get("max_length"),
@@ -222,7 +355,7 @@ def prepare(repo: str, revision: str, source: Path, artifact: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("repo", choices=[SOURCE_REPO, MLX_REPO])
+    parser.add_argument("repo", choices=[SOURCE_REPO, MLX_REPO, D3_REPO])
     parser.add_argument("revision")
     parser.add_argument("source", type=Path)
     parser.add_argument("artifact", type=Path)

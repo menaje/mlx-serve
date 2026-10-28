@@ -4,14 +4,15 @@ import asyncio
 import base64
 import logging
 import threading
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from mlx_serve.config import settings
 from mlx_serve.core.batch_processor import EmbeddingBatchProcessor
+from mlx_serve.core.default_models import request_model_default
 from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
@@ -134,6 +135,11 @@ class EmbeddingRequest(BaseModel):
         description="Number of dimensions for the output embedding (requires MRL-trained model)",
         gt=0,
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def use_default_model(cls, data: Any) -> Any:
+        return request_model_default(data, "embedding")
 
 
 class EmbeddingData(BaseModel):
@@ -335,7 +341,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
             ),
         ) from e
     except Exception as e:
-        logger.error(f"Embedding generation failed: {e}")
+        logger.error("Embedding generation failed (%s)", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail={

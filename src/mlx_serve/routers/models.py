@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from mlx_serve.core.local_access import internal_management_headers
 from mlx_serve.core.model_manager import (
     ModelInUseError,
     ModelType,
@@ -37,9 +38,10 @@ async def _decision_worker_request(
             base_url + path,
             "GET" if payload is None else "POST",
             b"" if payload is None else json.dumps(payload).encode(),
-            {"Content-Type": "application/json"},
+            {"Content-Type": "application/json", **internal_management_headers()},
+            loopback_only=True,
         )
-    except (OSError, urllib.error.URLError) as exc:
+    except (OSError, urllib.error.URLError, ValueError) as exc:
         raise HTTPException(
             status_code=503,
             detail={
@@ -106,7 +108,7 @@ class PullRequest(BaseModel):
         default=None, description="Quantization bits (4 or 8). None for no quantization."
     )
     keep_original: bool = Field(
-        default=False, description="Keep original model in HuggingFace cache after conversion"
+        default=False, description="Keep a separate d1 source after successful verification"
     )
 
 
@@ -153,6 +155,7 @@ class UnloadResponse(BaseModel):
 @router.get("/v1/models", response_model=ModelsResponse)
 async def list_models_openai() -> ModelsResponse:
     """List all available models (OpenAI format)."""
+    model_manager._load_metadata()
     models = model_manager.list_models()
 
     return ModelsResponse(
@@ -170,6 +173,7 @@ async def list_models_openai() -> ModelsResponse:
 @router.get("/api/tags", response_model=OllamaTagsResponse)
 async def list_models_ollama() -> OllamaTagsResponse:
     """List all available models (Ollama format)."""
+    model_manager._load_metadata()
     models = model_manager.list_models()
 
     return OllamaTagsResponse(

@@ -1,10 +1,11 @@
 """Configuration management for mlx-serve."""
 
+import json
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from mlx_serve.core.config_loader import get_config_values
 
@@ -39,7 +40,7 @@ class Settings(BaseSettings):
 
     # Server settings
     host: str = Field(default="0.0.0.0", description="Server host")
-    port: int = Field(default=8000, description="Server port")
+    port: int = Field(default=8000, description="Server port", ge=1, le=65535)
 
     # Model storage
     models_dir: Path = Field(
@@ -56,6 +57,12 @@ class Settings(BaseSettings):
         default="text",
         description="Log format (text or json)",
     )
+    app_log_retention_days: int | None = Field(
+        default=None,
+        ge=1,
+        le=36500,
+        description="Days to keep completed app-owned server logs; None keeps them indefinitely",
+    )
     debug_log_chat_request_bodies: bool = Field(
         default=False,
         description="Write full /v1/chat/completions request bodies to debug logs",
@@ -65,10 +72,12 @@ class Settings(BaseSettings):
     cache_max_embedding_models: int = Field(
         default=3,
         description="Maximum number of embedding models to keep in cache (LRU)",
+        ge=1,
     )
     cache_max_reranker_models: int = Field(
         default=2,
         description="Maximum number of reranker models to keep in cache (LRU)",
+        ge=1,
     )
     cache_max_decision_models: int = Field(
         default=1,
@@ -110,10 +119,11 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = Field(
         default=1800,
         description="Time-to-live for cached models in seconds (30 minutes default)",
+        ge=1,
     )
 
     # Preload settings
-    preload_models: list[str] = Field(
+    preload_models: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
         description="List of model names to preload at startup",
     )
@@ -388,6 +398,8 @@ class Settings(BaseSettings):
     def parse_preload_models(cls, v):
         """Parse preload_models from comma-separated string or list."""
         if isinstance(v, str):
+            if v.lstrip().startswith("["):
+                return json.loads(v)
             return [m.strip() for m in v.split(",") if m.strip()]
         return v
 
@@ -401,6 +413,10 @@ class Settings(BaseSettings):
 
     def ensure_dirs(self) -> None:
         """Ensure required directories exist."""
+        from mlx_serve.core.storage_access import model_volume_mounted
+
+        if not model_volume_mounted(self.models_dir):
+            raise OSError("Model storage volume is unavailable; reconnect it first")
         self.models_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod

@@ -429,7 +429,7 @@ def _extract_images_from_messages(messages: list[ChatMessage]) -> list["Image.Im
                         img = _load_image_from_url(part.image_url.url)
                         images.append(img)
                     except Exception as e:
-                        logger.warning(f"Failed to load image: {e}")
+                        logger.warning("Failed to load image (%s)", type(e).__name__)
     return images
 
 
@@ -511,7 +511,7 @@ def _format_messages_for_model(
                 add_generation_prompt=True,
             )
     except Exception as e:
-        logger.warning(f"Chat template failed, using fallback: {e}")
+        logger.warning("Chat template failed, using fallback (%s)", type(e).__name__)
 
     # Fallback: simple concatenation
     prompt_parts = []
@@ -1493,7 +1493,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Chat completion failed: {e}")
+        logger.error("Chat completion failed (%s)", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail={
@@ -1817,8 +1817,7 @@ async def create_completion(request: CompletionRequest):
     The unsupported parameters are accepted for API compatibility but have no effect.
     Only `n=1` is supported (generating a single completion per request).
     """
-    # DEBUG: Log incoming request for troubleshooting
-    logger.info(f"[DEBUG] Received completion request: {request.model_dump()}")
+    logger.debug("Received legacy completion request")
 
     # Log warning for unsupported parameters
     unsupported_params = []
@@ -1975,7 +1974,7 @@ async def create_completion(request: CompletionRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Text completion failed: {e}")
+        logger.error("Text completion failed (%s)", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail={

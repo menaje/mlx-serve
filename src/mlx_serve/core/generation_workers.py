@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import signal
@@ -13,8 +14,10 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Awaitable, Callable, TypeVar
 
 from mlx_serve.config import settings
+from mlx_serve.core.local_access import open_local_http
 from mlx_serve.core.model_manager import model_manager, resolve_model_alias
 from mlx_serve.core.runtime_topology import (
     GENERATION_WORKER_KIND_ENV,
@@ -37,10 +40,12 @@ class GenerationWorkerProcess:
     process: subprocess.Popen
     model_name: str | None = None
     last_used_at: float = 0.0
+    active_leases: int = 0
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        host = "127.0.0.1" if self.host == "0.0.0.0" else self.host
+        return f"http://{host}:{self.port}"
 
     def touch(self) -> None:
         """Mark this worker as recently used."""
@@ -63,11 +68,16 @@ class GenerationWorkerSupervisor:
     def __init__(self) -> None:
         self._workers: dict[str, GenerationWorkerProcess] = {}
         self._lock = threading.RLock()
+        # Serialize starts for the same model without blocking status or other models.
+        self._start_locks = [threading.Lock() for _ in range(32)]
+        self._stopping = False
         self._reaper_stop = threading.Event()
         self._reaper_thread: threading.Thread | None = None
 
     def start(self) -> dict[str, str]:
         """Start configured generation workers and return their base URLs."""
+        with self._lock:
+            self._stopping = False
         _cleanup_orphaned_generation_workers()
         if settings.generation_worker_mode == "model":
             self._start_idle_reaper()
@@ -86,30 +96,44 @@ class GenerationWorkerSupervisor:
             return {kind: worker.base_url for kind, worker in self._workers.items()}
 
     def ensure_worker(self, kind: GenerationWorkerKind, model_name: str) -> str:
-        """Return a worker URL, starting a model-scoped worker on demand if configured."""
-        if settings.generation_worker_mode != "model":
-            with self._lock:
-                worker = self._workers.get(kind)
-            if worker is None or worker.process.poll() is not None:
-                worker = self._start_worker(kind)
-                with self._lock:
-                    self._workers[kind] = worker
-            worker.touch()
-            return worker.base_url
+        """Return a worker URL; callers doing work should hold a worker lease instead."""
+        lease = self.acquire_worker(kind, model_name)
+        assert lease is not None
+        try:
+            return lease.url
+        finally:
+            lease.release()
 
-        self.reap_idle_workers()
+    def acquire_worker(
+        self, kind: GenerationWorkerKind, model_name: str, *, start: bool = True,
+    ) -> GenerationWorkerLease | None:
+        """Keep the right worker alive until the caller finishes its operation."""
         resolved_name, _, _ = resolve_model_alias(model_name)
-        key = self._worker_key(kind, resolved_name)
-        with self._lock:
-            worker = self._workers.get(key)
-        if worker is not None and worker.process.poll() is None:
-            worker.touch()
-            return worker.base_url
-
-        worker = self._start_worker(kind, model_name=resolved_name)
-        with self._lock:
-            self._workers[key] = worker
-        return worker.base_url
+        scoped = settings.generation_worker_mode == "model"
+        key = self._worker_key(kind, resolved_name) if scoped else kind
+        start_lock = self._start_locks[hash(key) % len(self._start_locks)]
+        with start_lock:
+            with self._lock:
+                if self._stopping:
+                    raise RuntimeError("Generation worker supervisor is stopping")
+                worker = self._workers.get(key)
+                if worker is not None and worker.process.poll() is None:
+                    worker.active_leases += 1
+                    worker.touch()
+                    return GenerationWorkerLease(self, worker)
+                if not start:
+                    return None
+            worker = self._start_worker(kind, model_name=resolved_name if scoped else None)
+            with self._lock:
+                stopping = self._stopping
+                if not stopping:
+                    worker.active_leases += 1
+                    worker.touch()
+                    self._workers[key] = worker
+            if stopping:
+                self._terminate_workers([worker])
+                raise RuntimeError("Generation worker supervisor is stopping")
+            return GenerationWorkerLease(self, worker)
 
     def stop(self) -> None:
         """Terminate all managed workers."""
@@ -117,6 +141,7 @@ class GenerationWorkerSupervisor:
         if self._reaper_thread is not None and self._reaper_thread.is_alive():
             self._reaper_thread.join(timeout=1.0)
         with self._lock:
+            self._stopping = True
             workers = list(self._workers.values())
             self._workers.clear()
         if not workers:
@@ -140,6 +165,8 @@ class GenerationWorkerSupervisor:
                 if worker.process.poll() is not None:
                     expired.append((key, worker))
                     self._workers.pop(key, None)
+                    continue
+                if worker.active_leases:
                     continue
                 if worker.last_used_at and now - worker.last_used_at >= idle_timeout:
                     expired.append((key, worker))
@@ -219,19 +246,22 @@ class GenerationWorkerSupervisor:
         else:
             env.pop("MLX_SERVE_PRELOAD_MODELS", None)
 
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "uvicorn",
-                "mlx_serve.server:app",
-                "--host",
-                host,
-                "--port",
-                str(port),
-            ],
-            env=env,
-        )
+        command = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "mlx_serve.server:app",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
+        if env.get("MLX_SERVE_APP_OWNED") == "1":
+            command = [
+                sys.executable, "-m", "mlx_serve.app_server_runner",
+                "--host", host, "--port", str(port), "--parent", str(os.getpid()),
+            ]
+        process = subprocess.Popen(command, env=env)
 
         worker = GenerationWorkerProcess(
             kind=kind,
@@ -241,7 +271,11 @@ class GenerationWorkerSupervisor:
             model_name=model_name,
         )
         worker.touch()
-        _wait_for_worker_ready(worker)
+        try:
+            _wait_for_worker_ready(worker)
+        except BaseException:
+            self._terminate_workers([worker])
+            raise
         logger.info(
             "Started %s generation worker on %s (PID: %s)",
             f"{kind}:{model_name}" if model_name else kind,
@@ -252,6 +286,83 @@ class GenerationWorkerSupervisor:
 
     def _worker_key(self, kind: GenerationWorkerKind, model_name: str) -> str:
         return f"{kind}:{model_name}"
+
+
+class GenerationWorkerLease:
+    """An idempotent reservation held across a worker request or stream."""
+
+    def __init__(self, supervisor: GenerationWorkerSupervisor, worker: GenerationWorkerProcess):
+        self._supervisor = supervisor
+        self._worker = worker
+        self._released = False
+
+    @property
+    def url(self) -> str:
+        return self._worker.base_url
+
+    def release(self) -> None:
+        with self._supervisor._lock:
+            if not self._released:
+                self._released = True
+                self._worker.active_leases -= 1
+                self._worker.touch()
+
+
+async def acquire_generation_worker(
+    supervisor: GenerationWorkerSupervisor, kind: GenerationWorkerKind, model_name: str,
+    *, start: bool = True,
+) -> GenerationWorkerLease | None:
+    """Release a reservation even if the caller disappears during worker startup."""
+    task = asyncio.create_task(asyncio.to_thread(
+        supervisor.acquire_worker, kind, model_name, start=start,
+    ))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def release_when_started(done: asyncio.Task) -> None:
+            try:
+                lease = done.result()
+                if lease is not None:
+                    lease.release()
+            except BaseException:
+                pass
+
+        task.add_done_callback(release_when_started)
+        raise
+
+
+_T = TypeVar("_T")
+
+
+async def await_worker_operation(
+    operation: Awaitable[_T], lease: GenerationWorkerLease | None, *,
+    keep_on_success: bool = False, discard: Callable[[_T], None] | None = None,
+) -> _T:
+    """Keep a worker reserved until a cancelled underlying operation actually ends."""
+    task = asyncio.ensure_future(operation)
+    try:
+        result = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def finish_cancelled(done: asyncio.Future) -> None:
+            try:
+                result = done.result()
+                if discard is not None:
+                    discard(result)
+            except BaseException:
+                pass
+            finally:
+                if lease is not None:
+                    lease.release()
+
+        task.add_done_callback(finish_cancelled)
+        raise
+    except BaseException:
+        if lease is not None:
+            lease.release()
+        raise
+    if lease is not None and not keep_on_success:
+        lease.release()
+    return result
 
 
 def _select_preload_models(kind: GenerationWorkerKind) -> list[str]:
@@ -361,7 +472,9 @@ def _wait_for_worker_ready(worker: GenerationWorkerProcess) -> None:
             )
 
         try:
-            with urllib.request.urlopen(health_url, timeout=1.0) as response:
+            with open_local_http(
+                urllib.request.Request(health_url), timeout=1.0, allow_non_loopback=True
+            ) as response:
                 if response.status == 200:
                     return
         except urllib.error.URLError:
