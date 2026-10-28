@@ -75,6 +75,14 @@ additional native and backend harness checks are identified below.
   loaded count. A native summary test also covers loaded, unloaded and unknown
   model states and missing memory data. The new menu-bar text itself was not
   independently inspected in this pass.
+- In a later isolated packaged-app run, a copy of the real `d3-lite` model was
+  loaded into the decision worker and then unloaded through the model detail
+  screen. The overview changed from one loaded model to zero; the worker's
+  reported MLX active memory fell from 1,505,837,192 to 1,032 bytes. The
+  overview's system-memory and gateway-RSS values also matched the gateway's
+  live health snapshot within the normal refresh interval. This verifies the
+  main screen and actual worker, while the menu-bar display still requires a
+  separate visual check.
 - Queue size, request timeout, memory thresholds and server-log retention were
   changed through the current settings UI. Saved and applied values were shown
   separately until restart, after which the server reported the new values. An
