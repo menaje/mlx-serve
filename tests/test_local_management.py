@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -233,6 +234,45 @@ def test_management_agent_requires_secret_and_local_non_browser_requests(tmp_pat
         assert local.get("http://evil.example/jobs", headers=header).status_code == 403
     with TestClient(app, base_url="http://localhost", client=("192.0.2.4", 1)) as remote:
         assert remote.get("/jobs", headers=header).status_code == 403
+
+
+def test_diagnostics_excludes_job_inputs_errors_and_untrusted_health(tmp_path, monkeypatch):
+    from mlx_serve.management_agent import ServerController, create_agent
+
+    async def status(_controller):
+        return {
+            "state": "connected", "ownership": "external", "port": 8000,
+            "health": {"status": "healthy", "extra": "health_secret"},
+        }
+
+    monkeypatch.setattr("mlx_serve.management_agent.initialize_app_config", lambda: None)
+    monkeypatch.setattr(ServerController, "status", status)
+    app = create_agent("private-secret", data_dir=tmp_path)
+    header = {"Authorization": "Bearer private-secret"}
+    with TestClient(app, base_url="http://localhost", client=("127.0.0.1", 1)) as client:
+        params = {"revision": "hf_revision_secret", "name": "private_model_input"}
+        with sqlite3.connect(tmp_path / "jobs" / "jobs.sqlite3") as db:
+            db.execute(
+                "INSERT INTO jobs (id, request_key, params, status, stage, created_at, "
+                "updated_at, result, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "a" * 32, "fixture", json.dumps(params), "failed", "failed",
+                    "2026-10-28T00:00:00+00:00", "2026-10-28T00:01:00+00:00",
+                    json.dumps({"detail": "result_secret"}),
+                    "Network connection failed: error_secret",
+                ),
+            )
+        response = client.get("/diagnostics", headers=header)
+        assert response.status_code == 200
+        for secret in (
+            "hf_revision_secret", "private_model_input", "result_secret",
+            "error_secret", "health_secret",
+        ):
+            assert secret not in response.text
+        report = response.json()
+        assert report["server"]["state"] == "connected"
+        assert report["jobs"][0]["status"] == "failed"
+        assert report["jobs"][0]["error_category"] == "network"
 
 
 def test_internal_http_bypasses_proxies_and_rejects_redirects(monkeypatch):

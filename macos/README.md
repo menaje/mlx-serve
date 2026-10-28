@@ -86,6 +86,9 @@ Face tokens or use Keychain, and its own server and preparation processes disabl
 automatic use of existing Hugging Face credentials. Existing credentials on the
 Mac are left untouched. This restriction applies to app-owned processes; an
 independent CLI or server continues to use its own configuration.
+Diagnostic export includes a limited server and job status summary; it omits
+model inputs, error details, request bodies, credentials, and logs. Use the
+app's job screen for the full local error details.
 Paths under `/Volumes/<name>` must refer to a mounted volume. This prevents
 starting the engine or creating a replacement directory after that volume is
 disconnected. With the server and preparations stopped, existing model storage

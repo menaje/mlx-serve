@@ -105,6 +105,10 @@ additional native and backend harness checks are identified below.
   embedding and reranker downloads, validation and inference also succeeded.
   The app-owned server uses the same credential policy; existing CLI
   configurations and credentials are not modified.
+- Diagnostic export now includes only an allowlisted server and job summary.
+  An endpoint test placed synthetic secrets in saved job inputs, results and
+  errors and in an external server's health response; none appeared in the
+  exported report, which retained job status and the error category.
 - With both the development and bundled runtimes, the official d1 MLX FP16
   checkpoint was copied from an existing local installation, validated, and
   used for choice, Boolean and score inference without invoking a converter.

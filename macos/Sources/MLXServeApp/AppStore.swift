@@ -405,7 +405,7 @@ final class AppStore: ObservableObject {
             let data = try JSONSerialization.data(withJSONObject: try await request("/diagnostics"), options: [.prettyPrinted, .sortedKeys])
             let panel = NSSavePanel()
             panel.nameFieldStringValue = "mlx-serve-diagnostics.json"
-            panel.message = "서버 상태와 작업 이력만 포함합니다. 요청 본문, 인증정보와 로그는 제외됩니다."
+            panel.message = "서버 상태와 작업 이력 요약만 포함합니다. 모델 입력값, 오류 상세, 요청 본문, 인증정보와 로그는 제외됩니다."
             if panel.runModal() == .OK, let url = panel.url { try data.write(to: url, options: .atomic) }
         } catch { message = error.localizedDescription }
     }

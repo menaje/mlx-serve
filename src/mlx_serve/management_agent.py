@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,58 @@ from mlx_serve.core.storage_access import model_storage_available, model_volume_
 from mlx_serve.core.storage_migration import migrate_storage, preview_storage_migration
 
 DATA_DIR = Path.home() / ".mlx-serve"
+
+
+def _diagnostic_time(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value).isoformat()
+    except ValueError:
+        return None
+
+
+def _diagnostic_report(state: dict[str, Any], jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Export an allowlisted summary, not arbitrary job inputs or remote health data."""
+    server_states = {"connected", "degraded", "starting", "stopped", "failed", "port_conflict"}
+    job_states = {"queued", "running", "cancelling", "recovery_pending", "succeeded",
+                  "failed", "cancelled", "interrupted"}
+    stages = job_states | {"resolving", "downloading", "checking", "converting", "validating",
+                           "registering", "loading", "load_succeeded", "load_failed", "complete"}
+    categories = {"access_approval", "authentication", "storage_permission", "disk", "memory",
+                  "network", "missing_file", "timeout", "unsupported", "validation",
+                  "conversion", "preparation"}
+
+    def choice(value: Any, allowed: set[str], default: str | None = None) -> str | None:
+        return value if isinstance(value, str) and value in allowed else default
+
+    port = state.get("port")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        port = None
+    health = state.get("health")
+    health_status = health.get("status") if isinstance(health, dict) else None
+    server = {
+        "state": choice(state.get("state"), server_states, "unknown"),
+        "ownership": choice(state.get("ownership"), {"app", "external"}),
+        "port": port,
+        "health_status": choice(health_status, {"healthy", "degraded", "unhealthy"}),
+    }
+    history = []
+    for job in jobs:
+        identifier = job.get("id")
+        history.append({
+            "id": identifier if isinstance(identifier, str)
+            and re.fullmatch(r"[0-9a-f]{32}", identifier) else None,
+            "status": choice(job.get("status"), job_states, "unknown"),
+            "stage": choice(job.get("stage"), stages, "unknown"),
+            "created_at": _diagnostic_time(job.get("created_at")),
+            "updated_at": _diagnostic_time(job.get("updated_at")),
+            "error_category": choice(job.get("error_category"), categories),
+        })
+    return {
+        "server": server, "jobs": history,
+        "note": "Model inputs, request bodies, credentials, error details and logs are excluded.",
+    }
 
 
 def _loopback_host(bind_host: str) -> str:
@@ -850,10 +903,7 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
     async def diagnostics() -> dict[str, Any]:
         assert jobs is not None
         state = await controller.status()
-        return {
-            "server": state, "jobs": jobs.list(),
-            "note": "Request bodies, credentials and server logs are excluded.",
-        }
+        return _diagnostic_report(state, jobs.list())
 
     return app
 
