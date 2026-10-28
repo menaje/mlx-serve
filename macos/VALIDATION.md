@@ -61,6 +61,20 @@ additional native and backend harness checks are identified below.
   settings UI. A second test copy in the user's Applications folder did produce
   a macOS authorization request. These observations do not establish how every
   macOS version or installation location behaves.
+- In another installed test copy, the user allowed notifications. A deliberate
+  unexpected exit of its isolated server, a model job with a nonexistent
+  revision, and a successful job reusing a verified model each produced a
+  separate notification. The macOS notification service recorded delivery to
+  Notification Center for all three. It also reported silencing interruptions
+  because the display was being shared; a visible banner was not independently
+  observed. The failed job showed its error and suggested checking the revision.
+- The user reported a sleep and wake while the installed test app was running.
+  The same app, management agent and server processes were present afterward,
+  and the server was healthy. The model had become unloaded after more than its
+  30-minute idle cache lifetime; reloading it and running a bool inference in
+  the UI succeeded. The power log recorded the display turning off and on but
+  did not record a system sleep/wake transition in that interval, so this check
+  establishes display sleep/wake recovery rather than full system sleep/wake.
 
 - A native harness compiled from the current `AppStore` started the actual
   agent and its server in an isolated home. After the harness exited normally
@@ -256,6 +270,6 @@ additional native and backend harness checks are identified below.
   installation is limited to the documented profiles. The cleanup and
   offline-removal controls have backend and earlier UI coverage as described
   above, but were not re-exercised in the current full UI pass.
-- Notification transition filtering is tested and the macOS permission request
-  was observed for an installed test copy, but visible notification delivery
-  has not yet been verified end to end.
+- Notification transition filtering and macOS delivery for all three event
+  types were verified. A visible banner was not independently observed while
+  display sharing caused macOS to silence interruptions.
