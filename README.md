@@ -2,6 +2,10 @@
 
 MLX-based multimodal AI server with OpenAI-compatible API for Apple Silicon.
 
+An experimental native macOS client is available in [macos/](macos/README.md).
+It currently supports a limited model-preparation flow and is not yet a signed,
+notarized release; see its validation notes for the remaining work.
+
 ## Features
 
 - **OpenAI-compatible Chat API** (`/v1/chat/completions`) - LLM and VLM support

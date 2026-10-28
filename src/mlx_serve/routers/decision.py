@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import logging
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from mlx_serve.config import settings
 from mlx_serve.core.d1_decision import DecisionInputError
+from mlx_serve.core.default_models import clear_deleted_decision_default, request_model_default
 from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
@@ -58,7 +60,13 @@ async def delete_decision_model(name: str) -> bool:
                     return False
                 if model_manager.get_model_type(name) != "decision":
                     return False
-                return model_manager.delete_model(name)
+                deleted = model_manager.delete_model(name)
+                if deleted:
+                    # A damaged defaults file must not turn a successful delete
+                    # into a failure; stale selections are checked on every use.
+                    with contextlib.suppress(OSError, ValueError):
+                        clear_deleted_decision_default(name, settings.models_dir)
+                return deleted
             finally:
                 fcntl.flock(registry_lock.fileno(), fcntl.LOCK_UN)
 
@@ -157,6 +165,11 @@ class DecisionRequest(BaseModel):
     questions: dict[str, DecisionQuestion] = Field(min_length=1, max_length=64)
     images: list[str] = Field(default_factory=list)
     videos: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def use_default_model(cls, data: Any) -> Any:
+        return request_model_default(data, "decision")
 
     @field_validator("questions")
     @classmethod

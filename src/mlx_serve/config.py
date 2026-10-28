@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # Server settings
     host: str = Field(default="0.0.0.0", description="Server host")
-    port: int = Field(default=8000, description="Server port")
+    port: int = Field(default=8000, description="Server port", ge=1, le=65535)
 
     # Model storage
     models_dir: Path = Field(
@@ -65,10 +65,12 @@ class Settings(BaseSettings):
     cache_max_embedding_models: int = Field(
         default=3,
         description="Maximum number of embedding models to keep in cache (LRU)",
+        ge=1,
     )
     cache_max_reranker_models: int = Field(
         default=2,
         description="Maximum number of reranker models to keep in cache (LRU)",
+        ge=1,
     )
     cache_max_decision_models: int = Field(
         default=1,
@@ -110,6 +112,7 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = Field(
         default=1800,
         description="Time-to-live for cached models in seconds (30 minutes default)",
+        ge=1,
     )
 
     # Preload settings
@@ -401,6 +404,10 @@ class Settings(BaseSettings):
 
     def ensure_dirs(self) -> None:
         """Ensure required directories exist."""
+        from mlx_serve.core.storage_access import model_volume_mounted
+
+        if not model_volume_mounted(self.models_dir):
+            raise OSError("Model storage volume is unavailable; reconnect it first")
         self.models_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod

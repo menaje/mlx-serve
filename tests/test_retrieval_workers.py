@@ -130,7 +130,7 @@ def test_wait_for_worker_ready_retries_socket_timeout(monkeypatch):
         process=process,
     )
 
-    monkeypatch.setattr(retrieval_workers.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(retrieval_workers, "open_local_http", fake_urlopen)
     monkeypatch.setattr(retrieval_workers.time, "sleep", lambda _: None)
 
     retrieval_workers._wait_for_worker_ready(worker)

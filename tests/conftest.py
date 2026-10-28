@@ -23,7 +23,7 @@ from mlx_serve.server import create_app
 @pytest.fixture
 def client():
     """Create a test client for the FastAPI app."""
-    return TestClient(create_app())
+    return TestClient(create_app(), base_url="http://localhost", client=("127.0.0.1", 12345))
 
 
 @pytest.fixture(autouse=True)

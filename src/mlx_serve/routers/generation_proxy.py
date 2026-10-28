@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from mlx_serve.core.inference_control import build_overload_detail
+from mlx_serve.core.local_access import open_local_http
 from mlx_serve.core.model_manager import model_manager, resolve_model_alias
 from mlx_serve.core.runtime_topology import GenerationWorkerKind
 from mlx_serve.routers.retrieval_proxy import perform_worker_request
@@ -83,7 +84,7 @@ def open_worker_stream(
         method=method,
     )
     try:
-        response = urllib.request.urlopen(request)
+        response = open_local_http(request, allow_non_loopback=True)
     except urllib.error.HTTPError as exc:
         return Response(
             content=exc.read(),

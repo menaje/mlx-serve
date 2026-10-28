@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from mlx_serve.config import settings
 from mlx_serve.core.inference_control import build_overload_detail
+from mlx_serve.core.local_access import open_local_http
 from mlx_serve.core.runtime_topology import RetrievalWorkerKind
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ def perform_worker_request(
     headers: dict[str, str],
     *,
     timeout: float | None | object = _DEFAULT_TIMEOUT,
+    loopback_only: bool = False,
 ) -> WorkerProxyResponse:
     """Perform a blocking HTTP request against an internal worker."""
     if timeout is _DEFAULT_TIMEOUT:
@@ -49,9 +51,10 @@ def perform_worker_request(
     )
 
     try:
-        with urllib.request.urlopen(
+        with open_local_http(
             request,
             timeout=timeout,
+            allow_non_loopback=not loopback_only,
         ) as response:
             return WorkerProxyResponse(
                 status_code=response.status,

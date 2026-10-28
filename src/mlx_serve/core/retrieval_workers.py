@@ -14,6 +14,7 @@ import urllib.request
 from dataclasses import dataclass
 
 from mlx_serve.config import settings
+from mlx_serve.core.local_access import open_local_http
 from mlx_serve.core.model_manager import model_manager, resolve_model_alias
 from mlx_serve.core.runtime_topology import (
     RETRIEVAL_WORKER_KIND_ENV,
@@ -36,7 +37,8 @@ class RetrievalWorkerProcess:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        host = "127.0.0.1" if self.host == "0.0.0.0" else self.host
+        return f"http://{host}:{self.port}"
 
     def snapshot(self) -> dict[str, object]:
         """Return a small health/debug payload for the worker."""
@@ -245,7 +247,9 @@ def _wait_for_worker_ready(worker: RetrievalWorkerProcess) -> None:
             )
 
         try:
-            with urllib.request.urlopen(health_url, timeout=1.0) as response:
+            with open_local_http(
+                urllib.request.Request(health_url), timeout=1.0, allow_non_loopback=True
+            ) as response:
                 if response.status == 200:
                     return
         except (TimeoutError, urllib.error.URLError):

@@ -2,12 +2,14 @@
 
 import asyncio
 import logging
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from mlx_serve.config import settings
 from mlx_serve.core.batch_processor import RerankBatchProcessor
+from mlx_serve.core.default_models import request_model_default
 from mlx_serve.core.inference_control import (
     InferenceOverloadedError,
     build_inference_key,
@@ -45,6 +47,11 @@ class RerankRequest(BaseModel):
         le=1.0,
         description="Threshold for yes/no decision (0.0-1.0)",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def use_default_model(cls, data: Any) -> Any:
+        return request_model_default(data, "reranker")
 
 
 class DocumentResult(BaseModel):

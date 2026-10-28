@@ -342,11 +342,45 @@ async def test_preparation_registers_once_and_reuses_verified_model(preparation,
     )
     results = [event async for event in prepare_d1(model_manager, SOURCE_REPO, "d1-test", REVISION)]
     assert results[-1]["status"] == "success"
+    estimate = next(event for event in results if event["status"] == "checking")
+    assert estimate["estimate_basis"] == "partial_repository_metadata"
+    assert estimate["estimated_disk_bytes"] == 128 * 1024**2
+    assert estimate["free_disk_bytes"] > 0
+    assert any(event.get("temporary_file_bytes", 0) > 0 for event in results)
     assert model_manager._metadata["d1-test"]["revision"] == REVISION
     assert model_manager._metadata["d1-test"]["size"] > 0
     reused = [event async for event in prepare_d1(model_manager, SOURCE_REPO, "d1-test", REVISION)]
     assert reused[-1]["reused"] is True
+    copied = [event async for event in prepare_d1(model_manager, SOURCE_REPO, "d1-copy", REVISION)]
+    copy_estimate = next(event for event in copied if event["status"] == "checking")
+    measurement = next(event for event in copied if event["status"] == "resources")
+    assert copy_estimate["estimate_basis"] == "verified_copy"
+    assert copy_estimate["estimated_disk_bytes"] == measurement["temporary_file_bytes"] > 0
+    assert copied[-1]["reused"] is True
     assert calls == 1
+    assert not list(settings.models_dir.glob(".decision-prepare-*"))
+
+
+@pytest.mark.asyncio
+async def test_preparation_reports_space_estimate_before_rejecting_full_volume(
+    preparation, monkeypatch
+):
+    monkeypatch.setattr(
+        "mlx_serve.core.decision_prepare.HfApi.model_info",
+        lambda *a, **k: SimpleNamespace(sha=REVISION, siblings=[SimpleNamespace(size=1000)]),
+    )
+    monkeypatch.setattr(
+        "mlx_serve.core.decision_prepare.shutil.disk_usage",
+        lambda path: SimpleNamespace(free=10),
+    )
+    events = [event async for event in prepare_d1(model_manager, SOURCE_REPO, "d1-test", REVISION)]
+    estimate = next(event for event in events if event["status"] == "checking")
+    assert estimate["estimate_basis"] == "repository_metadata"
+    assert estimate["estimated_disk_bytes"] == 1600 + 128 * 1024**2
+    assert estimate["free_disk_bytes"] == 10
+    assert events[-1]["status"] == "error"
+    assert "Insufficient free disk" in events[-1]["message"]
+    assert not (settings.models_dir / "d1-test").exists()
     assert not list(settings.models_dir.glob(".decision-prepare-*"))
 
 
@@ -601,7 +635,7 @@ def test_gateway_unloads_the_isolated_decision_worker(client, monkeypatch):
         "active_inference": [],
     }
 
-    def worker_request(url, method, body, headers):
+    def worker_request(url, method, body, headers, **kwargs):
         seen.append((url, method, json.loads(body)))
         payload = {
             "unloaded": [{"name": "d1-omni-600M", "type": "decision"}],
@@ -642,7 +676,7 @@ async def test_timed_out_inference_keeps_model_reserved_until_thread_finishes(mo
     monkeypatch.setattr("mlx_serve.core.model_manager.clear_mlx_cache", lambda **kwargs: True)
     transport = httpx.ASGITransport(app=create_app())
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
             response = await client.post(
                 "/v1/decisions",
                 json={
@@ -752,7 +786,7 @@ async def test_worker_delete_blocks_loading_then_removes_cached_model(preparatio
     monkeypatch.setattr(model_manager, "get_decision_model", load_model)
     transport = httpx.ASGITransport(app=create_app())
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
             running = asyncio.create_task(
                 client.post(
                     "/v1/decisions",
@@ -796,7 +830,7 @@ def test_gateway_deletes_in_worker_and_handles_worker_unavailable(preparation, m
     client.app.state.retrieval_worker_urls = {"decision": "http://worker"}
     calls = []
 
-    def unavailable(url, method, body, headers):
+    def unavailable(url, method, body, headers, **kwargs):
         raise urllib.error.URLError("worker down")
 
     monkeypatch.setattr("mlx_serve.routers.retrieval_proxy.perform_worker_request", unavailable)
@@ -804,7 +838,7 @@ def test_gateway_deletes_in_worker_and_handles_worker_unavailable(preparation, m
     assert response.status_code == 503
     assert (settings.models_dir / name).exists()
 
-    def worker_request(url, method, body, headers):
+    def worker_request(url, method, body, headers, **kwargs):
         calls.append((url, method, json.loads(body)))
         model_manager.delete_model("d1-omni")
         return WorkerProxyResponse(200, b'{"deleted": true}', {})

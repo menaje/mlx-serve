@@ -1,6 +1,7 @@
 """FastAPI server for mlx-serve."""
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -12,6 +13,11 @@ from fastapi.responses import JSONResponse
 from mlx_serve import __version__
 from mlx_serve.config import settings
 from mlx_serve.core.generation_workers import GenerationWorkerSupervisor
+from mlx_serve.core.local_access import (
+    is_local_management_request,
+    is_management_authorized,
+    is_management_path,
+)
 from mlx_serve.core.mlx_memory import get_mlx_memory_snapshot
 from mlx_serve.core.process_title import apply_process_title
 from mlx_serve.core.retrieval_workers import RetrievalWorkerSupervisor
@@ -43,6 +49,34 @@ apply_process_title()
 # Track active requests for graceful shutdown
 _active_requests: int = 0
 _shutting_down: bool = False
+
+
+def _redact_debug_body(body: bytes) -> str:
+    """Remove credentials even when the user opted into request-body logging."""
+    import json
+
+    def redact(value):
+        if isinstance(value, dict):
+            return {
+                key: "[redacted]" if re.search(
+                    r"(?i)(token|secret|password|api.?key|authorization)", str(key)
+                )
+                else redact(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, str):
+            value = re.sub(r"hf_[A-Za-z0-9_]+", "[redacted]", value)
+            return re.sub(r"(?i)Bearer\s+[^\s\"']+", "Bearer [redacted]", value)
+        return value
+
+    text = body.decode("utf-8", errors="replace")
+    try:
+        return json.dumps(redact(json.loads(text)), ensure_ascii=False, indent=2)
+    except (ValueError, TypeError):
+        # Malformed bodies cannot be safely inspected for structured secrets.
+        return "[unparseable request body omitted]"
 
 
 @asynccontextmanager
@@ -118,6 +152,9 @@ def _include_routers(app: FastAPI) -> None:
     generation_worker_kind = get_generation_worker_kind()
 
     if role == "worker":
+        from mlx_serve.routers.management import internal_router as worker_management_router
+
+        app.include_router(worker_management_router)
         if worker_kind == "embedding":
             app.include_router(embeddings_router)
             app.include_router(tokenize_router)
@@ -148,6 +185,9 @@ def _include_routers(app: FastAPI) -> None:
         app.include_router(decision_router)
     app.include_router(images_router)
     app.include_router(models_router)
+    from mlx_serve.routers.management import router as management_router
+
+    app.include_router(management_router)
     app.include_router(tokenize_router)
 
 
@@ -170,6 +210,10 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def track_requests(request: Request, call_next):
         global _active_requests
+        if is_management_path(request.url.path) and (
+            not is_local_management_request(request) or not is_management_authorized(request)
+        ):
+            return JSONResponse(status_code=403, content={"detail": "Local authorization required"})
         _active_requests += 1
 
         # Full request body logging is opt-in because it duplicates large payloads in memory.
@@ -180,23 +224,20 @@ def create_app() -> FastAPI:
             and request.method == "POST"
         ):
             try:
-                import json
+                import os
                 from pathlib import Path
 
                 body = await request.body()
-                body_str = body.decode("utf-8")
+                body_str = _redact_debug_body(body)
 
                 # Write to debug file
                 debug_file = Path.home() / ".mlx-serve" / "logs" / "request_debug.log"
                 debug_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(debug_file, "a") as f:
-                    f.write(f"\n\n========== REQUEST at {request.url} ==========\n")
+                fd = os.open(debug_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "a") as f:
+                    f.write(f"\n\n========== REQUEST at {request.url.path} ==========\n")
                     f.write(f"Body: {body_str}\n")
-                    try:
-                        body_json = json.loads(body_str)
-                        f.write(f"Parsed JSON:\n{json.dumps(body_json, indent=2)}\n")
-                    except json.JSONDecodeError:
-                        pass
                     f.write("==================================\n\n")
 
                 logger.debug("[REQUEST BODY] /v1/chat/completions captured")
@@ -221,37 +262,10 @@ def create_app() -> FastAPI:
         request: Request,
         exc: RequestValidationError,
     ) -> JSONResponse:
-        # Log the full request body and validation errors
+        # Validation errors may contain the original input, including credentials
+        # and prompts.  Return them to the caller, but never copy them to logs.
         errors = jsonable_encoder(exc.errors(), custom_encoder={Exception: str})
-        body = None
-        try:
-            import json
-            from pathlib import Path
-
-            body = await request.body()
-            body_str = body.decode("utf-8")
-
-            # Write to debug file
-            debug_file = Path.home() / ".mlx-serve" / "logs" / "validation_errors.log"
-            debug_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(debug_file, "a") as f:
-                f.write(f"\n\n========== VALIDATION ERROR at {request.url.path} ==========\n")
-                f.write(f"Timestamp: {__import__('datetime').datetime.now()}\n")
-                f.write(f"Request body: {body_str}\n")
-                try:
-                    body_json = json.loads(body_str)
-                    f.write(f"Parsed JSON:\n{json.dumps(body_json, indent=2)}\n")
-                except json.JSONDecodeError:
-                    pass
-                f.write(f"Validation errors:\n{json.dumps(errors, indent=2)}\n")
-                f.write("==================================\n\n")
-
-            logger.error(f"[VALIDATION ERROR] Request to {request.url.path}")
-            logger.error(f"[VALIDATION ERROR] Request body: {body_str}")
-            logger.error(f"[VALIDATION ERROR] Validation errors: {exc.errors()}")
-        except Exception as e:
-            logger.error(f"[VALIDATION ERROR] Could not read request body: {e}")
-            logger.error(f"[VALIDATION ERROR] Validation errors: {exc.errors()}")
+        logger.warning("Request validation failed (%s errors)", len(errors))
 
         return JSONResponse(
             status_code=422,
@@ -261,7 +275,7 @@ def create_app() -> FastAPI:
     # Global exception handler for OpenAI-compatible errors
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        logger.error(f"Unhandled exception: {exc}")
+        logger.error("Unhandled exception (%s)", type(exc).__name__)
         return JSONResponse(
             status_code=500,
             content={

@@ -175,8 +175,9 @@ def load_yaml_config(config_path: Path | None = None) -> dict[str, Any]:
             config = yaml.safe_load(f) or {}
         logger.info(f"Loaded config from {config_path}")
         return config
-    except yaml.YAMLError as e:
-        logger.error(f"Failed to parse config file {config_path}: {e}")
+    except yaml.YAMLError:
+        # Parser exceptions can include source lines, including credentials.
+        logger.error("Failed to parse config file %s", config_path)
         return {}
     except Exception as e:
         logger.error(f"Failed to load config file {config_path}: {e}")

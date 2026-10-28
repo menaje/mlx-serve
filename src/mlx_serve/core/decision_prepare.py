@@ -23,6 +23,7 @@ from huggingface_hub import HfApi, snapshot_download
 
 from mlx_serve.config import settings
 from mlx_serve.core.decision_prepare_worker import MANIFEST, MLX_REPO, SOURCE_REPO, file_hash
+from mlx_serve.core.storage_access import model_volume_mounted
 
 logger = logging.getLogger(__name__)
 SUPPORTED_REPOS = {SOURCE_REPO, MLX_REPO}
@@ -109,6 +110,9 @@ async def prepare_d1(
         name = resolve_decision_install_name(name, repo)
     except ValueError as exc:
         yield {"status": "error", "message": str(exc)}
+        return
+    if not model_volume_mounted(settings.models_dir):
+        yield {"status": "error", "message": "Model storage is unavailable"}
         return
     model_dir = manager._get_model_dir(name)
     lock_dir = settings.models_dir / ".decision-locks"
@@ -198,13 +202,23 @@ async def prepare_d1(
                 ):
                     reusable = (candidate_dir, original_path)
                     break
-            stage = Path(tempfile.mkdtemp(prefix=".decision-prepare-", dir=settings.models_dir))
+            job_id = os.environ.get("MLX_SERVE_PREPARE_JOB_ID", "")
+            job_prefix = f"{job_id}-" if re.fullmatch(r"[0-9a-f]{32}", job_id) else ""
+            stage = Path(
+                tempfile.mkdtemp(prefix=f".decision-prepare-{job_prefix}", dir=settings.models_dir)
+            )
             source, artifact = stage / "source", stage / "artifact"
             if reusable is not None:
                 copy_size = await asyncio.to_thread(_directory_size, reusable[0])
+                free = shutil.disk_usage(settings.models_dir).free
+                yield {
+                    "status": "checking", "name": name,
+                    "estimated_disk_bytes": copy_size, "free_disk_bytes": free,
+                    "estimate_basis": "verified_copy",
+                }
                 if copy_size > settings.decision_prepare_max_disk_bytes:
                     raise ValueError("Model preparation exceeds the configured disk limit")
-                if shutil.disk_usage(settings.models_dir).free < copy_size:
+                if free < copy_size:
                     raise ValueError("Insufficient free disk space to reuse decision model")
                 yield {
                     "status": "validating",
@@ -212,14 +226,29 @@ async def prepare_d1(
                     "detail": "Reusing a verified model with the same revision",
                 }
                 await asyncio.to_thread(shutil.copytree, reusable[0], artifact)
+                yield {
+                    "status": "resources", "name": name,
+                    "temporary_file_bytes": await asyncio.to_thread(_directory_size, stage),
+                }
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Decision model preparation exceeded its time limit")
             else:
-                total = sum((getattr(item, "size", 0) or 0) for item in (info.siblings or []))
+                siblings = info.siblings or []
+                total = sum((getattr(item, "size", 0) or 0) for item in siblings)
                 expected = int(total * (1.6 if repo == SOURCE_REPO else 1.1)) + 128 * 1024**2
+                free = shutil.disk_usage(settings.models_dir).free
+                complete_sizes = bool(siblings) and all(
+                    getattr(item, "size", None) is not None for item in siblings
+                )
+                yield {
+                    "status": "checking", "name": name,
+                    "estimated_disk_bytes": expected, "free_disk_bytes": free,
+                    "estimate_basis": "repository_metadata" if complete_sizes
+                    else "partial_repository_metadata",
+                }
                 if expected > settings.decision_prepare_max_disk_bytes:
                     raise ValueError("Model preparation exceeds the configured disk limit")
-                if shutil.disk_usage(settings.models_dir).free < expected:
+                if free < expected:
                     raise ValueError("Insufficient free disk space for decision model preparation")
                 environment = os.environ.copy()
                 package_root = str(Path(__file__).resolve().parents[2])
@@ -241,6 +270,8 @@ async def prepare_d1(
                 assert process.stdout is not None
                 error = None
                 last_check = 0.0
+                last_report = 0.0
+                last_reported_disk: int | None = None
                 while True:
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Decision model preparation exceeded its time limit")
@@ -256,6 +287,14 @@ async def prepare_d1(
                         if disk > settings.decision_prepare_max_disk_bytes:
                             raise ValueError("Decision model preparation exceeded its disk limit")
                         last_check = time.monotonic()
+                        if last_check - last_report >= 10 and disk != last_reported_disk:
+                            # A logical file size, not a download percentage or prediction.
+                            yield {
+                                "status": "resources", "name": name,
+                                "temporary_file_bytes": disk,
+                            }
+                            last_report = last_check
+                            last_reported_disk = disk
                     try:
                         line = await asyncio.wait_for(process.stdout.readline(), timeout=0.5)
                     except TimeoutError:
@@ -285,6 +324,7 @@ async def prepare_d1(
                 "precision": "float16",
                 "architecture": "d1_omni",
             }
+            yield {"status": "registering", "name": name}
             metadata_lock = settings.models_dir.parent / ".decision-metadata.lock"
             with metadata_lock.open("a+") as registration_lock:
                 while True:
@@ -348,6 +388,9 @@ async def prepare_d1(
 
 async def prepare_d3(manager: Any, repo: str, name: str) -> AsyncIterator[dict[str, Any]]:
     """Download D3 into a private staging directory before publishing it."""
+    if not model_volume_mounted(settings.models_dir):
+        yield {"status": "error", "message": "Model storage is unavailable"}
+        return
     model_dir = manager._get_model_dir(name)
     if model_dir.exists():
         yield {
