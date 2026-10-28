@@ -121,3 +121,15 @@ async def proxy_embeddings(request: Request) -> Response:
 async def proxy_rerank(request: Request) -> Response:
     """Forward rerank requests to the isolated reranker worker."""
     return await forward_to_retrieval_worker(request, "reranker")
+
+
+@router.post("/v1/systemone")
+async def proxy_decision(request: Request) -> Response:
+    """Forward decision requests to the isolated decision worker."""
+    return await forward_to_retrieval_worker(request, "decision")
+
+
+@router.post("/v1/decisions")
+async def proxy_decisions(request: Request) -> Response:
+    """Forward typed decision requests to the isolated decision worker."""
+    return await forward_to_retrieval_worker(request, "decision")

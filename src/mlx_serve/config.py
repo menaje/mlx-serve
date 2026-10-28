@@ -70,6 +70,23 @@ class Settings(BaseSettings):
         default=2,
         description="Maximum number of reranker models to keep in cache (LRU)",
     )
+    cache_max_decision_models: int = Field(
+        default=1,
+        description="Maximum number of decision models to keep in cache (LRU)",
+        ge=1,
+    )
+    decision_max_input_tokens: int = Field(
+        default=4096,
+        description="Maximum tokens in an individual decision question prompt",
+        ge=1,
+    )
+    decision_prepare_timeout_seconds: float = Field(default=3600, gt=0)
+    decision_prepare_max_memory_bytes: int = Field(default=10 * 1024**3, gt=0)
+    decision_prepare_max_disk_bytes: int = Field(default=8 * 1024**3, gt=0)
+    decision_prepare_python: str | None = Field(
+        default=None, description="Optional Python executable for isolated decision conversion"
+    )
+    decision_execution_timeout_seconds: float = Field(default=120, gt=0)
     cache_max_llm_models: int = Field(
         default=1,
         description="Maximum number of LLM models to keep in cache (LRU)",

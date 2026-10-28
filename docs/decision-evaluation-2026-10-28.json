@@ -1,0 +1,496 @@
+{
+  "date": "2026-10-28",
+  "hardware": "Apple M2, 16 GiB unified memory",
+  "method": "Six fixed Korean examples in scripts/evaluate_decisions.py; score is correct if the highest-probability level matches the expected level.",
+  "models": {
+    "d1": {
+      "architecture": "d1_omni",
+      "load_seconds": 0.9332,
+      "peak_rss_bytes": 1726824448,
+      "peak_mlx_bytes": 1269578902,
+      "correct": 4,
+      "total": 6,
+      "cases": [
+        {
+          "id": "document_type",
+          "expected": "support",
+          "predicted": "receipt",
+          "correct": false,
+          "answer": {
+            "type": "choice",
+            "value": "receipt",
+            "probabilities": {
+              "support": 0.2395,
+              "minutes": 0.3676,
+              "receipt": 0.3929
+            },
+            "metadata": {
+              "confidence": 0.3929
+            }
+          },
+          "elapsed_seconds": 0.0762,
+          "usage": {
+            "input_tokens": 67,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "note_topic",
+          "expected": "development",
+          "predicted": "development",
+          "correct": true,
+          "answer": {
+            "type": "choice",
+            "value": "development",
+            "probabilities": {
+              "payroll": 0.0155,
+              "development": 0.98,
+              "travel": 0.0045
+            },
+            "metadata": {
+              "confidence": 0.98
+            }
+          },
+          "elapsed_seconds": 0.0234,
+          "usage": {
+            "input_tokens": 63,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "task_route",
+          "expected": "technical",
+          "predicted": "technical",
+          "correct": true,
+          "answer": {
+            "type": "choice",
+            "value": "technical",
+            "probabilities": {
+              "billing": 0.0905,
+              "technical": 0.9095
+            },
+            "metadata": {
+              "confidence": 0.9095
+            }
+          },
+          "elapsed_seconds": 0.0228,
+          "usage": {
+            "input_tokens": 62,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "condition_true",
+          "expected": true,
+          "predicted": true,
+          "correct": true,
+          "answer": {
+            "type": "bool",
+            "value": true,
+            "probability": 0.7688
+          },
+          "elapsed_seconds": 0.0355,
+          "usage": {
+            "input_tokens": 68,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "condition_false",
+          "expected": false,
+          "predicted": true,
+          "correct": false,
+          "answer": {
+            "type": "bool",
+            "value": true,
+            "probability": 0.5688
+          },
+          "elapsed_seconds": 0.0217,
+          "usage": {
+            "input_tokens": 64,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "priority",
+          "expected": 2,
+          "predicted": 2,
+          "correct": true,
+          "answer": {
+            "type": "score",
+            "value": 1.1161,
+            "probabilities": {
+              "0": 0.2646,
+              "1": 0.3546,
+              "2": 0.3808
+            },
+            "metadata": {
+              "confidence": 0.3808,
+              "legend": {
+                "0": "낮음",
+                "1": "보통",
+                "2": "높음"
+              }
+            }
+          },
+          "elapsed_seconds": 0.0363,
+          "usage": {
+            "input_tokens": 76,
+            "output_tokens": 0
+          }
+        }
+      ],
+      "source_revision": "02b55d7076f15129e59ab3f94783f32c4b088674",
+      "reference_mlx_revision": "05e99e49eb1799f1f9f98ec619b6fef2b0dd0960",
+      "original_vs_converted_max_probability_difference": 0.0001,
+      "official_fp16_vs_server_max_probability_difference": 0.0
+    },
+    "laya": {
+      "architecture": "laya",
+      "load_seconds": 1.8991,
+      "peak_rss_bytes": 1929084928,
+      "peak_mlx_bytes": 699520807,
+      "correct": 6,
+      "total": 6,
+      "cases": [
+        {
+          "id": "document_type",
+          "expected": "support",
+          "predicted": "support",
+          "correct": true,
+          "answer": {
+            "type": "choice",
+            "value": "support",
+            "probabilities": {
+              "support": 0.5261,
+              "minutes": 0.0036,
+              "receipt": 0.4702
+            },
+            "metadata": {
+              "rl_agent": {
+                "act_probability": 1.0
+              },
+              "confidence": 0.3509
+            }
+          },
+          "elapsed_seconds": 0.1213,
+          "usage": {
+            "input_tokens": 61,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "note_topic",
+          "expected": "development",
+          "predicted": "development",
+          "correct": true,
+          "answer": {
+            "type": "choice",
+            "value": "development",
+            "probabilities": {
+              "payroll": 0.0012,
+              "development": 0.9977,
+              "travel": 0.0011
+            },
+            "metadata": {
+              "rl_agent": {
+                "act_probability": 1.0
+              },
+              "confidence": 0.9836
+            }
+          },
+          "elapsed_seconds": 0.0296,
+          "usage": {
+            "input_tokens": 57,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "task_route",
+          "expected": "technical",
+          "predicted": "technical",
+          "correct": true,
+          "answer": {
+            "type": "choice",
+            "value": "technical",
+            "probabilities": {
+              "billing": 0.0001,
+              "technical": 0.9999
+            },
+            "metadata": {
+              "rl_agent": {
+                "act_probability": 1.0
+              },
+              "confidence": 0.9985
+            }
+          },
+          "elapsed_seconds": 0.0202,
+          "usage": {
+            "input_tokens": 58,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "condition_true",
+          "expected": true,
+          "predicted": true,
+          "correct": true,
+          "answer": {
+            "type": "bool",
+            "value": true,
+            "probability": 0.9915,
+            "metadata": {
+              "rl_agent": {
+                "act_probability": 1.0
+              }
+            }
+          },
+          "elapsed_seconds": 0.0292,
+          "usage": {
+            "input_tokens": 71,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "condition_false",
+          "expected": false,
+          "predicted": false,
+          "correct": true,
+          "answer": {
+            "type": "bool",
+            "value": false,
+            "probability": 0.0456,
+            "metadata": {
+              "rl_agent": {
+                "act_probability": 1.0
+              }
+            }
+          },
+          "elapsed_seconds": 0.0172,
+          "usage": {
+            "input_tokens": 63,
+            "output_tokens": 0
+          }
+        },
+        {
+          "id": "priority",
+          "expected": 2,
+          "predicted": 2,
+          "correct": true,
+          "answer": {
+            "type": "score",
+            "value": 1.0887,
+            "probabilities": {
+              "0": 0.2826,
+              "1": 0.3462,
+              "2": 0.3713
+            },
+            "metadata": {
+              "rl_agent": {
+                "act_probability": 1.0
+              },
+              "confidence": 0.0058,
+              "legend": {
+                "0": "낮음",
+                "1": "보통",
+                "2": "높음"
+              }
+            }
+          },
+          "elapsed_seconds": 0.0223,
+          "usage": {
+            "input_tokens": 73,
+            "output_tokens": 0
+          }
+        }
+      ],
+      "source_revision": "b68ecaf6ff6d1e8a5b60aa20c4e07a61cd4cb2e0",
+      "pytorch_vs_mlx_max_probability_difference": 0.0019
+    },
+    "kev": {
+      "model": "jaredpalmer/kev-0.8b",
+      "backend": "mlx",
+      "correct": 6,
+      "total": 6,
+      "cases": [
+        {
+          "id": "document_type",
+          "expected": "support",
+          "predicted": "support",
+          "correct": true,
+          "answer": {
+            "type": "choice",
+            "choice": "support",
+            "confidence": 0.9245,
+            "probabilities": {
+              "support": 0.9496,
+              "minutes": 0.0213,
+              "receipt": 0.0291
+            }
+          },
+          "elapsed_seconds": 0.111
+        },
+        {
+          "id": "note_topic",
+          "expected": "development",
+          "predicted": "development",
+          "correct": true,
+          "answer": {
+            "type": "choice",
+            "choice": "development",
+            "confidence": 0.9869,
+            "probabilities": {
+              "payroll": 0.0039,
+              "development": 0.9912,
+              "travel": 0.0048
+            }
+          },
+          "elapsed_seconds": 0.0815
+        },
+        {
+          "id": "task_route",
+          "expected": "technical",
+          "predicted": "technical",
+          "correct": true,
+          "answer": {
+            "type": "choice",
+            "choice": "technical",
+            "confidence": 0.9829,
+            "probabilities": {
+              "billing": 0.0085,
+              "technical": 0.9915
+            }
+          },
+          "elapsed_seconds": 0.2262
+        },
+        {
+          "id": "condition_true",
+          "expected": true,
+          "predicted": true,
+          "correct": true,
+          "answer": {
+            "type": "noul",
+            "noul": 0.5951
+          },
+          "elapsed_seconds": 0.0797
+        },
+        {
+          "id": "condition_false",
+          "expected": false,
+          "predicted": false,
+          "correct": true,
+          "answer": {
+            "type": "noul",
+            "noul": 0.4355
+          },
+          "elapsed_seconds": 0.0764
+        },
+        {
+          "id": "priority",
+          "expected": 2,
+          "predicted": 2,
+          "correct": true,
+          "answer": {
+            "type": "score",
+            "score": 1.545,
+            "legend": {
+              "0": "낮음",
+              "1": "보통",
+              "2": "높음"
+            },
+            "probabilities": {
+              "0": 0.1478,
+              "1": 0.1595,
+              "2": 0.6927
+            },
+            "confidence": 0.3175
+          },
+          "elapsed_seconds": 0.0856
+        }
+      ],
+      "source_revision": "bf75a6a8848ea6960ff2ed108d9ed44c2941174f",
+      "backbone_revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+      "code_revision": "2074cc44256200bb37540103fa4572901faa10f3"
+    }
+  },
+  "laya_pytorch_answers": {
+    "document_type": {
+      "type": "choice",
+      "choice": "support",
+      "probabilities": {
+        "support": 0.528,
+        "minutes": 0.0037,
+        "receipt": 0.4684
+      },
+      "confidence": 0.351,
+      "answer_confidence": 0.528,
+      "action": {
+        "act_probability": 1.0
+      }
+    },
+    "note_topic": {
+      "type": "choice",
+      "choice": "development",
+      "probabilities": {
+        "payroll": 0.0012,
+        "development": 0.9977,
+        "travel": 0.0011
+      },
+      "confidence": 0.9835,
+      "answer_confidence": 0.9977,
+      "action": {
+        "act_probability": 1.0
+      }
+    },
+    "task_route": {
+      "type": "choice",
+      "choice": "technical",
+      "probabilities": {
+        "billing": 0.0001,
+        "technical": 0.9999
+      },
+      "confidence": 0.9985,
+      "answer_confidence": 0.9999,
+      "action": {
+        "act_probability": 1.0
+      }
+    },
+    "condition_true": {
+      "type": "noul",
+      "noul": 0.9915,
+      "confidence": 0.9915,
+      "answer_confidence": 0.9915,
+      "action": {
+        "act_probability": 1.0
+      }
+    },
+    "condition_false": {
+      "type": "noul",
+      "noul": 0.0455,
+      "confidence": 0.9545,
+      "answer_confidence": 0.9545,
+      "action": {
+        "act_probability": 1.0
+      }
+    },
+    "priority": {
+      "type": "score",
+      "score": 1.0886,
+      "legend": {
+        "0": "낮음",
+        "1": "보통",
+        "2": "높음"
+      },
+      "probabilities": {
+        "0": 0.2827,
+        "1": 0.3461,
+        "2": 0.3712
+      },
+      "confidence": 0.0058,
+      "answer_confidence": 0.3712,
+      "action": {
+        "act_probability": 1.0
+      }
+    }
+  }
+}

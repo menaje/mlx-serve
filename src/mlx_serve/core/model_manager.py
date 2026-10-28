@@ -3,7 +3,9 @@
 import gc
 import json
 import logging
+import os
 import shutil
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -32,7 +34,7 @@ from mlx_serve.core.system_guard import collect_memory_snapshot
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["embedding", "reranker", "llm", "vlm", "tts", "stt", "image_gen"]
+ModelType = Literal["embedding", "reranker", "decision", "llm", "vlm", "tts", "stt", "image_gen"]
 ModelUnloadHook = Callable[[ModelType, str, str], None]
 
 _model_unload_hooks: list[ModelUnloadHook] = []
@@ -45,8 +47,16 @@ def register_model_unload_hook(hook: ModelUnloadHook) -> None:
         if hook not in _model_unload_hooks:
             _model_unload_hooks.append(hook)
 
+
 # Model aliases for short names
 MODEL_ALIASES: dict[str, tuple[str, ModelType]] = {
+    "d1-omni": ("LiquidAI/d1-omni-600M", "decision"),
+    "d1-omni-600m": ("LiquidAI/d1-omni-600M", "decision"),
+    "liquidai/d1-omni-600m": ("LiquidAI/d1-omni-600M", "decision"),
+    "liquidai/d1-omni-600m-mlx-fp16": ("LiquidAI/d1-omni-600M-MLX-fp16", "decision"),
+    "d3-lite": ("vllm-sr/d3-lite", "decision"),
+    "d3-lite:0.8b-mlx-bf16": ("vllm-sr/d3-lite", "decision"),
+    "vllm-sr/d3-lite": ("vllm-sr/d3-lite", "decision"),
     # Embedding models
     "qwen-embedding": ("Qwen/Qwen3-Embedding-0.6B", "embedding"),
     "qwen-embedding-0.6b": ("Qwen/Qwen3-Embedding-0.6B", "embedding"),
@@ -252,6 +262,10 @@ class ModelManager:
             maxsize=settings.cache_max_reranker_models,
             ttl=settings.cache_ttl_seconds,
         )
+        self._decision_cache = TTLLRUCache(
+            maxsize=settings.cache_max_decision_models,
+            ttl=settings.cache_ttl_seconds,
+        )
         self._llm_cache = TTLLRUCache(
             maxsize=settings.cache_max_llm_models,
             ttl=settings.cache_ttl_seconds,
@@ -293,6 +307,7 @@ class ModelManager:
                 caches = [
                     ("embedding", self._embedding_cache),
                     ("reranker", self._reranker_cache),
+                    ("decision", self._decision_cache),
                     ("llm", self._llm_cache),
                     ("vlm", self._vlm_cache),
                     ("tts", self._tts_cache),
@@ -323,7 +338,17 @@ class ModelManager:
     def _save_metadata(self) -> None:
         """Save model metadata to disk."""
         self._metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        self._metadata_path.write_text(json.dumps(self._metadata, indent=2))
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self._metadata_path.parent, delete=False
+            ) as file:
+                temporary = Path(file.name)
+                json.dump(self._metadata, file, indent=2)
+            os.replace(temporary, self._metadata_path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def _get_load_lock(self, key: str) -> threading.Lock:
         """Get a per-model lock for cache misses and model loading."""
@@ -344,6 +369,7 @@ class ModelManager:
         return {
             "embedding": self._embedding_cache,
             "reranker": self._reranker_cache,
+            "decision": self._decision_cache,
             "llm": self._llm_cache,
             "vlm": self._vlm_cache,
             "tts": self._tts_cache,
@@ -359,11 +385,7 @@ class ModelManager:
             snapshot = inference_controller.snapshot()
         except Exception:
             return set()
-        return {
-            key
-            for key, state in snapshot.items()
-            if int(state.get("active", 0)) > 0
-        }
+        return {key for key, state in snapshot.items() if int(state.get("active", 0)) > 0}
 
     def _model_inference_key(self, model_type: ModelType, model_name: str) -> str:
         """Build the cache/inference key form without importing inference_control."""
@@ -585,9 +607,13 @@ class ModelManager:
                 last_error = exc
 
         target_key = self._model_inference_key(model_type, model_name)
-        for _estimated_bytes, _last_used, candidate_type, key, cache in (
-            self._idle_eviction_candidates({target_key})
-        ):
+        for (
+            _estimated_bytes,
+            _last_used,
+            candidate_type,
+            key,
+            cache,
+        ) in self._idle_eviction_candidates({target_key}):
             if not self._evict_idle_model(
                 candidate_type,
                 key,
@@ -686,9 +712,13 @@ class ModelManager:
             self._model_inference_key(model_type, resolved_name),
             self._model_inference_key(model_type, model_name),
         }
-        for _estimated_bytes, _last_used, candidate_type, key, cache in (
-            self._idle_eviction_candidates(target_keys)
-        ):
+        for (
+            _estimated_bytes,
+            _last_used,
+            candidate_type,
+            key,
+            cache,
+        ) in self._idle_eviction_candidates(target_keys):
             if not self._evict_idle_model(
                 candidate_type,
                 key,
@@ -741,13 +771,8 @@ class ModelManager:
         after_snapshot = collect_memory_snapshot()
         after_mlx = get_mlx_memory_snapshot()
         observed_candidates: list[int] = []
-        if (
-            before_process_rss_bytes is not None
-            and after_snapshot.process_rss_bytes is not None
-        ):
-            observed_candidates.append(
-                after_snapshot.process_rss_bytes - before_process_rss_bytes
-            )
+        if before_process_rss_bytes is not None and after_snapshot.process_rss_bytes is not None:
+            observed_candidates.append(after_snapshot.process_rss_bytes - before_process_rss_bytes)
         after_mlx_active = after_mlx.get("active_bytes") if after_mlx.get("available") else None
         if before_mlx_active_bytes is not None and after_mlx_active is not None:
             observed_candidates.append(int(after_mlx_active) - before_mlx_active_bytes)
@@ -827,6 +852,7 @@ class ModelManager:
 
     def get_model_info(self, model_name: str) -> ModelInfo | None:
         """Get information about a specific model."""
+        model_name, _, _ = resolve_model_alias(model_name)
         if model_name not in self._metadata:
             return None
 
@@ -847,6 +873,7 @@ class ModelManager:
 
     def is_model_installed(self, model_name: str) -> bool:
         """Check if a model is installed."""
+        model_name, _, _ = resolve_model_alias(model_name)
         return model_name in self._metadata and self._get_model_dir(model_name).exists()
 
     def get_model_type(self, model_name: str) -> ModelType | None:
@@ -863,6 +890,7 @@ class ModelManager:
         model_name: str | None = None,
         quantize: int | None = None,
         keep_original: bool = False,
+        revision: str | None = None,
     ) -> AsyncIterator[dict]:
         """
         Download and convert a model from Hugging Face to MLX format.
@@ -876,8 +904,31 @@ class ModelManager:
 
         Yields status updates during the process.
         """
+        resolved_name, resolved_repo, resolved_type = resolve_model_alias(hf_repo)
+        if resolved_type is not None:
+            hf_repo = resolved_repo
         if model_name is None:
-            model_name = hf_repo.split("/")[-1]
+            model_name = resolved_name.split("/")[-1]
+
+        if model_type == "decision" and quantize is not None:
+            yield {"status": "error", "message": "Decision model quantization is not supported"}
+            return
+
+        if model_type == "decision":
+            from mlx_serve.core.decision_prepare import SUPPORTED_REPOS, prepare_d1
+
+            if hf_repo in SUPPORTED_REPOS:
+                async for status in prepare_d1(
+                    self, hf_repo, model_name, revision, keep_original=keep_original
+                ):
+                    yield status
+                return
+            if hf_repo != "vllm-sr/d3-lite":
+                yield {"status": "error", "message": "Unsupported decision model architecture"}
+                return
+        if revision is not None:
+            yield {"status": "error", "message": "Revision selection is supported for d1 only"}
+            return
 
         # Add quantization suffix to model name
         if quantize:
@@ -886,6 +937,12 @@ class ModelManager:
             output_name = model_name
 
         model_dir = self._get_model_dir(output_name)
+        if model_type == "decision" and model_dir.exists():
+            yield {
+                "status": "error",
+                "message": f"Model '{output_name}' already exists; remove it before pulling again",
+            }
+            return
 
         try:
             yield {"status": "downloading", "name": output_name, "hf_repo": hf_repo}
@@ -893,14 +950,18 @@ class ModelManager:
             # Check if model is already in MLX format (from mlx-community etc)
             is_mlx_model = self._is_mlx_format_repo(hf_repo)
 
-            if is_mlx_model and not quantize:
+            if (is_mlx_model or model_type == "decision") and not quantize:
                 # MLX model without quantization: direct download
                 snapshot_download(
                     repo_id=hf_repo,
                     local_dir=str(model_dir),
-                    local_dir_use_symlinks=False,
                 )
-                yield {"status": "converting", "name": output_name, "detail": "Already MLX format"}
+                detail = (
+                    "Decision model checkpoint ready"
+                    if model_type == "decision"
+                    else "Already MLX format"
+                )
+                yield {"status": "converting", "name": output_name, "detail": detail}
             else:
                 # Need conversion: download to temp then convert
                 yield {"status": "converting", "name": output_name}
@@ -970,7 +1031,7 @@ class ModelManager:
                     )
                     delete_strategy.execute()
                     # Log cleanup (freed_size_str may not exist in all versions)
-                    freed_size = getattr(delete_strategy, 'freed_size_str', 'unknown size')
+                    freed_size = getattr(delete_strategy, "freed_size_str", "unknown size")
                     logger.info(f"Cleaned up HF cache for {hf_repo}: freed {freed_size}")
                     return True
 
@@ -1039,14 +1100,12 @@ class ModelManager:
                         snapshot_download(
                             repo_id=hf_repo,
                             local_dir=str(output_dir),
-                            local_dir_use_symlinks=False,
                         )
                 else:
                     # For tts, stt, image_gen: direct download (specialized formats)
                     snapshot_download(
                         repo_id=hf_repo,
                         local_dir=str(output_dir),
-                        local_dir_use_symlinks=False,
                     )
 
                 return True
@@ -1058,6 +1117,7 @@ class ModelManager:
 
     def delete_model(self, model_name: str) -> bool:
         """Delete a model from disk."""
+        model_name, _, _ = resolve_model_alias(model_name)
         model_dir = self._get_model_dir(model_name)
 
         # Remove from all caches
@@ -1103,9 +1163,7 @@ class ModelManager:
             cache = self._cache_map()[target_type]
             inference_key = self._model_inference_key(target_type, resolved_name)
             if inference_key in active_keys and resolved_name in cache.keys():
-                raise ModelInUseError(
-                    f"Model '{resolved_name}' is active and cannot be unloaded"
-                )
+                raise ModelInUseError(f"Model '{resolved_name}' is active and cannot be unloaded")
             if cache.remove(resolved_name):
                 self._notify_cached_model_removed(
                     target_type,
@@ -1285,6 +1343,61 @@ class ModelManager:
                 before_mlx_active,
             )
             return model, tokenizer
+
+    def get_decision_model(self, model_name: str) -> Any:
+        """Load and cache a native MLX decision model."""
+        resolved_name, hf_repo, _ = resolve_model_alias(model_name)
+        self._cleanup_expired_cache("decision", self._decision_cache, "expired decision cache")
+        cached = self._decision_cache.get(resolved_name)
+        if cached is not None:
+            return cached
+
+        with self._get_load_lock(f"decision:{resolved_name}"):
+            cached = self._decision_cache.get(resolved_name)
+            if cached is not None:
+                return cached
+            model_dir = self._get_model_dir(resolved_name)
+            if not model_dir.exists():
+                if not settings.auto_download or not self._auto_download_model(
+                    hf_repo, "decision", resolved_name
+                ):
+                    raise FileNotFoundError(f"Decision model '{model_name}' is not installed")
+            installed_type = self.get_model_type(resolved_name)
+            if installed_type is not None and installed_type != "decision":
+                raise ValueError(f"Model '{model_name}' is type '{installed_type}', not decision")
+
+            self._ensure_load_memory_available("decision", resolved_name, model_dir)
+            before_rss, before_mlx = self._memory_calibration_baseline()
+            try:
+                config = json.loads((model_dir / "config.json").read_text())
+                if config.get("model_type") == "d1_omni":
+                    from mlx_serve.core.d1_decision import D1DecisionModel
+                    from mlx_serve.core.decision_prepare import read_verified_manifest
+
+                    if installed_type is None:
+                        # The CLI or a separate worker may have installed it since startup.
+                        self._load_metadata()
+                        installed_type = self.get_model_type(resolved_name)
+                    if installed_type != "decision":
+                        raise ValueError("Decision model has not been registered")
+                    manifest = read_verified_manifest(model_dir)
+                    metadata = self._metadata[resolved_name]
+                    if (
+                        metadata.get("revision") != manifest["revision"]
+                        or metadata.get("hf_repo") != manifest["source_repo"]
+                    ):
+                        raise ValueError("Decision model metadata does not match its manifest")
+                    model = D1DecisionModel(model_dir)
+                else:
+                    from mlx_serve.core.decision import D3DecisionModel
+
+                    model = D3DecisionModel(model_dir)
+            except Exception:
+                self._forget_model_estimate("decision", resolved_name)
+                raise
+            self._cache_loaded_model("decision", resolved_name, self._decision_cache, model)
+            self._calibrate_loaded_model_estimate("decision", resolved_name, before_rss, before_mlx)
+            return model
 
     def get_llm_model(self, model_name: str) -> Any:
         """Get or load an LLM model for text generation.
@@ -1524,20 +1637,25 @@ class ModelManager:
                     self._ensure_load_memory_available(
                         "image_gen",
                         resolved_name,
-                            estimated_weight_bytes=estimated_bytes,
-                        )
+                        estimated_weight_bytes=estimated_bytes,
+                    )
 
             # For FLUX models, we use mflux which handles model loading differently
             logger.info(f"Loading image generation model: {resolved_name}")
             before_process_rss, before_mlx_active = self._memory_calibration_baseline()
 
-            from mflux import Flux1
+            from mflux.models.common.config import ModelConfig
+            from mflux.models.flux.variants.txt2img.flux import Flux1
 
             # Determine model variant from alias
             if "schnell" in resolved_name.lower() or "schnell" in hf_repo.lower():
-                model = Flux1.from_alias("flux1-schnell")
+                model_config = ModelConfig.schnell()
             else:
-                model = Flux1.from_alias("flux1-dev")
+                model_config = ModelConfig.dev()
+            model = Flux1(
+                model_config=model_config,
+                model_path=str(model_dir) if model_dir.exists() else None,
+            )
 
             self._cache_loaded_model(
                 "image_gen",
@@ -1583,16 +1701,23 @@ class ModelManager:
             async def _download():
                 async for status in self.pull_model(hf_repo, model_type, model_name):
                     if status["status"] == "error":
-                        err_msg = status.get('message', 'Unknown error')
+                        err_msg = status.get("message", "Unknown error")
                         logger.error(f"Auto-download failed: {err_msg}")
                         return False
                     elif status["status"] == "success":
                         return True
                 return False
 
+            async def _bounded_download():
+                try:
+                    return await asyncio.wait_for(_download(), timeout=timeout)
+                except TimeoutError:
+                    logger.error("Auto-download timed out after %ss for %s", timeout, hf_repo)
+                    return False
+
             # Use ThreadPoolExecutor to run with timeout
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, _download())
+                future = executor.submit(asyncio.run, _bounded_download())
                 try:
                     return future.result(timeout=timeout)
                 except concurrent.futures.TimeoutError:
@@ -1605,6 +1730,7 @@ class ModelManager:
 
     def get_cache_stats(self) -> dict:
         """Get cache statistics."""
+
         def cache_payload(
             model_type: ModelType,
             cache: TTLLRUCache,
@@ -1657,6 +1783,9 @@ class ModelManager:
                 self._reranker_cache,
                 settings.cache_max_reranker_models,
             ),
+            "decision_models": cache_payload(
+                "decision", self._decision_cache, settings.cache_max_decision_models
+            ),
             "ttl_seconds": settings.cache_ttl_seconds,
             "active_inference": sorted(self._active_inference_keys()),
             "mlx_memory": get_mlx_memory_snapshot(),
@@ -1686,6 +1815,7 @@ class ModelManager:
             loaders = {
                 "embedding": self.get_embedding_model,
                 "reranker": self.get_reranker_model,
+                "decision": self.get_decision_model,
                 "llm": self.get_llm_model,
                 "vlm": self.get_vlm_model,
                 "tts": self.get_tts_model,

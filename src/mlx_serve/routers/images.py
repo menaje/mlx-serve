@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -158,14 +159,15 @@ async def _generate_image(
 
     def _generate():
         # mflux Flux1 model generate
-        image = model.generate_image(
+        result = model.generate_image(
+            seed=secrets.randbits(32),
             prompt=prompt,
             width=width,
             height=height,
             num_inference_steps=num_steps,
             guidance=guidance,
         )
-        return image
+        return getattr(result, "image", result)
 
     image = await loop.run_in_executor(None, _generate)
 

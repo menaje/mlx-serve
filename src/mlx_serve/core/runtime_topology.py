@@ -8,14 +8,14 @@ from typing import Literal
 from mlx_serve.config import settings
 
 ServerRole = Literal["gateway", "worker"]
-RetrievalWorkerKind = Literal["embedding", "reranker"]
+RetrievalWorkerKind = Literal["embedding", "reranker", "decision"]
 GenerationWorkerKind = Literal["llm", "vlm"]
 
 SERVER_ROLE_ENV = "MLX_SERVE_SERVER_ROLE"
 RETRIEVAL_WORKER_KIND_ENV = "MLX_SERVE_RETRIEVAL_WORKER_KIND"
 GENERATION_WORKER_KIND_ENV = "MLX_SERVE_GENERATION_WORKER_KIND"
 GENERATION_WORKER_MODEL_ENV = "MLX_SERVE_GENERATION_WORKER_MODEL"
-RETRIEVAL_WORKER_KINDS: tuple[RetrievalWorkerKind, ...] = ("embedding", "reranker")
+RETRIEVAL_WORKER_KINDS: tuple[RetrievalWorkerKind, ...] = ("embedding", "reranker", "decision")
 GENERATION_WORKER_KINDS: tuple[GenerationWorkerKind, ...] = ("llm", "vlm")
 
 

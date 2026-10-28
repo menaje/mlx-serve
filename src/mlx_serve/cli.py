@@ -1,6 +1,7 @@
 """CLI for mlx-serve."""
 
 import asyncio
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -209,8 +210,7 @@ def stop(
             pid_manager = PIDManager(inst_port)
             if pid_manager.stop_server(force=force):
                 console.print(
-                    f"[green]Stopped server on port {inst_port} "
-                    f"(PID: {inst_pid})[/green]"
+                    f"[green]Stopped server on port {inst_port} (PID: {inst_pid})[/green]"
                 )
             else:
                 console.print(f"[red]Failed to stop server on port {inst_port}[/red]")
@@ -226,8 +226,7 @@ def stop(
     if not pid_manager.is_process_running(pid):
         pid_manager.remove_pid()
         console.print(
-            f"[yellow]Server on port {port} is not running "
-            "(stale PID file cleaned)[/yellow]"
+            f"[yellow]Server on port {port} is not running (stale PID file cleaned)[/yellow]"
         )
         return
 
@@ -383,7 +382,7 @@ def pull(
         "embedding",
         "--type",
         "-t",
-        help="Model type (embedding, reranker, llm, vlm, tts, stt, image_gen)",
+        help="Model type (embedding, reranker, decision, llm, vlm, tts, stt, image_gen)",
     ),
     quantize_bits: Optional[int] = typer.Option(
         None,
@@ -397,20 +396,31 @@ def pull(
         "-k",
         help="Keep original model in HuggingFace cache after conversion",
     ),
+    revision: Optional[str] = typer.Option(
+        None, "--revision", help="Hugging Face branch, tag or commit for d1"
+    ),
+    local_name: Optional[str] = typer.Option(
+        None, "--name", help="Optional local name for the installed model"
+    ),
 ) -> None:
     """Download and convert a model from Hugging Face to MLX format.
 
-    By default, the original HuggingFace cache is deleted after conversion
-    to save disk space. Use --keep-original to preserve it.
+    For d1, shared Hugging Face caches are never deleted. Use --keep-original
+    to retain the downloaded source separately after successful verification.
+    Other conversion paths may delete the Hugging Face cache unless retained.
 
     Examples:
         mlx-serve pull Qwen/Qwen3-Embedding-0.6B --type embedding
+        mlx-serve pull vllm-sr/d3-lite --type decision
         mlx-serve pull meta-llama/Llama-3.2-1B-Instruct --type llm --quantize 4
         mlx-serve pull mlx-community/Qwen2.5-7B-Instruct-4bit --type llm
         mlx-serve pull meta-llama/Llama-3.2-1B --type llm --keep-original
     """
     if quantize_bits is not None and quantize_bits not in [4, 8]:
         console.print("[red]Quantize bits must be 4 or 8[/red]")
+        raise typer.Exit(1)
+    if local_name is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", local_name):
+        console.print("[red]Invalid local model name[/red]")
         raise typer.Exit(1)
 
     console.print(f"[blue]Pulling model: {model}[/blue]")
@@ -421,15 +431,23 @@ def pull(
         async for status in model_manager.pull_model(
             hf_repo=model,
             model_type=model_type,
+            model_name=local_name,
             quantize=quantize_bits,
             keep_original=keep_original,
+            revision=revision,
         ):
-            if status["status"] == "downloading":
+            if status["status"] == "resolving":
+                console.print("[yellow]Resolving source revision...[/yellow]")
+            elif status["status"] == "downloading":
                 hf_repo = status.get("hf_repo", model)
                 console.print(f"[yellow]Downloading from {hf_repo}...[/yellow]")
+            elif status["status"] == "checking":
+                console.print("[yellow]Checking model architecture and files...[/yellow]")
             elif status["status"] == "converting":
                 detail = status.get("detail", "Converting to MLX format")
                 console.print(f"[yellow]{detail}...[/yellow]")
+            elif status["status"] == "validating":
+                console.print(f"[yellow]{status.get('detail', 'Validating the model')}...[/yellow]")
             elif status["status"] == "cleaning":
                 console.print("[yellow]Cleaning up HuggingFace cache...[/yellow]")
             elif status["status"] == "success":
@@ -440,6 +458,22 @@ def pull(
                 raise typer.Exit(1)
 
     asyncio.run(_pull())
+
+
+@app.command("import-ollama")
+def import_ollama(
+    model: str = typer.Argument(..., help="Installed Ollama decision model, including its tag"),
+    name: str = typer.Option("d3-lite", "--name", help="Model name in mlx-serve"),
+) -> None:
+    """Import a local Ollama D3 decision model into mlx-serve."""
+    from mlx_serve.core.ollama_import import import_ollama_decision
+
+    try:
+        path = import_ollama_decision(model, name)
+    except (ValueError, OSError) as exc:
+        console.print(f"[red]Import failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]Imported {name}: {path}[/green]")
 
 
 @app.command("list")

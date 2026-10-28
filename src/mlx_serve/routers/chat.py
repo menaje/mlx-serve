@@ -530,6 +530,37 @@ def _format_messages_for_model(
     return "\n".join(prompt_parts)
 
 
+def _format_vlm_messages_for_model(
+    messages: list[ChatMessage], processor: Any, model: Any, tools: list[ToolDefinition] | None
+) -> str:
+    """Use mlx-vlm's model-specific template while preserving image positions."""
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    formatted = []
+    for message in messages:
+        if isinstance(message.content, list):
+            content = [
+                {"type": "image"}
+                if isinstance(part, ContentPartImage)
+                else {"type": "text", "text": part.text}
+                for part in message.content
+            ]
+        else:
+            content = message.content or ""
+        item: dict[str, Any] = {"role": message.role, "content": content}
+        if message.tool_calls:
+            item["tool_calls"] = [call.model_dump() for call in message.tool_calls]
+        if message.tool_call_id:
+            item["tool_call_id"] = message.tool_call_id
+        formatted.append(item)
+    kwargs = {}
+    if tools:
+        kwargs["tools"] = [tool.model_dump() for tool in tools]
+    return apply_chat_template(
+        processor, model.config, formatted, num_images=_count_image_parts(messages), **kwargs
+    )
+
+
 def _build_response_format_instruction(response_format: ResponseFormat | None) -> str:
     """Build instruction text for response format."""
     if response_format is None:
@@ -1328,7 +1359,12 @@ async def create_chat_completion(request: ChatCompletionRequest):
             )
 
         # Format messages
-        prompt = _format_messages_for_model(request.messages, tokenizer, request.tools)
+        if has_vision or is_vlm_model:
+            prompt = _format_vlm_messages_for_model(
+                request.messages, tokenizer, model, request.tools
+            )
+        else:
+            prompt = _format_messages_for_model(request.messages, tokenizer, request.tools)
 
         # Add response format instruction to prompt
         response_format_instruction = _build_response_format_instruction(request.response_format)

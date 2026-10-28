@@ -1,17 +1,63 @@
 """Models API router - OpenAI and Ollama compatible."""
 
+import asyncio
+import json
 import logging
+import urllib.error
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from mlx_serve.core.model_manager import ModelInUseError, ModelType, model_manager
+from mlx_serve.core.model_manager import (
+    ModelInUseError,
+    ModelType,
+    model_manager,
+    resolve_model_alias,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["models"])
+
+
+async def _decision_worker_request(
+    request: Request, path: str, payload: dict | None = None
+) -> dict | None:
+    """Contact the isolated decision worker, if this gateway has one."""
+    from mlx_serve.routers.retrieval_proxy import perform_worker_request
+
+    base_url = getattr(request.app.state, "retrieval_worker_urls", {}).get("decision")
+    if not base_url:
+        return None
+    try:
+        response = await asyncio.to_thread(
+            perform_worker_request,
+            base_url + path,
+            "GET" if payload is None else "POST",
+            b"" if payload is None else json.dumps(payload).encode(),
+            {"Content-Type": "application/json"},
+        )
+    except (TimeoutError, urllib.error.URLError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {"message": "Decision worker is unavailable", "code": "worker_unavailable"}
+            },
+        ) from exc
+    data = json.loads(response.body)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=data.get("detail", data))
+    return data
+
+
+def _merge_decision_cache(local: dict, worker: dict | None) -> dict:
+    if worker is not None:
+        local["decision_models"] = worker["decision_models"]
+        local["decision_worker_memory"] = worker["mlx_memory"]
+        local["decision_worker_active_inference"] = worker["active_inference"]
+    return local
 
 
 # OpenAI-compatible schemas
@@ -52,6 +98,10 @@ class PullRequest(BaseModel):
 
     name: str = Field(..., description="Hugging Face repo ID (e.g., Qwen/Qwen3-Embedding-0.6B)")
     type: ModelType = Field(default="embedding", description="Model type")
+    revision: str | None = Field(default=None, description="Hugging Face branch, tag or commit")
+    model_name: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", description="Local model name"
+    )
     quantize: int | None = Field(
         default=None, description="Quantization bits (4 or 8). None for no quantization."
     )
@@ -140,7 +190,7 @@ async def pull_model(request: PullRequest) -> StreamingResponse:
     """Download and convert a model from Hugging Face to MLX format.
 
     Supports optional quantization (4-bit or 8-bit) during conversion.
-    By default, HuggingFace cache is cleaned up after conversion.
+    The d1 preparation path does not delete shared Hugging Face caches.
     """
     import json
 
@@ -148,8 +198,10 @@ async def pull_model(request: PullRequest) -> StreamingResponse:
         async for status in model_manager.pull_model(
             hf_repo=request.name,
             model_type=request.type,
+            model_name=request.model_name,
             quantize=request.quantize,
             keep_original=request.keep_original,
+            revision=request.revision,
         ):
             yield json.dumps(status) + "\n"
 
@@ -179,13 +231,14 @@ async def delete_model(request: DeleteRequest) -> dict:
 
 
 @router.get("/v1/models/cache")
-async def get_model_cache_stats() -> dict:
+async def get_model_cache_stats(http_request: Request) -> dict:
     """Return loaded model cache and memory diagnostics."""
-    return model_manager.get_cache_stats()
+    worker = await _decision_worker_request(http_request, "/internal/decision/cache")
+    return _merge_decision_cache(model_manager.get_cache_stats(), worker)
 
 
 @router.post("/v1/models/unload", response_model=UnloadResponse)
-async def unload_models(request: UnloadRequest) -> UnloadResponse:
+async def unload_models(request: UnloadRequest, http_request: Request) -> UnloadResponse:
     """Unload cached idle models without deleting them from disk."""
     if not request.all:
         raise HTTPException(
@@ -200,21 +253,43 @@ async def unload_models(request: UnloadRequest) -> UnloadResponse:
         )
 
     result = model_manager.unload_all(request.type)
+    worker = None
+    if request.type in (None, "decision"):
+        worker = await _decision_worker_request(http_request, "/internal/decision/unload", {})
+        if worker is not None:
+            result["unloaded"].extend(worker["unloaded"])
+            result["skipped_active"].extend(worker["skipped_active"])
     return UnloadResponse(
         unloaded=result["unloaded"],
         skipped_active=result["skipped_active"],
-        cache=model_manager.get_cache_stats(),
+        cache=_merge_decision_cache(model_manager.get_cache_stats(), worker and worker["cache"]),
     )
 
 
 @router.post("/v1/models/{model_name}/unload", response_model=UnloadResponse)
 async def unload_model(
     model_name: str,
+    http_request: Request,
     model_type: ModelType | None = None,
     type_: ModelType | None = Query(default=None, alias="type"),
 ) -> UnloadResponse:
     """Unload one cached model without deleting it from disk."""
     target_type = type_ or model_type
+    _, _, alias_type = resolve_model_alias(model_name)
+    is_decision = target_type == "decision" or (
+        target_type is None
+        and (alias_type == "decision" or model_manager.get_model_type(model_name) == "decision")
+    )
+    if is_decision:
+        worker = await _decision_worker_request(
+            http_request, "/internal/decision/unload", {"name": model_name}
+        )
+        if worker is not None:
+            return UnloadResponse(
+                unloaded=worker["unloaded"],
+                skipped_active=worker["skipped_active"],
+                cache=_merge_decision_cache(model_manager.get_cache_stats(), worker["cache"]),
+            )
     try:
         unloaded = model_manager.unload_model(model_name, target_type)
     except ModelInUseError as e:

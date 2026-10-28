@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -26,6 +27,7 @@ from mlx_serve.core.system_guard import memory_monitor
 from mlx_serve.routers import (
     audio_router,
     chat_router,
+    decision_router,
     embeddings_router,
     generation_proxy_router,
     images_router,
@@ -122,6 +124,11 @@ def _include_routers(app: FastAPI) -> None:
         elif worker_kind == "reranker":
             app.include_router(rerank_router)
             app.include_router(tokenize_router)
+        elif worker_kind == "decision":
+            app.include_router(decision_router)
+            from mlx_serve.routers.decision import internal_router as decision_internal_router
+
+            app.include_router(decision_internal_router)
         elif generation_worker_kind in ("llm", "vlm"):
             app.include_router(chat_router)
         else:
@@ -138,6 +145,7 @@ def _include_routers(app: FastAPI) -> None:
     else:
         app.include_router(embeddings_router)
         app.include_router(rerank_router)
+        app.include_router(decision_router)
     app.include_router(images_router)
     app.include_router(models_router)
     app.include_router(tokenize_router)
@@ -214,6 +222,7 @@ def create_app() -> FastAPI:
         exc: RequestValidationError,
     ) -> JSONResponse:
         # Log the full request body and validation errors
+        errors = jsonable_encoder(exc.errors(), custom_encoder={Exception: str})
         body = None
         try:
             import json
@@ -234,7 +243,7 @@ def create_app() -> FastAPI:
                     f.write(f"Parsed JSON:\n{json.dumps(body_json, indent=2)}\n")
                 except json.JSONDecodeError:
                     pass
-                f.write(f"Validation errors:\n{json.dumps(exc.errors(), indent=2)}\n")
+                f.write(f"Validation errors:\n{json.dumps(errors, indent=2)}\n")
                 f.write("==================================\n\n")
 
             logger.error(f"[VALIDATION ERROR] Request to {request.url.path}")
@@ -246,7 +255,7 @@ def create_app() -> FastAPI:
 
         return JSONResponse(
             status_code=422,
-            content={"detail": exc.errors()},
+            content={"detail": errors},
         )
 
     # Global exception handler for OpenAI-compatible errors
