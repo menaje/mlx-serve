@@ -97,6 +97,11 @@ def _preparation_record(path: Path, metadata: dict[str, Any], kind: str) -> dict
                 "prepared_at",
             )
         }
+        if result["converted"] is False:
+            # Older MLX d1 manifests named a converter even though they copied
+            # the published MLX checkpoint directly without invoking it.
+            result["converter"] = None
+            result["converter_version"] = None
         validation = manifest["validation"]
         result["validation"] = {
             field: validation[field]

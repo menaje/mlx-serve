@@ -323,8 +323,8 @@ def prepare(repo: str, revision: str, source: Path, artifact: Path) -> None:
         "architecture": config["model_type"],
         "license": "lfm1.0",
         "precision": "float16",
-        "converter": "mlx-vlm",
-        "converter_version": version("mlx-vlm"),
+        "converter": "mlx-vlm" if is_original else None,
+        "converter_version": version("mlx-vlm") if is_original else None,
         "environment": {
             "python": sys.version.split()[0],
             **{
@@ -332,7 +332,10 @@ def prepare(repo: str, revision: str, source: Path, artifact: Path) -> None:
                 for name in ("mlx", "mlx-vlm", "transformers", "huggingface-hub", "safetensors")
             },
         },
-        "converter_options": {"dtype": "float16", "trust_remote_code": False},
+        "converter_options": (
+            {"dtype": "float16", "trust_remote_code": False}
+            if is_original else {"trust_remote_code": False}
+        ),
         "converted": is_original,
         "temperatures": config["temperatures"],
         "max_length": config.get("max_length"),

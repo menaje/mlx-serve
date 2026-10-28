@@ -88,6 +88,52 @@ def test_checkpoint_checks_actual_head_precision_and_required_files(tmp_path):
         validate_checkpoint(tmp_path, converted=True)
 
 
+@pytest.mark.parametrize("repo,converted", [(SOURCE_REPO, True), (MLX_REPO, False)])
+def test_d1_preparation_only_converts_the_original_checkpoint(
+    tmp_path, monkeypatch, repo, converted,
+):
+    import huggingface_hub
+    import mlx_vlm
+
+    from mlx_serve.core import decision_prepare_worker as worker
+
+    conversions = []
+    statuses = []
+
+    def download(repo_id, revision, local_dir, allow_patterns):
+        assert repo_id == repo and revision == REVISION and allow_patterns
+        source = Path(local_dir)
+        source.mkdir()
+        (source / "config.json").write_text('{"model_type": "d1_omni"}')
+        (source / "tokenizer.json").write_text("{}")
+        (source / "LICENSE").write_text("license")
+        (source / "model.safetensors").write_bytes(b"published-weights")
+
+    def convert(source, mlx_path, **options):
+        conversions.append(options)
+        shutil.copytree(source, mlx_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    monkeypatch.setattr(mlx_vlm, "convert", convert)
+    monkeypatch.setattr(worker, "version", lambda name: "0.7.10" if name == "mlx-vlm" else "test")
+    monkeypatch.setattr(worker, "emit", lambda status, **_details: statuses.append(status))
+    monkeypatch.setattr(worker, "validate_checkpoint", lambda *_args, **_kwargs: {
+        "model_type": "d1_omni", "temperatures": {},
+    })
+    monkeypatch.setattr(worker, "sample_prediction", lambda _path: {
+        "answers": {"example": {"type": "bool", "value": True, "probability": 0.9}},
+    })
+    artifact = tmp_path / "artifact"
+    worker.prepare(repo, REVISION, tmp_path / "download", artifact)
+    manifest = json.loads((artifact / MANIFEST).read_text())
+    assert manifest["converted"] is converted
+    assert len(conversions) == int(converted)
+    assert ("converting" in statuses) is converted
+    assert (artifact / "model.safetensors").read_bytes() == b"published-weights"
+    assert manifest["converter"] == ("mlx-vlm" if converted else None)
+    assert manifest["converter_version"] == ("0.7.10" if converted else None)
+
+
 def test_probability_comparison_preserves_option_ids_and_tolerance():
     original = {
         "answers": {"x": {"type": "choice", "value": "b", "probabilities": {"a": 0.1, "b": 0.9}}}

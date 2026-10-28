@@ -455,6 +455,24 @@ def test_management_reports_recorded_preparation_without_rehashing(
     }
 
 
+def test_existing_mlx_record_does_not_claim_a_local_converter(tmp_path, monkeypatch):
+    from mlx_serve.core.decision_prepare_worker import MLX_REPO
+    from mlx_serve.routers import management
+
+    manifest = {
+        "source_repo": MLX_REPO, "revision": "a" * 40,
+        "converted": False, "converter": "mlx-vlm", "converter_version": "0.7.10",
+        "validation": {"official_predict": True},
+    }
+    monkeypatch.setattr(management, "read_verified_manifest", lambda *_args, **_kwargs: manifest)
+    record = management._preparation_record(
+        tmp_path, {"revision": "a" * 40, "hf_repo": MLX_REPO}, "decision",
+    )
+    assert record["converted"] is False
+    assert record["converter"] is None and record["converter_version"] is None
+    assert manifest["converter"] == "mlx-vlm"  # The existing recorded file is not rewritten.
+
+
 def test_agent_rejects_storage_change_when_models_are_present(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

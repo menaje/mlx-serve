@@ -278,7 +278,7 @@ struct ModelsView: View {
 struct AddModelView: View {
     @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) var dismiss
-    @State private var repo = "LiquidAI/d1-omni-600M"
+    @State private var repo = "LiquidAI/d1-omni-600M-MLX-fp16"
     @State private var name = ""
     @State private var revision = ""
     @State private var keepOriginal = false
@@ -401,7 +401,8 @@ struct ModelDetailView: View {
                     if record["state"] as? String == "recorded" {
                         LabeledContent("라이선스", value: record["license"] as? String ?? "정보 없음")
                         LabeledContent("변환", value: record["converted"] as? Bool == true ? "수행함" : "수행하지 않음")
-                        if let converter = record["converter"] as? String {
+                        if record["converted"] as? Bool == true,
+                           let converter = record["converter"] as? String {
                             let version = record["converter_version"] as? String ?? ""
                             LabeledContent("변환 도구", value: "\(converter) \(version)".trimmingCharacters(in: .whitespaces))
                         }
@@ -435,7 +436,7 @@ struct ModelDetailView: View {
                         removalPreview = nil
                         confirmDelete = true
                     }.disabled(store.busy)
-                    Text("모델 등록과 변환 파일을 제거합니다. 보존한 원본과 공유 캐시는 유지됩니다.")
+                    Text("모델 등록과 준비된 모델 파일을 제거합니다. 보존한 원본과 공유 캐시는 유지됩니다.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
                     Text("이 모델을 제거하려면 서버를 중지하세요.").font(.caption).foregroundStyle(.secondary)

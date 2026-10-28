@@ -11,9 +11,10 @@ its current completion criteria. Other unverified flows are listed below.
   huggingface-hub 1.33.0, transformers 5.21.0.
 - Bundled environment: Python 3.14.10 with the same package versions above;
   the complete pinned dependency list is in `requirements-runtime.txt`.
-- The Python test suite passed 394 tests with real d3-lite and Qwen3-Reranker
-  checkpoints supplied; no tests were skipped. The run emitted one third-party
-  Starlette deprecation warning. Set `MLX_SERVE_D3_TEST_MODEL_DIR` and
+- The Python test suite passed 397 tests with real d3-lite and Qwen3-Reranker
+  checkpoints supplied; no tests were skipped. The Starlette test-client
+  deprecation was fixed with the HTTPX2 development dependency, and this run
+  treated that warning as an error. Set `MLX_SERVE_D3_TEST_MODEL_DIR` and
   `MLX_SERVE_RERANK_TEST_MODEL_DIR` to local checkpoint directories to include
   those optional real-model tests in a future run.
 
@@ -44,6 +45,13 @@ than a new full-UI pass.
   embedding and reranker downloads, validation and inference also succeeded.
   The app-owned server uses the same credential policy; existing CLI
   configurations and credentials are not modified.
+- With both the development and bundled runtimes, the official d1 MLX FP16
+  checkpoint was copied from an existing local installation, validated, and
+  used for choice, Boolean and score inference without invoking a converter.
+  Regression tests also check that only the original d1 checkpoint takes the
+  conversion path and that older non-converted records do not report a local
+  converter. The model-add form now defaults to the official MLX checkpoint;
+  this default has not been checked through the current UI while locked.
 - Queue and memory limit settings were checked for optional values, valid
   boundaries, atomic saves and rejection of invalid values. A native, non-UI
   harness checked the current Swift input and display helpers. Tests also check

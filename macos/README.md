@@ -21,13 +21,16 @@ as an external server. The new app does not access its old Keychain entry or
 terminate processes it cannot identify as its own.
 
 Supported installs are LiquidAI's original d1 checkpoint, its official MLX
-FP16 checkpoint, `vllm-sr/d3-lite`,
+FP16 checkpoint (the model-add form's default), `vllm-sr/d3-lite`,
 `mlx-community/all-MiniLM-L6-v2-bf16` (embedding), and
 `mlx-community/Qwen3-Reranker-0.6B-4bit` (reranker). The d3 model's BF16
-weights and FP32 readout and the two retrieval models' MLX weights are used
-directly after file-hash and inference checks. Preparation runs in the backend.
-Other model types may be tested if already installed, but adding other
-repositories is disabled until their validation paths are supported.
+weights and FP32 readout, the official d1 MLX checkpoint and the two retrieval
+models' MLX weights are used directly after file-hash and inference checks;
+only the original d1 checkpoint is converted locally to MLX FP16. Preparation
+runs in the backend. The app does not automatically search for an MLX version
+of an arbitrary repository. Other model types may be tested if already
+installed, but adding other repositories is disabled until their validation
+paths are supported.
 
 Generation-worker load and unload commands are routed to the appropriate
 model- or type-scoped worker. A running server can remove decision models by

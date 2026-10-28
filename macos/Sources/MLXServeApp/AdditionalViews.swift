@@ -89,7 +89,7 @@ struct JobsView: View {
                                         Text("저장소의 파일 크기 정보가 일부 없어 실제 필요 공간이 더 클 수 있습니다.")
                                             .foregroundStyle(.orange)
                                     } else if event["estimate_basis"] as? String == "repository_metadata" {
-                                        Text("저장소 파일 크기를 기준으로 변환 및 임시 공간을 더한 추정치입니다.")
+                                        Text("저장소 파일 크기와 준비에 필요한 여유 공간을 반영한 추정치입니다.")
                                             .foregroundStyle(.secondary)
                                     }
                                 }
@@ -449,7 +449,7 @@ struct PreferencesView: View {
         Form {
             Section("변환과 런타임") {
                 LabeledContent("지원 모델", value: "d1 / d3-lite / all-MiniLM / Qwen3 리랭커")
-                LabeledContent("변환 정밀도", value: "FP16")
+                LabeledContent("d1 원본 변환 정밀도", value: "FP16")
                 LabeledContent("d3 정밀도", value: "BF16 / readout FP32")
                 LabeledContent("동시 변환", value: "1개")
                 Text("다운로드, 구조 확인, 필요한 변환, 검증과 등록을 서버에서 수행합니다.").foregroundStyle(.secondary)
