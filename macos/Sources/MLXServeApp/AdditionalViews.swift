@@ -44,6 +44,11 @@ struct JobsView: View {
                             Text(jobGuidance(job["error_category"] as? String ?? ""))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
+                        if let result = job["result"] as? [String: Any],
+                           result["auto_load"] as? String == "failed" {
+                            Text("준비는 완료했지만 자동 로드에 실패했습니다. 서버를 확인한 뒤 모델 화면에서 직접 로드하세요.")
+                                .foregroundStyle(.orange)
+                        }
                         let id = job["id"] as? String ?? ""
                         let status = job["status"] as? String ?? ""
                         if ["queued", "running", "cancelling", "recovery_pending"].contains(status) {
@@ -60,7 +65,7 @@ struct JobsView: View {
                                         name: params["name"] as? String ?? "",
                                         revision: params["revision"] as? String ?? "",
                                         keepOriginal: params["keep_original"] as? Bool ?? false,
-                                        loadAfter: false
+                                        loadAfter: params["load_after"] as? Bool ?? false
                                     )
                                 }
                             }.disabled(store.busy)
@@ -92,7 +97,11 @@ struct JobsView: View {
                                     Text("작업 임시 파일 크기 \(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) (측정값)")
                                         .foregroundStyle(.secondary)
                                 }
-                                if let message = event["message"] as? String { Text(message).foregroundStyle(.orange) }
+                                if let message = event["message"] as? String {
+                                    Text(event["status"] as? String == "load_failed"
+                                        ? "자동 로드에 실패했습니다. 서버를 확인한 뒤 모델 화면에서 직접 로드하세요."
+                                        : message).foregroundStyle(.orange)
+                                }
                                 Text(event["time"] as? String ?? "").font(.caption2).foregroundStyle(.secondary)
                             }.font(.callout)
                         }

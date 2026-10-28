@@ -10,6 +10,9 @@ stops a server it did not start. Closing the window leaves the menu-bar app
 running; by default, quitting cancels its preparation jobs and stops its own
 server. The user can opt in to retaining the app-owned agent, jobs and server
 after quitting; the connection secret is then kept in Keychain for reconnection.
+When preparation requests automatic loading, the agent records and performs
+that step even while the app is closed. A loading failure is recorded separately
+from successful preparation so the user can load the model manually.
 The app also inspects known CLI paths and the user's launchd service without
 changing those services.
 

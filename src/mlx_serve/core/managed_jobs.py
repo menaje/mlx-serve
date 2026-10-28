@@ -16,7 +16,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from mlx_serve.core.decision_prepare_worker import MLX_REPO, SOURCE_REPO
 from mlx_serve.core.storage_access import model_storage_available
@@ -147,8 +147,11 @@ async def _stop_job_workers(job_id: str) -> bool:
 class JobManager:
     """Run preparation in isolated process groups; keep history in SQLite."""
 
-    def __init__(self, data_dir: Path):
+    def __init__(
+        self, data_dir: Path, *, load_model: Callable[[str], Awaitable[None]] | None = None,
+    ):
         self.data_dir = data_dir
+        self._load_model = load_model
         data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._lock = (data_dir / "jobs.lock").open("a+")
         try:
@@ -159,6 +162,8 @@ class JobManager:
         self.db_path = data_dir / "jobs.sqlite3"
         self._tasks: dict[str, asyncio.Task] = {}
         self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._load_tasks: dict[str, asyncio.Task] = {}
+        self._recovery_lock = asyncio.Lock()
         with self._db() as db:
             db.executescript(
                 """
@@ -201,6 +206,42 @@ class JobManager:
         if stage and stage not in ("error", "success", "resources"):
             self._update(job_id, stage=str(stage))
 
+    async def _load_prepared_model(
+        self, job_id: str, result: dict[str, Any], token: str | None = None,
+    ) -> dict[str, Any]:
+        """Record loading separately from the outcome of verified preparation."""
+        if result.get("auto_load") in ("succeeded", "failed"):
+            return result
+        self._event(job_id, {"status": "loading"}, token)
+        try:
+            name = result.get("name")
+            current = self.get(job_id)
+            if (
+                self._load_model is None or not isinstance(name, str) or not name
+                or (current is not None and current["status"] == "cancelling")
+            ):
+                raise ValueError("Automatic loading is unavailable")
+            load_task = asyncio.create_task(self._load_model(name))
+            self._load_tasks[job_id] = load_task
+            try:
+                await load_task
+            finally:
+                self._load_tasks.pop(job_id, None)
+            state = "succeeded"
+            event = {"status": "load_succeeded"}
+        except (Exception, asyncio.CancelledError):
+            state = "failed"
+            event = {
+                "status": "load_failed",
+                "message": (
+                    "Automatic loading failed. Check the server and load the model manually."
+                ),
+            }
+        result = {**result, "auto_load": state}
+        self._event(job_id, event, token)
+        self._update(job_id, result=json.dumps(result, ensure_ascii=False))
+        return result
+
     def list(self) -> list[dict[str, Any]]:
         with self._db() as db:
             rows = db.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
@@ -232,6 +273,10 @@ class JobManager:
 
     async def recover(self) -> None:
         """Stop only identifiable orphaned runners before marking jobs interrupted."""
+        async with self._recovery_lock:
+            await self._recover()
+
+    async def _recover(self) -> None:
         with self._db() as db:
             rows = db.execute(
                 "SELECT * FROM jobs WHERE status IN "
@@ -280,9 +325,14 @@ class JobManager:
                 and self._cleanup_stage(row["id"], json.loads(row["params"]))
             )
             if cleaned:
+                params = json.loads(row["params"])
+                result = json.loads(row["result"]) if row["result"] else None
+                if isinstance(result, dict) and params.get("load_after"):
+                    result = await self._load_prepared_model(row["id"], result)
                 self._update(
                     row["id"], status="succeeded" if row["result"] else "interrupted",
                     stage="complete" if row["result"] else "interrupted", pid=None,
+                    result=json.dumps(result, ensure_ascii=False) if result else None,
                     error=None if row["result"] else (
                         "The manager stopped during preparation. Check the model and retry."
                     ),
@@ -294,7 +344,7 @@ class JobManager:
                 )
 
     def start(self, params: dict[str, Any], token: str | None = None) -> dict[str, Any]:
-        allowed = {"repo", "name", "revision", "keep_original", "models_dir"}
+        allowed = {"repo", "name", "revision", "keep_original", "models_dir", "load_after"}
         if params.keys() - allowed:
             raise ValueError("Unsupported preparation options")
         repo = params.get("repo")
@@ -312,9 +362,12 @@ class JobManager:
         normalized = {
             "repo": repo, "name": name, "revision": revision,
             "keep_original": bool(params.get("keep_original", False)), "models_dir": models_dir,
+            "load_after": bool(params.get("load_after", False)),
         }
         # Two names still refer to the same underlying source and conversion.
-        dedupe = {key: value for key, value in normalized.items() if key != "name"}
+        dedupe = {
+            key: value for key, value in normalized.items() if key not in ("name", "load_after")
+        }
         request_key = json.dumps(dedupe, sort_keys=True)
         job_id = uuid.uuid4().hex
         now = _now()
@@ -372,6 +425,7 @@ class JobManager:
                 self._event(job_id, event, token)
                 if event.get("status") == "success":
                     result = event
+                    self._update(job_id, result=json.dumps(result, ensure_ascii=False))
                 elif event.get("status") == "error":
                     error = str(event.get("message", "Preparation failed"))
             await process.wait()
@@ -396,6 +450,8 @@ class JobManager:
             workers_stopped = await _stop_job_workers(job_id)
             cleaned = workers_stopped and self._cleanup_stage(job_id, params)
             if cleaned:
+                if final_status == "succeeded" and result is not None and params["load_after"]:
+                    result = await self._load_prepared_model(job_id, result, token)
                 self._update(
                     job_id, status=final_status,
                     stage="complete" if final_status == "succeeded" else final_status,
@@ -451,6 +507,9 @@ class JobManager:
         if job["status"] not in ACTIVE_STATES or task is None:
             raise ValueError("Job is not running")
         self._update(job_id, status="cancelling", stage="cancelling")
+        load_task = self._load_tasks.get(job_id)
+        if load_task is not None:
+            load_task.cancel()
         process = self._processes.get(job_id)
         if process is None:
             # Wait until the scheduled coroutine has started its process.

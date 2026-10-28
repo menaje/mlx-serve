@@ -24,7 +24,6 @@ final class AppStore: ObservableObject {
     private var agent: Process?
     private var agentPort: Int?
     private var secret = ""
-    private var autoLoad = Set<String>()
     private let localSession = makeLocalSession()
     private var serverStartPolicy = ServerStartPolicy()
     private var notificationPolicy = NotificationPolicy()
@@ -339,17 +338,6 @@ final class AppStore: ObservableObject {
             if let id = selectedJob {
                 jobDetail = (try? await request("/jobs/\(id)")) as? [String: Any] ?? [:]
             }
-            for job in jobs {
-                guard let id = job["id"] as? String, autoLoad.contains(id) else { continue }
-                if job["status"] as? String == "succeeded" {
-                    autoLoad.remove(id)
-                    if let result = job["result"] as? [String: Any], let name = result["name"] as? String {
-                        await modelCommand("load", name: name, type: "decision")
-                    }
-                } else if ["failed", "cancelled", "interrupted"].contains(job["status"] as? String ?? "") {
-                    autoLoad.remove(id)
-                }
-            }
             await evaluateAutomaticStart()
         } catch {
             server = ["state": "unknown"]
@@ -417,14 +405,15 @@ final class AppStore: ObservableObject {
 
     func startJob(repo: String, name: String, revision: String, keepOriginal: Bool, loadAfter: Bool) async {
         await action {
-            var body: [String: Any] = ["repo": repo, "keep_original": keepOriginal]
+            var body: [String: Any] = [
+                "repo": repo, "keep_original": keepOriginal, "load_after": loadAfter
+            ]
             if !name.isEmpty { body["name"] = name }
             if !revision.isEmpty { body["revision"] = revision }
             if let token = HFKeychain.read(), !token.isEmpty { body["token"] = token }
             let result = try await self.request("/jobs", method: "POST", body: body) as? [String: Any] ?? [:]
             if let id = result["id"] as? String {
                 self.selectedJob = id
-                if loadAfter { self.autoLoad.insert(id) }
             }
         }
     }
@@ -502,6 +491,7 @@ func readableState(_ state: String) -> String {
      "interrupted": "중단됨", "loaded": "적재됨", "not_loaded": "미적재", "unknown": "확인 불가",
      "idle": "유휴", "installed": "설치됨", "downloading": "다운로드", "checking": "호환성 확인",
      "converting": "MLX 변환", "validating": "검증", "resolving": "버전 확인",
-     "registering": "모델 등록", "resources": "임시 파일 측정", "complete": "완료"]
+     "registering": "모델 등록", "resources": "임시 파일 측정", "complete": "완료",
+     "loading": "모델 로드", "load_succeeded": "자동 로드 완료", "load_failed": "자동 로드 실패"]
     return translations[state] ?? state
 }

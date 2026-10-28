@@ -416,6 +416,41 @@ async def test_external_server_or_port_conflict_is_never_stopped(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_automatic_load_ignores_proxies_and_does_not_follow_redirects(monkeypatch):
+    import httpx
+
+    import mlx_serve.management_agent as agent
+
+    requests = []
+
+    async def respond(reader, writer):
+        requests.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\n"
+            b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(respond, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await agent._post_local_management(
+                port, "/management/models/load", {"name": "d1", "type": "decision"},
+                authorization="local-secret", host="127.0.0.1",
+            )
+        assert len(requests) == 1
+        assert b"authorization: bearer local-secret" in requests[0].lower()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_unexpected_server_exit_is_visible_and_allows_restart(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
@@ -551,6 +586,8 @@ async def test_job_cancel_terminates_process_and_preserves_existing_models(tmp_p
     job = manager.start(params, token="hf_secret123")
     with pytest.raises(ValueError, match="active job"):
         manager.start({**params, "name": "another-name"})
+    with pytest.raises(ValueError, match="active job"):
+        manager.start({**params, "load_after": True})
     for _ in range(100):
         current = manager.get(job["id"])
         if current and any(e.get("temporary_file_bytes") == 42 for e in current["events"]):
@@ -573,6 +610,177 @@ async def test_job_cancel_terminates_process_and_preserves_existing_models(tmp_p
     database_contents = (tmp_path / "jobs" / "jobs.sqlite3").read_bytes().decode(errors="ignore")
     assert "hf_secret123" not in database_contents
     await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("load_fails", [False, True])
+async def test_preparation_records_automatic_loading_separately(tmp_path, monkeypatch, load_fails):
+    import mlx_serve.core.managed_jobs as managed_jobs
+
+    models = tmp_path / "models"
+    models.mkdir()
+    script = tmp_path / "fake_runner.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'status':'success','name':'d1-test'}), flush=True)\n"
+    )
+    original = asyncio.create_subprocess_exec
+
+    async def spawn_fake(*args, **kwargs):
+        return await original(sys.executable, str(script), **kwargs)
+
+    calls = []
+
+    async def load_model(name):
+        calls.append(name)
+        if load_fails:
+            raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(managed_jobs.asyncio, "create_subprocess_exec", spawn_fake)
+    monkeypatch.setattr(managed_jobs, "_job_worker_pids", lambda _: [])
+    manager = JobManager(tmp_path / "jobs", load_model=load_model)
+    job = manager.start({
+        "repo": "LiquidAI/d1-omni-600M", "models_dir": str(models), "load_after": True,
+    })
+    await manager._tasks[job["id"]]
+    completed = manager.get(job["id"])
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["auto_load"] == ("failed" if load_fails else "succeeded")
+    assert calls == ["d1-test"]
+    assert any(
+        event["status"] == ("load_failed" if load_fails else "load_succeeded")
+        for event in completed["events"]
+    )
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_during_automatic_load_does_not_delay_shutdown(tmp_path, monkeypatch):
+    import mlx_serve.core.managed_jobs as managed_jobs
+
+    models = tmp_path / "models"
+    models.mkdir()
+    script = tmp_path / "fake_runner.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'status':'success','name':'d1-test'}), flush=True)\n"
+    )
+    original = asyncio.create_subprocess_exec
+
+    async def spawn_fake(*args, **kwargs):
+        return await original(sys.executable, str(script), **kwargs)
+
+    entered = asyncio.Event()
+
+    async def load_model(name):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(managed_jobs.asyncio, "create_subprocess_exec", spawn_fake)
+    monkeypatch.setattr(managed_jobs, "_job_worker_pids", lambda _: [])
+    manager = JobManager(tmp_path / "jobs", load_model=load_model)
+    job = manager.start({
+        "repo": "LiquidAI/d1-omni-600M", "models_dir": str(models), "load_after": True,
+    })
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    completed = await asyncio.wait_for(manager.cancel(job["id"]), timeout=2)
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["auto_load"] == "failed"
+    await manager.close()
+
+
+def test_agent_loads_a_prepared_model_without_an_open_app(tmp_path, monkeypatch):
+    import time
+
+    import mlx_serve.core.managed_jobs as managed_jobs
+    import mlx_serve.management_agent as agent
+
+    models = tmp_path / "models"
+    models.mkdir()
+    script = tmp_path / "fake_runner.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'status':'success','name':'d1-test'}), flush=True)\n"
+    )
+    original = asyncio.create_subprocess_exec
+
+    async def spawn_fake(*args, **kwargs):
+        return await original(sys.executable, str(script), **kwargs)
+
+    async def server_status(self):
+        return {"state": "connected", "ownership": "external", "port": 19001}
+
+    calls = []
+
+    def server_request(port, path, payload=None, **kwargs):
+        assert path == "/management/settings"
+        return {"fields": {"models_dir": {"applied": str(models)}}}
+
+    async def load_request(port, path, payload, **kwargs):
+        assert path == "/management/models/load"
+        calls.append((port, payload))
+
+    monkeypatch.setattr(agent, "initialize_app_config", lambda: None)
+    monkeypatch.setattr(agent.ServerController, "status", server_status)
+    monkeypatch.setattr(agent.ServerController, "address", lambda self, port: "127.0.0.1")
+    monkeypatch.setattr(agent, "_request_json", server_request)
+    monkeypatch.setattr(agent, "_post_local_management", load_request)
+    monkeypatch.setattr(managed_jobs.asyncio, "create_subprocess_exec", spawn_fake)
+    monkeypatch.setattr(managed_jobs, "_job_worker_pids", lambda _: [])
+    headers = {"Authorization": "Bearer test-secret"}
+    app = agent.create_agent("test-secret", data_dir=tmp_path)
+    with TestClient(app, base_url="http://localhost", client=("127.0.0.1", 1)) as client:
+        started = client.post(
+            "/jobs", headers=headers,
+            json={"repo": "LiquidAI/d1-omni-600M", "load_after": True},
+        )
+        assert started.status_code == 200
+        job_id = started.json()["id"]
+        for _ in range(100):
+            completed = client.get(f"/jobs/{job_id}", headers=headers).json()
+            if completed["status"] == "succeeded":
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("Preparation did not finish")
+        assert completed["result"]["auto_load"] == "succeeded"
+        assert calls == [(19001, {"name": "d1-test", "type": "decision"})]
+
+
+@pytest.mark.asyncio
+async def test_recovery_finishes_a_persisted_automatic_load(tmp_path, monkeypatch):
+    import mlx_serve.core.managed_jobs as managed_jobs
+
+    models = tmp_path / "models"
+    models.mkdir()
+    params = {
+        "repo": "LiquidAI/d1-omni-600M", "models_dir": str(models), "load_after": True,
+    }
+    calls = []
+
+    async def load_model(name):
+        calls.append(name)
+        await asyncio.sleep(0.01)
+
+    manager = JobManager(tmp_path / "jobs", load_model=load_model)
+    with manager._db() as db:
+        db.execute(
+            "INSERT INTO jobs (id, request_key, params, status, stage, created_at, updated_at, "
+            "result) VALUES (?, ?, ?, 'running', 'loading', 'now', 'now', ?)",
+            ("a" * 32, "pending-load", json.dumps(params),
+             json.dumps({"status": "success", "name": "d1-test"})),
+        )
+    monkeypatch.setattr(managed_jobs, "_job_worker_pids", lambda _: [])
+    await asyncio.gather(manager.recover(), manager.recover())
+    job = manager.get("a" * 32)
+    assert job["status"] == "succeeded" and job["result"]["auto_load"] == "succeeded"
+    assert calls == ["d1-test"]
+    await manager.recover()
+    assert calls == ["d1-test"]
+    await manager.close()
 
 
 @pytest.mark.asyncio

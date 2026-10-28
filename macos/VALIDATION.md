@@ -10,7 +10,7 @@ criteria of issue #12.
   huggingface-hub 1.33.0, transformers 5.21.0.
 - Bundled environment: Python 3.14.10 with the same package versions above;
   the complete pinned dependency list is in `requirements-runtime.txt`.
-- The Python test suite passed 338 tests. One d3 integration test was skipped
+- The Python test suite passed 344 tests. One d3 integration test was skipped
   because a local d3-lite checkpoint was not supplied.
 
 ## Observed flows
@@ -93,6 +93,12 @@ criteria of issue #12.
   and restarted the owned server. After disabling the option and ending the
   attached parent, the agent and server exited. The protocol tests cover replay,
   incorrect keys, remote and browser-origin requests, and discovery records.
+- In separate isolated homes, the agent also completed an official MLX FP16 d1
+  preparation and automatically loaded it after the app's parent process exited.
+  Repeated runs reused a verified artifact and exercised the current asynchronous
+  load request, including one using the rebuilt app's bundled runtime. Tests cover
+  load failure, cancellation during loading, and recovery of a saved load request.
+  These process tests do not exercise macOS Keychain.
 - Existing CLI and launchd detection is read-only; tests cover running, loaded,
   absent and uninspectable user services. System service files are identified,
   but their running state is not determined.

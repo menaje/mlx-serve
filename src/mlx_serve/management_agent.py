@@ -78,6 +78,16 @@ def _request_json(
         raise HTTPException(status_code=503, detail="Server is unavailable") from exc
 
 
+async def _post_local_management(
+    port: int, path: str, payload: dict[str, Any], *,
+    authorization: str | None, host: str,
+) -> None:
+    headers = {"Authorization": f"Bearer {authorization}"} if authorization else {}
+    async with httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=180) as client:
+        response = await client.post(_server_url(port, host) + path, json=payload, headers=headers)
+        response.raise_for_status()
+
+
 def _port_is_busy(port: int, host: str = "127.0.0.1") -> bool:
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     # On macOS a reuse-enabled bind to a specific address can succeed even
@@ -295,6 +305,7 @@ class JobRequest(BaseModel):
     name: str | None = None
     revision: str | None = None
     keep_original: bool = False
+    load_after: bool = False
     token: str | None = Field(default=None, max_length=4096)
 
 
@@ -377,11 +388,21 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
         except Exception:
             update_migration(status="failed", error="Model storage copy failed")
 
+    async def load_prepared_model(name: str) -> None:
+        state = await controller.status()
+        if state["state"] not in ("connected", "degraded"):
+            raise RuntimeError("Server is unavailable")
+        port = int(state["port"])
+        await _post_local_management(
+            port, "/management/models/load", {"name": name, "type": "decision"},
+            authorization=controller.authorization(port), host=controller.address(port),
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         nonlocal jobs
         initialize_app_config()
-        jobs = JobManager(data_dir / "jobs")
+        jobs = JobManager(data_dir / "jobs", load_model=load_prepared_model)
         await jobs.recover()
         yield
         if migration_task is not None and not migration_task.done():
