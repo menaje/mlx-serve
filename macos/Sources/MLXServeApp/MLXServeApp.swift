@@ -284,25 +284,34 @@ struct AddModelView: View {
     @State private var keepOriginal = false
     @State private var loadAfter = true
     private let supported = [
-        "LiquidAI/d1-omni-600M", "LiquidAI/d1-omni-600M-MLX-fp16", "vllm-sr/d3-lite"
+        "LiquidAI/d1-omni-600M", "LiquidAI/d1-omni-600M-MLX-fp16", "vllm-sr/d3-lite",
+        "mlx-community/all-MiniLM-L6-v2-bf16", "mlx-community/Qwen3-Reranker-0.6B-4bit"
     ]
     private var submittedRepo: String { repo.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var isD3: Bool { submittedRepo == "vllm-sr/d3-lite" }
     private var canKeepOriginal: Bool { submittedRepo == "LiquidAI/d1-omni-600M" }
+    private var profile: String {
+        switch submittedRepo {
+        case "vllm-sr/d3-lite": return "결정 모델 / BF16"
+        case "mlx-community/all-MiniLM-L6-v2-bf16": return "임베딩 / BF16"
+        case "mlx-community/Qwen3-Reranker-0.6B-4bit": return "리랭커 / 4비트"
+        default: return "결정 모델 / FP16"
+        }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            PageHeader(title: "모델 추가", subtitle: "서버의 검증된 결정 모델 준비 경로를 사용합니다.")
+            PageHeader(title: "모델 추가", subtitle: "서버의 검증된 모델 준비 경로를 사용합니다.")
             Form {
                 TextField("Hugging Face ID", text: $repo)
                 TextField("로컬 이름 (선택)", text: $name)
                 TextField("Revision (선택)", text: $revision)
-                LabeledContent("유형 / 정밀도", value: isD3 ? "결정 모델 / BF16" : "결정 모델 / FP16")
+                LabeledContent("유형 / 정밀도", value: profile)
                 Toggle("원본 보존", isOn: $keepOriginal).disabled(!canKeepOriginal)
                 Toggle("준비 후 메모리에 로드", isOn: $loadAfter)
             }
             Text(isD3
                  ? "d3 원본 파일의 무결성과 MLX 추론을 검증합니다. 원본 파일을 직접 사용하므로 별도의 원본 사본을 만들지 않습니다."
-                 : "d1 원본, 공식 d1 MLX FP16, d3-lite를 지원합니다. 모델 구조와 파일을 검증하며 이미 호환되는 모델은 다시 변환하지 않습니다.")
+                 : "d1 원본·MLX FP16, d3-lite, all-MiniLM 임베딩과 Qwen3 리랭커를 지원합니다. 파일과 추론을 검증하며 이미 호환되는 모델은 다시 변환하지 않습니다.")
                 .font(.callout).foregroundStyle(.secondary)
             if !supported.contains(submittedRepo) { Text("이 모델은 아직 지원하지 않습니다.").foregroundStyle(.orange) }
             HStack {
@@ -331,6 +340,8 @@ struct ModelDetailView: View {
     @State private var testResult = ""
     @State private var testing = false
     @State private var confirmDelete = false
+    @State private var removalPreview: [String: Any]?
+    @State private var reviewingRemoval = false
     var name: String { model["name"] as? String ?? "" }
     var kind: String { model["type"] as? String ?? "" }
     var body: some View {
@@ -376,7 +387,8 @@ struct ModelDetailView: View {
                         Text("예제는 영문으로 제공됩니다. 결과는 모델과 입력 언어에 따라 달라집니다.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
-                    Button(testing ? "실행 중…" : "테스트 실행") { Task { await test() } }.disabled(testing)
+                    Button(testing ? "실행 중…" : "테스트 실행") { Task { await test() } }
+                        .disabled(testing || !["connected", "degraded"].contains(store.state))
                     if !testResult.isEmpty { Text(testResult).font(.system(.caption, design: .monospaced)).textSelection(.enabled) }
                 } else {
                     Text("이 모델 유형의 테스트는 아직 제공되지 않습니다.").foregroundStyle(.secondary)
@@ -384,7 +396,7 @@ struct ModelDetailView: View {
                 Divider()
                 Text("설치 정보").font(.headline)
                 Text(pretty(model["metadata"] ?? [:])).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                if kind == "decision", let record = model["preparation"] as? [String: Any] {
+                if let record = model["preparation"] as? [String: Any] {
                     Text("모델 준비 기록").font(.headline)
                     if record["state"] as? String == "recorded" {
                         LabeledContent("라이선스", value: record["license"] as? String ?? "정보 없음")
@@ -412,19 +424,51 @@ struct ModelDetailView: View {
                         Button("API 요청 예제 복사") { copyText(example) }
                     }
                 }
-                if kind == "decision" {
-                    Divider()
-                    Button("모델 제거…", role: .destructive) { confirmDelete = true }.disabled(store.busy)
+                Divider()
+                if ["stopped", "failed"].contains(store.state) {
+                    Button("모델 제거…", role: .destructive) { Task { await previewRemoval() } }
+                        .disabled(store.busy || store.activeJobs > 0 || reviewingRemoval)
+                    Text("서버와 이 저장소를 사용하는 다른 앱을 모두 종료한 뒤 제거하세요. 보존한 원본과 공유 캐시는 유지됩니다.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if kind == "decision" {
+                    Button("모델 제거…", role: .destructive) {
+                        removalPreview = nil
+                        confirmDelete = true
+                    }.disabled(store.busy)
                     Text("모델 등록과 변환 파일을 제거합니다. 보존한 원본과 공유 캐시는 유지됩니다.")
                         .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("이 모델을 제거하려면 서버를 중지하세요.").font(.caption).foregroundStyle(.secondary)
                 }
             }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
         }
         .confirmationDialog("\(name)을 제거할까요?", isPresented: $confirmDelete) {
-            Button("모델 제거", role: .destructive) { Task { await store.modelCommand("delete", name: name, type: kind) } }
+            Button("모델 제거", role: .destructive) {
+                Task {
+                    if let preview = removalPreview {
+                        await store.action { _ = try await store.request("/stored-models/remove", method: "POST", body: preview) }
+                        removalPreview = nil
+                    } else {
+                        await store.modelCommand("delete", name: name, type: kind)
+                    }
+                }
+            }
         } message: {
-            Text("모델 파일이 삭제됩니다. 다시 사용하려면 재다운로드 또는 재변환해야 합니다. 공유 원본은 유지됩니다.")
+            if let preview = removalPreview {
+                let size = (preview["size_bytes"] as? NSNumber)?.int64Value ?? 0
+                Text("모델 파일 \(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))과 등록 정보가 삭제됩니다. 다른 서버나 앱을 모두 종료하세요. 공유 원본은 유지됩니다.")
+            } else {
+                Text("모델 파일이 삭제됩니다. 다시 사용하려면 재다운로드 또는 재변환해야 합니다. 공유 원본은 유지됩니다.")
+            }
         }
+    }
+    private func previewRemoval() async {
+        reviewingRemoval = true
+        defer { reviewingRemoval = false }
+        do {
+            removalPreview = try await store.request("/stored-models/preview", method: "POST", body: ["name": name, "type": kind]) as? [String: Any]
+            if removalPreview != nil { confirmDelete = true }
+        } catch { store.message = error.localizedDescription }
     }
     var apiExample: String? {
         let path: String

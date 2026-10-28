@@ -18,6 +18,7 @@ codesign --verify --deep --strict "$APP"
 STAGING="$(mktemp -d "$BUILD_DIR/dmg-stage.XXXXXX")"
 trap 'rm -rf "$STAGING"' EXIT
 ditto "$APP" "$STAGING/MLX Serve.app"
+codesign --verify --deep --strict "$STAGING/MLX Serve.app"
 ln -s /Applications "$STAGING/Applications"
 hdiutil create -quiet -fs HFS+ -volname 'MLX Serve' -srcfolder "$STAGING" \
     -format UDZO -ov "$OUTPUT"

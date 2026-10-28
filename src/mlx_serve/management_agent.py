@@ -314,6 +314,20 @@ class ModelCommand(BaseModel):
     type: str
 
 
+class HFCacheCleanupEntry(BaseModel):
+    repo: str = Field(min_length=3, max_length=300)
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+    size_bytes: int = Field(ge=0)
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ModelRemovalPreview(BaseModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    type: str
+    size_bytes: int = Field(ge=0)
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class TestRequest(BaseModel):
     path: str
     body: dict[str, Any]
@@ -388,13 +402,13 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
         except Exception:
             update_migration(status="failed", error="Model storage copy failed")
 
-    async def load_prepared_model(name: str) -> None:
+    async def load_prepared_model(name: str, model_type: str) -> None:
         state = await controller.status()
         if state["state"] not in ("connected", "degraded"):
             raise RuntimeError("Server is unavailable")
         port = int(state["port"])
         await _post_local_management(
-            port, "/management/models/load", {"name": name, "type": "decision"},
+            port, "/management/models/load", {"name": name, "type": model_type},
             authorization=controller.authorization(port), host=controller.address(port),
         )
 
@@ -625,6 +639,87 @@ def create_agent(token: str, data_dir: Path = DATA_DIR) -> FastAPI:
             raise HTTPException(
                 status_code=503, detail="Hugging Face cache is unavailable"
             ) from exc
+
+    async def hf_cache_cleanup_ready() -> Path:
+        check_not_migrating()
+        assert jobs is not None
+        if any(job["status"] in ACTIVE_STATES for job in jobs.list()):
+            raise HTTPException(status_code=409, detail="Finish or cancel active jobs first")
+        state = await controller.status()
+        if state["state"] not in ("stopped", "failed"):
+            raise HTTPException(status_code=409, detail="Stop the server before cleaning the cache")
+        return Settings().models_dir
+
+    @app.get("/hf-cache/cleanup")
+    async def hf_cache_cleanup_preview() -> dict[str, Any]:
+        from mlx_serve.core.hf_cache_cleanup import stale_hf_cache_revisions
+
+        async with storage_guard:
+            models_dir = await hf_cache_cleanup_ready()
+            try:
+                return await asyncio.to_thread(stale_hf_cache_revisions, models_dir)
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/hf-cache/cleanup")
+    async def hf_cache_cleanup(payload: HFCacheCleanupEntry) -> dict[str, Any]:
+        from mlx_serve.core.hf_cache_cleanup import cleanup_stale_hf_cache_revision
+
+        async with storage_guard:
+            models_dir = await hf_cache_cleanup_ready()
+            try:
+                return await asyncio.to_thread(
+                    cleanup_stale_hf_cache_revision, models_dir, payload.model_dump()
+                )
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def offline_models_ready() -> Path:
+        check_not_migrating()
+        assert jobs is not None
+        if any(job["status"] in ACTIVE_STATES for job in jobs.list()):
+            raise HTTPException(status_code=409, detail="Finish or cancel active jobs first")
+        state = await controller.status()
+        if state["state"] not in ("stopped", "failed"):
+            raise HTTPException(status_code=409, detail="Stop the server before removing models")
+        return Settings().models_dir
+
+    @app.get("/stored-models")
+    async def stored_models() -> dict[str, Any]:
+        from mlx_serve.core.offline_models import offline_model_list
+
+        async with storage_guard:
+            models_dir = await offline_models_ready()
+            try:
+                return await asyncio.to_thread(offline_model_list, models_dir)
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/stored-models/preview")
+    async def stored_model_preview(payload: ModelCommand) -> dict[str, Any]:
+        from mlx_serve.core.offline_models import preview_model_removal
+
+        async with storage_guard:
+            models_dir = await offline_models_ready()
+            try:
+                return await asyncio.to_thread(
+                    preview_model_removal, models_dir, payload.name, payload.type
+                )
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/stored-models/remove")
+    async def stored_model_remove(payload: ModelRemovalPreview) -> dict[str, Any]:
+        from mlx_serve.core.offline_models import remove_offline_model
+
+        async with storage_guard:
+            models_dir = await offline_models_ready()
+            try:
+                return await asyncio.to_thread(
+                    remove_offline_model, models_dir, payload.model_dump()
+                )
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/originals")
     async def originals() -> dict[str, Any]:

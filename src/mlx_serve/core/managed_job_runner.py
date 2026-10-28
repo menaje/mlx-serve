@@ -12,6 +12,7 @@ import sys
 
 async def run(parent: int, job_id: str) -> int:
     from mlx_serve.core.model_manager import model_manager
+    from mlx_serve.core.retrieval_prepare_worker import RETRIEVAL_PROFILES
 
     params = json.loads(sys.stdin.readline())
     os.environ["MLX_SERVE_PREPARE_JOB_ID"] = job_id
@@ -32,7 +33,7 @@ async def run(parent: int, job_id: str) -> int:
     try:
         async for event in model_manager.pull_model(
             hf_repo=params["repo"],
-            model_type="decision",
+            model_type=RETRIEVAL_PROFILES.get(params["repo"], "decision"),
             model_name=params.get("name"),
             revision=params.get("revision"),
             keep_original=params.get("keep_original", False),

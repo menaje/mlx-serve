@@ -132,7 +132,7 @@ private func jobGuidance(_ category: String) -> String {
     case "network": return "네트워크 연결을 확인한 뒤 다시 시도하세요."
     case "missing_file": return "저장소 ID, revision과 필요한 모델 파일을 확인하세요."
     case "timeout": return "네트워크와 실행 환경을 확인한 뒤 다시 시도하세요."
-    case "unsupported": return "지원되는 d1 또는 d3 결정 모델을 선택하세요."
+    case "unsupported": return "지원되는 결정·임베딩·리랭커 모델 중에서 선택하세요."
     case "validation": return "원본과 revision을 확인하고 검증된 파일을 다시 준비하세요."
     case "conversion": return "런타임 버전과 사용 가능한 자원을 확인한 뒤 다시 시도하세요."
     default: return "작업 기록에서 오류를 확인하고 원인을 수정한 뒤 다시 시도하세요."
@@ -427,7 +427,7 @@ struct PreferencesView: View {
     var runtime: some View {
         Form {
             Section("변환과 런타임") {
-                LabeledContent("지원 모델", value: "d1 원본 / 공식 d1 MLX FP16 / d3-lite")
+                LabeledContent("지원 모델", value: "d1 / d3-lite / all-MiniLM / Qwen3 리랭커")
                 LabeledContent("변환 정밀도", value: "FP16")
                 LabeledContent("d3 정밀도", value: "BF16 / readout FP32")
                 LabeledContent("동시 변환", value: "1개")
@@ -577,13 +577,18 @@ struct HFCacheInventoryView: View {
     @State private var inventory: [String: Any] = [:]
     @State private var loading = false
     @State private var error: String?
+    @State private var candidates: [[String: Any]] = []
+    @State private var showingCandidates = false
+    @State private var candidatesTruncated = false
+    @State private var selected: [String: Any]?
+    @State private var confirming = false
 
     private var repositories: [[String: Any]] { inventory["repositories"] as? [[String: Any]] ?? [] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Hugging Face 공유 캐시").font(.title2.bold())
-            Text("이 목록은 읽기 전용입니다. 다른 앱이나 모델에서 같은 파일을 사용할 수 있어 삭제 가능한 공간으로 계산하지 않습니다.")
+            Text("공유 캐시를 다른 앱에서도 사용할 수 있습니다. 정리하기 전에 이 서버와 캐시를 사용하는 다른 앱을 모두 종료하세요.")
                 .foregroundStyle(.secondary)
             if loading {
                 ProgressView("캐시 사용량을 확인하고 있습니다…")
@@ -606,7 +611,36 @@ struct HFCacheInventoryView: View {
                     Text("목록에는 처음 100개 저장소만 표시합니다.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if repositories.isEmpty {
+                if showingCandidates {
+                    Text("등록된 모델의 원본과 이름이 붙은 revision은 제외합니다. 표시된 예상 용량은 실제 확보 공간과 다를 수 있습니다.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if candidatesTruncated {
+                        Text("처음 100개만 표시합니다. 정리 후 다시 확인하세요.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if candidates.isEmpty {
+                        Text("정리할 수 있는 이전 revision이 없습니다.").foregroundStyle(.secondary)
+                    } else {
+                        List(candidates.indices, id: \.self) { index in
+                            let entry = candidates[index]
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(entry["repo"] as? String ?? "")
+                                    Text(entry["revision"] as? String ?? "")
+                                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                                    let bytes = (entry["size_bytes"] as? NSNumber)?.int64Value ?? 0
+                                    Text("예상 확보 \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("정리…", role: .destructive) {
+                                    selected = entry
+                                    confirming = true
+                                }.disabled(loading)
+                            }
+                        }.frame(minHeight: 140, maxHeight: 250)
+                    }
+                } else if repositories.isEmpty {
                     Text("확인된 캐시 저장소가 없습니다.").foregroundStyle(.secondary)
                 } else {
                     List(repositories.indices, id: \.self) { index in
@@ -623,13 +657,19 @@ struct HFCacheInventoryView: View {
                 }
             }
             HStack {
-                Button("다시 확인") { Task { await scan() } }.disabled(loading)
+                Button("사용량 다시 확인") { Task { await scan() } }.disabled(loading)
+                Button("이전 revision 정리…") { Task { await scanCandidates() } }.disabled(loading)
                 Spacer()
                 Button("닫기") { dismiss() }
             }
         }
         .padding(24).frame(width: 610).frame(minHeight: 300)
         .task { await scan() }
+        .confirmationDialog("선택한 캐시를 정리할까요?", isPresented: $confirming) {
+            Button("선택한 revision 정리", role: .destructive) { Task { await clean() } }
+        } message: {
+            Text("\(selected?["repo"] as? String ?? "")의 이전 파일을 삭제합니다. 다른 앱을 먼저 종료하세요. 다시 필요하면 다운로드해야 합니다.")
+        }
     }
 
     private func scan() async {
@@ -638,8 +678,41 @@ struct HFCacheInventoryView: View {
         do {
             inventory = try await store.request("/hf-cache") as? [String: Any] ?? [:]
             error = nil
+            showingCandidates = false
         } catch {
             inventory = [:]
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func scanCandidates() async {
+        loading = true
+        defer { loading = false }
+        do {
+            let result = try await store.request("/hf-cache/cleanup") as? [String: Any] ?? [:]
+            candidates = result["candidates"] as? [[String: Any]] ?? []
+            candidatesTruncated = result["truncated"] as? Bool == true
+            showingCandidates = true
+            error = nil
+        } catch {
+            candidates = []
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func clean() async {
+        guard let selected else { return }
+        loading = true
+        defer { loading = false }
+        do {
+            _ = try await store.request("/hf-cache/cleanup", method: "POST", body: selected)
+            self.selected = nil
+            let result = try await store.request("/hf-cache/cleanup") as? [String: Any] ?? [:]
+            candidates = result["candidates"] as? [[String: Any]] ?? []
+            candidatesTruncated = result["truncated"] as? Bool == true
+            inventory = try await store.request("/hf-cache") as? [String: Any] ?? [:]
+            error = nil
+        } catch {
             self.error = error.localizedDescription
         }
     }

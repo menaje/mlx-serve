@@ -250,8 +250,19 @@ final class AppStore: ObservableObject {
             return "정리가 끝나지 않았습니다. 남은 파일 위치를 확인하세요: " +
                 message.replacingOccurrences(of: "Cleanup was incomplete; inspect ", with: "")
         }
+        if message.hasPrefix("Removal was incomplete; inspect ") {
+            return "모델 제거가 끝나지 않았습니다. 남은 파일 위치를 확인하세요: " +
+                message.replacingOccurrences(of: "Removal was incomplete; inspect ", with: "")
+        }
         let translations = [
             "Hugging Face cache is unavailable": "Hugging Face 캐시에 접근할 수 없습니다. 저장 장치와 권한을 확인하세요.",
+            "Stop the server before cleaning the cache": "캐시를 정리하기 전에 서버를 중지하세요.",
+            "Hugging Face cache contains unreadable entries": "공유 캐시의 일부를 확인할 수 없어 정리를 중단했습니다. 캐시 상태와 권한을 확인하세요.",
+            "Hugging Face cache cleanup was incomplete": "캐시 정리가 완료되지 않았습니다. 다시 확인하세요.",
+            "Stop the server before removing models": "모델을 제거하기 전에 서버를 중지하세요.",
+            "Model files could not be safely checked": "모델 파일에 링크나 접근할 수 없는 항목이 있어 안전하게 확인하지 못했습니다.",
+            "Another model references these files": "다른 모델이 이 파일을 참조하고 있어 제거할 수 없습니다.",
+            "Removal target changed; review it again": "모델 파일이 변경되었습니다. 제거 대상을 다시 확인하세요.",
             "Existing model files must be migrated before changing storage": "기존 모델이 있습니다. ‘기존 모델 복사 및 전환’을 이용하세요.",
             "Existing registered models must be migrated before changing storage": "등록된 모델이 있습니다. ‘기존 모델 복사 및 전환’을 이용하세요.",
             "The current model storage is unavailable; reconnect it first": "현재 모델 저장소에 접근할 수 없습니다. 저장 장치를 다시 연결한 뒤 시도하세요.",
@@ -332,6 +343,14 @@ final class AppStore: ObservableObject {
                     modelState = [:]
                     modelError = "이 서버의 모델 상태를 확인할 수 없습니다: \(error.localizedDescription)"
                 }
+            } else if ["stopped", "failed"].contains(state) && activeJobs == 0 {
+                do {
+                    modelState = try await request("/stored-models") as? [String: Any] ?? [:]
+                    modelError = nil
+                } catch {
+                    modelState = [:]
+                    modelError = "저장된 모델을 확인할 수 없습니다: \(error.localizedDescription)"
+                }
             } else {
                 modelState = [:]
                 modelError = nil
@@ -389,8 +408,17 @@ final class AppStore: ObservableObject {
         busy = true
         defer { busy = false }
         do {
-            if enabled { try AgentKeychain.save(secret, keyID: agentKeyID) }
-            _ = try await request("/background", method: "POST", body: ["enabled": enabled])
+            if enabled {
+                try AgentKeychain.save(secret, keyID: agentKeyID)
+                do {
+                    _ = try await request("/background", method: "POST", body: ["enabled": true])
+                } catch {
+                    try? AgentKeychain.remove(agentKeyID)
+                    throw error
+                }
+            } else {
+                _ = try await request("/background", method: "POST", body: ["enabled": false])
+            }
             backgroundEnabled = enabled
             UserDefaults.standard.set(enabled, forKey: "backgroundServer")
             if !enabled { try AgentKeychain.remove(agentKeyID) }

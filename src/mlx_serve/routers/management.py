@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from mlx_serve.config import settings
-from mlx_serve.core.decision_prepare import read_verified_manifest
+from mlx_serve.core.decision_prepare import read_verified_manifest, read_verified_retrieval_manifest
 from mlx_serve.core.default_models import (
     DEFAULT_TYPES,
     DefaultSelectionChanged,
@@ -75,14 +75,19 @@ def _local_snapshot() -> dict[str, Any]:
     }
 
 
-def _preparation_record(path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+def _preparation_record(path: Path, metadata: dict[str, Any], kind: str) -> dict[str, Any]:
     """Report recorded preparation details without rehashing weights on every refresh."""
     try:
-        manifest = read_verified_manifest(path, verify_hashes=False)
+        reader = read_verified_manifest if kind == "decision" else read_verified_retrieval_manifest
+        manifest = reader(path, verify_hashes=False)
         if (
             not metadata.get("revision")
             or manifest["revision"] != metadata["revision"]
             or manifest["source_repo"] != metadata.get("hf_repo")
+            or (kind != "decision" and (
+                manifest.get("type") != kind
+                or metadata.get("preparation_format") != "retrieval-v1"
+            ))
         ):
             raise ValueError("Decision metadata does not match its preparation record")
         result = {
@@ -97,7 +102,7 @@ def _preparation_record(path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
             field: validation[field]
             for field in (
                 "official_predict", "mlx_predict", "published_file_hashes",
-                "max_probability_difference", "tolerance",
+                "max_probability_difference", "tolerance", "dimensions", "ranking_check",
             )
             if field in validation
         }
@@ -271,8 +276,8 @@ async def management_state(request: Request) -> dict[str, Any]:
                     "queued" if active.get("queued") else "idle"
                 )
         preparation = (
-            await asyncio.to_thread(_preparation_record, model.path, metadata)
-            if model.model_type == "decision" else None
+            await asyncio.to_thread(_preparation_record, model.path, metadata, model.model_type)
+            if model.model_type in ("decision", "embedding", "reranker") else None
         )
         models.append({
             "name": model.name, "type": model.model_type, "source": model.hf_repo,

@@ -945,6 +945,19 @@ class ModelManager:
                 return
             yield {"status": "error", "message": "Unsupported decision model architecture"}
             return
+        from mlx_serve.core.retrieval_prepare_worker import RETRIEVAL_PROFILES
+
+        if hf_repo in RETRIEVAL_PROFILES:
+            if model_type != RETRIEVAL_PROFILES[hf_repo] or quantize is not None:
+                yield {"status": "error", "message": "Unsupported model type or quantization"}
+                return
+            from mlx_serve.core.decision_prepare import prepare_decision
+
+            async for status in prepare_decision(
+                self, hf_repo, model_name, revision, model_type=model_type,
+            ):
+                yield status
+            return
         if revision is not None:
             yield {
                 "status": "error",
@@ -1204,6 +1217,22 @@ class ModelManager:
 
         return {"unloaded": unloaded, "skipped_active": skipped_active}
 
+    def _verify_retrieval_preparation(self, name: str, kind: str, path: Path) -> None:
+        """Recheck recorded app-prepared models; leave older CLI installs usable."""
+        from mlx_serve.core.decision_prepare import read_verified_retrieval_manifest
+        from mlx_serve.core.retrieval_prepare_worker import MANIFEST
+
+        self._load_metadata()
+        metadata = self._metadata.get(name, {})
+        if metadata.get("preparation_format") != "retrieval-v1" and not (path / MANIFEST).exists():
+            return
+        manifest = read_verified_retrieval_manifest(path)
+        if (metadata.get("preparation_format") != "retrieval-v1"
+                or metadata.get("type") != kind or manifest["type"] != kind
+                or metadata.get("hf_repo") != manifest["source_repo"]
+                or metadata.get("revision") != manifest["revision"]):
+            raise ValueError("Retrieval model metadata does not match its preparation record")
+
     def get_embedding_model(self, model_name: str) -> Any:
         """Get or load an embedding model.
 
@@ -1244,6 +1273,7 @@ class ModelManager:
                     )
 
             self._ensure_load_memory_available("embedding", resolved_name, model_dir)
+            self._verify_retrieval_preparation(resolved_name, "embedding", model_dir)
             logger.info(f"Loading embedding model: {resolved_name}")
             before_process_rss, before_mlx_active = self._memory_calibration_baseline()
 
@@ -1305,6 +1335,7 @@ class ModelManager:
                     )
 
             self._ensure_load_memory_available("reranker", resolved_name, model_dir)
+            self._verify_retrieval_preparation(resolved_name, "reranker", model_dir)
             logger.info(f"Loading reranker model: {resolved_name}")
             before_process_rss, before_mlx_active = self._memory_calibration_baseline()
 

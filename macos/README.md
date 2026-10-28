@@ -17,21 +17,32 @@ The app also inspects known CLI paths and the user's launchd service without
 changing those services.
 
 Supported installs are LiquidAI's original d1 checkpoint, its official MLX
-FP16 checkpoint, and `vllm-sr/d3-lite`. The d3 model's BF16 weights and FP32
-readout are used directly after file-hash and inference checks. Preparation is
-the same verified backend path as the CLI. Other model types may be tested if
-already installed, but adding other repositories is intentionally disabled
-until their conversion and validation paths meet the same guarantees. Decision
-models can be removed without deleting
-shared source caches; deletion of other types is disabled. Generation-worker
-load and unload commands are routed to the appropriate model- or type-scoped
-worker. General Hugging Face cache cleanup is not implemented; a read-only
-inventory shows Hub cache repositories and reported sizes, including when the
-engine is stopped. It does not estimate reclaimable space or include the Xet
-cache. The app can preview and remove unreferenced retained d1 originals; it
-rechecks the registry, files and preparation lock before deletion, and leaves
-referenced originals in place. Shared Hugging Face caches are not deleted
-automatically by any conversion path.
+FP16 checkpoint, `vllm-sr/d3-lite`,
+`mlx-community/all-MiniLM-L6-v2-bf16` (embedding), and
+`mlx-community/Qwen3-Reranker-0.6B-4bit` (reranker). The d3 model's BF16
+weights and FP32 readout and the two retrieval models' MLX weights are used
+directly after file-hash and inference checks. Preparation runs in the backend.
+Other model types may be tested if already installed, but adding other
+repositories is disabled until their validation paths are supported.
+
+Generation-worker load and unload commands are routed to the appropriate
+model- or type-scoped worker. A running server can remove decision models by
+using the worker-aware operation. With the server and preparation jobs stopped,
+registered models of the supported types can also be previewed and removed from
+storage. The offline operation checks the registry, references, target files and
+name; linked or otherwise unsafe directories cannot be removed this way. Stop
+other services that might use those files before removing them. Originals and
+shared Hugging Face caches are not removed by this operation.
+
+The app can preview and remove unreferenced retained d1 originals; it rechecks
+the registry, files and preparation lock before deletion. The Hub cache inventory
+can also preview and remove individual detached revisions that are no longer
+referenced by Hub refs or registered app models, retaining another revision in
+the repository and preserving shared blobs. The estimated reclaimable space is
+based on the Hub cache metadata. Stop other applications that use the cache
+before cleaning it: their model references cannot be discovered by the app. This
+is not general cache cleanup, and it does not include the Xet cache. Shared Hub
+caches are not deleted automatically by any conversion path.
 
 An installed decision, embedding, or reranker model can be selected as the
 default for its type. Requests that omit the model use that selection; an
@@ -51,7 +62,10 @@ Configuration, model files, and job records are kept outside the app in
 an existing CLI installation is left unchanged. Settings show saved, effective
 on restart, and currently applied values separately. Existing external servers
 are not reconfigured by the app. Hugging Face credentials are saved in macOS
-Keychain and passed only to the preparation process for a job.
+Keychain and passed only to the preparation process for a job. Keychain is built
+into macOS; no separate account or Developer ID is required. A token is optional
+for public models, and the default quit-and-stop mode needs no background
+reconnection secret.
 Paths under `/Volumes/<name>` must refer to a mounted volume. This prevents
 starting the engine or creating a replacement directory after that volume is
 disconnected. With the server and preparations stopped, existing model storage
@@ -68,7 +82,8 @@ the versions in `requirements-runtime.txt`, packages the current source, and
 creates `macos/.build/MLX Serve.app`. The resulting bundle uses an ad-hoc
 signature and is **not notarized**. Developer ID signing, notarization, a
 distributable DMG, and verification on a separate Mac without developer tools
-still require a release environment and credentials.
+are outside the current issue scope and require a release environment and
+credentials if pursued later.
 
 `./macos/package-dmg.sh` packages an already built app into
 `macos/.build/MLX-Serve-experimental.dmg` for local testing. This image contains

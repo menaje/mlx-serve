@@ -612,7 +612,10 @@ def test_management_deletion_uses_decision_worker_path_and_rejects_other_types(m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("repo", ["LiquidAI/d1-omni-600M", "vllm-sr/d3-lite"])
+@pytest.mark.parametrize("repo", [
+    "LiquidAI/d1-omni-600M", "vllm-sr/d3-lite",
+    "mlx-community/all-MiniLM-L6-v2-bf16", "mlx-community/Qwen3-Reranker-0.6B-4bit",
+])
 async def test_job_cancel_terminates_process_and_preserves_existing_models(
     tmp_path, monkeypatch, repo
 ):
@@ -694,7 +697,8 @@ async def test_preparation_records_automatic_loading_separately(tmp_path, monkey
 
     calls = []
 
-    async def load_model(name):
+    async def load_model(name, kind):
+        assert kind == "decision"
         calls.append(name)
         if load_fails:
             raise RuntimeError("unavailable")
@@ -736,7 +740,8 @@ async def test_cancelling_during_automatic_load_does_not_delay_shutdown(tmp_path
 
     entered = asyncio.Event()
 
-    async def load_model(name):
+    async def load_model(name, kind):
+        assert kind == "decision"
         entered.set()
         await asyncio.Event().wait()
 
@@ -823,7 +828,8 @@ async def test_recovery_finishes_a_persisted_automatic_load(tmp_path, monkeypatc
     }
     calls = []
 
-    async def load_model(name):
+    async def load_model(name, kind):
+        assert kind == "decision"
         calls.append(name)
         await asyncio.sleep(0.01)
 

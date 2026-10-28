@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from mlx_serve.core.decision_prepare_worker import D3_REPO, MLX_REPO, SOURCE_REPO
+from mlx_serve.core.retrieval_prepare_worker import RETRIEVAL_PROFILES
 from mlx_serve.core.storage_access import model_storage_available
 
 ACTIVE_STATES = ("queued", "running", "cancelling", "recovery_pending")
@@ -60,7 +61,7 @@ def _error_guidance(message: str) -> tuple[str, str]:
     if any(part in text for part in ("timeout", "timed out")):
         return "timeout", "Check the network and runtime, then retry."
     if any(part in text for part in ("unsupported", "not supported", "architecture")):
-        return "unsupported", "Choose a supported d1 or d3 decision model."
+        return "unsupported", "Choose one of the supported model preparation profiles."
     if any(part in text for part in ("validation", "verification", "checksum", "manifest")):
         return "validation", "Check the source and revision; retry to obtain verified files."
     if any(part in text for part in ("conversion", "convert")):
@@ -110,7 +111,10 @@ def _job_worker_pids(job_id: str) -> list[int] | None:
         parts = line.strip().split(maxsplit=1)
         if (
             len(parts) == 2 and parts[0].isdigit()
-            and "mlx_serve.core.decision_prepare_worker" in parts[1]
+            and any(worker in parts[1] for worker in (
+                "mlx_serve.core.decision_prepare_worker",
+                "mlx_serve.core.retrieval_prepare_worker",
+            ))
             and f".decision-prepare-{job_id}-" in parts[1]
         ):
             found.append(int(parts[0]))
@@ -148,7 +152,7 @@ class JobManager:
     """Run preparation in isolated process groups; keep history in SQLite."""
 
     def __init__(
-        self, data_dir: Path, *, load_model: Callable[[str], Awaitable[None]] | None = None,
+        self, data_dir: Path, *, load_model: Callable[[str, str], Awaitable[None]] | None = None,
     ):
         self.data_dir = data_dir
         self._load_model = load_model
@@ -221,7 +225,8 @@ class JobManager:
                 or (current is not None and current["status"] == "cancelling")
             ):
                 raise ValueError("Automatic loading is unavailable")
-            load_task = asyncio.create_task(self._load_model(name))
+            model_type = RETRIEVAL_PROFILES.get(current["params"].get("repo"), "decision")
+            load_task = asyncio.create_task(self._load_model(name, model_type))
             self._load_tasks[job_id] = load_task
             try:
                 await load_task
@@ -348,8 +353,10 @@ class JobManager:
         if params.keys() - allowed:
             raise ValueError("Unsupported preparation options")
         repo = params.get("repo")
-        if repo not in {SOURCE_REPO, MLX_REPO, D3_REPO}:
-            raise ValueError("Only validated d1 and d3 repositories are supported")
+        if repo not in {SOURCE_REPO, MLX_REPO, D3_REPO, *RETRIEVAL_PROFILES}:
+            raise ValueError(
+                "Only validated decision, embedding and reranker profiles are supported"
+            )
         name = params.get("name") or None
         if name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
             raise ValueError("Invalid local model name")

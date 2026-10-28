@@ -1,7 +1,8 @@
 # macOS app validation
 
-The app is still under development. These results do not meet all acceptance
-criteria of issue #12.
+The app is still under development. Issue #12 excludes Developer ID signing,
+notarization, signed updates and a separate development-tools-free Mac from
+its current completion criteria. Other unverified flows are listed below.
 
 ## Tested environment
 
@@ -10,7 +11,7 @@ criteria of issue #12.
   huggingface-hub 1.33.0, transformers 5.21.0.
 - Bundled environment: Python 3.14.10 with the same package versions above;
   the complete pinned dependency list is in `requirements-runtime.txt`.
-- The Python test suite passed 362 tests with real d3-lite and Qwen3-Reranker
+- The Python test suite passed 380 tests with real d3-lite and Qwen3-Reranker
   checkpoints supplied; no tests were skipped. The run emitted one third-party
   Starlette deprecation warning. Set `MLX_SERVE_D3_TEST_MODEL_DIR` and
   `MLX_SERVE_RERANK_TEST_MODEL_DIR` to local checkpoint directories to include
@@ -57,15 +58,36 @@ criteria of issue #12.
   relevant document against an unrelated one and compared single and batched
   scores. These pre-existing models were installed by the development CLI, not
   by the app's model-add UI.
+- In an isolated home, the persistent job manager downloaded and prepared
+  `mlx-community/all-MiniLM-L6-v2-bf16` revision
+  `b6691709eacd8f0afcc3faace288cf50e611f3aa` and
+  `mlx-community/Qwen3-Reranker-0.6B-4bit` revision
+  `5f324548f1d20c2b5a450f126fc6ef2fb1126524`. It checked the published file
+  set, sizes and hashes, verified the model architecture and precision, ran MLX
+  inference, and registered both models. Independent inference returned a
+  384-dimensional embedding and ranked the matching reranker example higher.
+  The same two fresh downloads and inference checks also succeeded using the
+  packaged Python runtime and a separate empty storage directory; that run
+  invoked the job manager directly.
+  The management agent using the packaged runtime then reused verified copies,
+  automatically loaded and tested both through an owned server, and removed
+  one copy while the server was stopped without removing its source. The new
+  model-add UI itself was not exercised during this run. With the app's
+  bytecode-writing protection applied, the rebuilt bundle's ad-hoc signature
+  still verified after these operations.
 - The app's native Keychain code stored, updated, reopened and removed disposable
   Hugging Face and agent secrets across two processes using a temporary Keychain.
   The test did not add it to the user's Keychain search list. This does not yet
   exercise the app's complete background reconnection flow with the login Keychain.
-- With the packaged app's server stopped, its read-only Hub cache inventory showed
+- In an earlier packaged app build with its server stopped, the Hub cache
+  inventory showed
   an isolated synthetic repository with two revisions sharing one 23-byte file.
   Automated tests also cover a missing cache, corrupt entries, authorization and
-  preservation of shared cache files during other model conversions. Xet cache
-  size and reclaimable space are not included in the inventory.
+  preservation of shared cache files during other model conversions. The newer
+  management endpoint previewed and removed one detached revision in an isolated
+  cache while preserving a shared blob, the current revision and an unrelated
+  model. Tests cover changed references and files, corrupt metadata, shared
+  files, symlinked paths, authorization and server state. Xet is not included.
 - On the same Mac, the packaged app was also launched with a separate empty
   home directory. Through its UI, the original d1 repository was downloaded,
   converted to MLX FP16, validated, registered and automatically loaded. A
@@ -150,6 +172,15 @@ criteria of issue #12.
   rebuilt packaged app was launched in a separate test home. Its UI displayed
   the test port and service state, started and stopped its own server, and showed
   the background option disabled. Its ad-hoc signature was checked after use.
+- A separate temporary ad-hoc test app registered and unregistered a real
+  `SMAppService` login item. It reported enabled after registration and
+  unregistered afterward. This did not test the packaged app's UI or login
+  behavior after a reboot.
+- A native test harness using the app's actual background-setting code attempted
+  to enable the option while the Mac/login Keychain was locked and Keychain UI
+  interaction was disabled for the test. The operation returned a Keychain
+  interaction error and did not enable background mode. A successful relaunch
+  using the login Keychain has not been tested in this state.
 
 ## Remaining validation and limitations
 
@@ -158,15 +189,19 @@ criteria of issue #12.
   after a separate list-clipping issue was found. Subsequent UI sessions
   completed the flows above, but the original exception has not been reliably
   reproduced or definitively resolved.
-- Sleep/wake, real login-item registration and approval, physically disconnected
-  external storage, signed installer updates, and the minimum macOS 26
-  deployment target have not been tested end to end.
+- Sleep/wake, the packaged app's login-item approval and login behavior,
+  physically disconnected external storage, and the minimum macOS 26 deployment
+  target have not been tested end to end.
 - The bundle has an ad-hoc signature only. Developer ID signing, notarization,
   distribution of a release DMG, and installation on a separate Mac without
-  development tools remain unverified.
-- General Hugging Face cache cleanup remains unimplemented. Defaults are limited
-  to decision, embedding and reranker models. See `README.md` for the supported
-  model scope. The optional background mode's actual Keychain and app relaunch
-  flow has not been exercised end to end.
+  development tools and signed installer updates are outside the current issue
+  scope and remain unverified.
+- General Hugging Face cache cleanup is not implemented; cleanup is restricted
+  to individually reviewed detached revisions as described in `README.md`.
+  Defaults are limited to decision, embedding and reranker models, and new model
+  installation is limited to the documented profiles. The new cleanup and
+  offline-removal controls and the optional background mode's successful login
+  Keychain reconnection were not exercised through the full app UI while the Mac
+  was locked.
 - Notification transition filtering is tested, but the macOS permission prompt
   and visible delivery have not been exercised end to end.
